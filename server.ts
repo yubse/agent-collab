@@ -515,6 +515,7 @@ type AgentRuntimeConfig = {
   tmuxCaptureIntervalMs: number
   tmuxFilterMode: 'strict' | 'loose' | 'off'
   tmuxQuietMs: number
+  promptPath?: string
 }
 const AGENT_RUNTIMES: Record<string, AgentRuntimeConfig> = {
   product: ROLE_AGENT_CONFIGS.product,
@@ -2217,7 +2218,25 @@ function buildBridgePrompt(record: GroupRecord, recipient: string, hopCount: num
     `hop_count=${hopCount}`,
   ].filter(Boolean).join('\n')
   const footer = observeOnly && !isDm ? OBSERVE_FOOTER : ''
-  return `${head}\n${meta}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
+  const runtime = AGENT_RUNTIMES[recipient]
+  const promptCandidates = [
+    runtime?.promptPath,
+    runtime?.cwd ? path.join(runtime.cwd, 'AGENTS.md') : '',
+    path.join(import.meta.dir, 'agents', recipient, 'AGENTS.md'),
+  ].filter(Boolean) as string[]
+  let sharedDefinition = ''
+  for (const candidate of promptCandidates) {
+    try {
+      if (existsSync(candidate)) { sharedDefinition = readFileSync(candidate, 'utf8').trim(); break }
+    } catch {}
+  }
+  const privateMemory = userRepo.memory(record.user_id, recipient)?.content?.trim() || ''
+  const serverContext = [
+    sharedDefinition ? `[共享 Agent Definition]\n${sharedDefinition}` : '',
+    privateMemory ? `[当前用户私有 Memory]\n${privateMemory}` : '',
+  ].filter(Boolean).join('\n\n')
+  const request = `${head}\n${meta}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
+  return serverContext ? `${serverContext}\n\n[本次请求]\n${request}` : request
 }
 
 // AIC-116: injectToTmux removed. Dispatch goes through `provider.send()` in dispatchGroupRecord.

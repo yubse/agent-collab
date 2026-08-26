@@ -149,6 +149,7 @@ export function loadAgentRuntimeEnv(prefix: string, fallbackProvider: AgentProvi
     tmuxQuietMs: parseIntervalMs(process.env[`${key}_TMUX_QUIET_MS`], 30_000),
     heartbeatPath: process.env[`${key}_HEARTBEAT_PATH`] || '',
     projectDir: process.env[`${key}_PROJECT_DIR`] || '',
+    promptPath: process.env[`${key}_PROMPT_PATH`] || '',
   }
 }
 // Optional agent startup script.
