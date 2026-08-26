@@ -36,6 +36,18 @@ import { TmuxProvider } from './src/providers/tmux.ts'
 import { hasRequestAuth, isLocalRequestHost, requestAuthMode } from './src/auth.ts'
 // AIC-65: handleTodosRoutes import removed — iOS todo 跟 task 撞定位，整个 todo 模块退役
 import { dangerousEndpointFor, hasRemoteControlConfirm, logDangerousOperation } from './src/security.ts'
+import { runMigrations, LEGACY_ADMIN_ID } from './src/db/migrations.ts'
+import { UserRepository } from './src/data/user-repository.ts'
+import {
+  authenticatePassword,
+  authenticatedUser,
+  clearSessionCookie,
+  createSession,
+  ensureLegacyAdminPassword,
+  revokeSession,
+  sessionCookie,
+  type AuthenticatedUser,
+} from './src/auth/user-auth.ts'
 
 const WORKSPACE_ROOT = workspaceRoot(import.meta.dir)
 const RUNTIME_DATA_ROOT = runtimeDataRoot(import.meta.dir)
@@ -356,6 +368,14 @@ db.run(`CREATE TABLE IF NOT EXISTS actor_theme_styles (
   updated_at   TEXT NOT NULL,
   PRIMARY KEY (actor_id, theme_id)
 )`)
+
+// Versioned, idempotent multi-user migration. It runs only after every legacy
+// table exists so old databases can be upgraded in-place without data loss.
+runMigrations(db)
+const userRepo = new UserRepository(db)
+if (process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD) {
+  await ensureLegacyAdminPassword(db, process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD)
+}
 // Initialize AIC sequence — start above v1 task count to avoid id collision (cosmetic)
 try {
   const v1Count = (db.prepare(`SELECT COUNT(*) AS n FROM group_tasks`).get() as any).n || 0
