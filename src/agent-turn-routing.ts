@@ -10,6 +10,7 @@
  */
 export type AgentTurnRoute = {
   id: string
+  userId: string
   conversationId: string
   observeOnly: boolean
   dispatchId: string

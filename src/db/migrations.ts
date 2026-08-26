@@ -116,6 +116,26 @@ const MIGRATIONS: Migration[] = [
       db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_seen_owner_actor_channel ON actor_channel_seen(user_id, actor_id, channel)`)
     },
   },
+  {
+    version: 3,
+    name: 'user_scoped_seen_marks',
+    up(db) {
+      db.run(`ALTER TABLE actor_channel_seen RENAME TO actor_channel_seen_legacy`)
+      db.run(`CREATE TABLE actor_channel_seen (
+        user_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        last_seen_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, actor_id, channel),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )`)
+      db.run(`INSERT OR IGNORE INTO actor_channel_seen (user_id, actor_id, channel, last_seen_id, updated_at)
+        SELECT COALESCE(NULLIF(user_id, ''), '${LEGACY_ADMIN_ID}'), actor_id, channel, last_seen_id, updated_at
+        FROM actor_channel_seen_legacy`)
+      db.run(`DROP TABLE actor_channel_seen_legacy`)
+    },
+  },
 ]
 
 export function runMigrations(db: Database): void {
@@ -142,4 +162,3 @@ export function runMigrations(db: Database): void {
     }
   }
 }
-

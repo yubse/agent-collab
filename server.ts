@@ -397,6 +397,7 @@ type GroupMember = {
 
 type GroupRecord = {
   id: string
+  user_id: string
   ts: string
   conversation_id: string
   sender_id: string
@@ -645,7 +646,7 @@ function handleProviderEvent(agentId: string, ev: AgentEvent): void {
       // This is what lets Creative explicitly hand a question to Product and receive
       // Product's follow-up in the same group.
       const mentions = normalizeGroupMentions([], text)
-      const responseTargets = groupTargetsFor(agentId, mentions, activeRoute.hopCount, conversationId)
+      const responseTargets = groupTargetsFor(agentId, mentions, activeRoute.hopCount, conversationId, activeRoute.userId)
       const delivery = {
         mode: mentions.length ? 'mention' : 'broadcast',
         targets: responseTargets,
@@ -663,13 +664,14 @@ function handleProviderEvent(agentId: string, ev: AgentEvent): void {
         },
         mentions,
         delivery,
+        activeRoute.userId,
       )
       if (responseTargets.length) {
         dispatchGroupRecord(record, responseTargets, activeRoute.hopCount)
       }
       // Non-mentioned agents still receive the message as silent context.
       if (!dmAgentFor(conversationId)) {
-        const observers = groupObserverTargetsFor(agentId, responseTargets, conversationId)
+        const observers = groupObserverTargetsFor(agentId, responseTargets, conversationId, activeRoute.userId)
         if (observers.length) {
           dispatchGroupRecord(record, observers, activeRoute.hopCount, /* observeOnly */ true)
         }
@@ -759,8 +761,19 @@ type GroupConversationSummary = {
   member_ids: string[]
 }
 
-function groupConversationById(id: string): GroupConversationSummary | null {
-  const row = db.prepare(`SELECT id, name, created_at, created_by, is_default FROM group_conversations WHERE id=?`).get(id) as any
+function ensureUserDefaultConversation(user: AuthenticatedUser): GroupConversationSummary {
+  const existing = db.prepare(`SELECT id FROM group_conversations WHERE user_id=? AND is_default=1 LIMIT 1`).get(user.id) as any
+  if (existing) return groupConversationById(String(existing.id), user.id)!
+  const id = user.id === LEGACY_ADMIN_ID ? 'workgroup' : `workgroup-${user.id.slice(4, 16)}`
+  const now = groupNowIso()
+  db.run(`INSERT INTO group_conversations (id, name, created_at, created_by, is_default, user_id)
+    VALUES (?, '工作群', ?, ?, 1, ?)`, [id, now, user.id, user.id])
+  saveConversationMembers(id, ['admin', ...ROLE_AGENT_IDS])
+  return groupConversationById(id, user.id)!
+}
+
+function groupConversationById(id: string, userId: string): GroupConversationSummary | null {
+  const row = db.prepare(`SELECT id, name, created_at, created_by, is_default FROM group_conversations WHERE id=? AND user_id=?`).get(id, userId) as any
   if (!row) return null
   const members = db.prepare(`SELECT member_id FROM group_conversation_members WHERE conversation_id=? ORDER BY member_id`).all(id) as any[]
   return {
@@ -773,18 +786,20 @@ function groupConversationById(id: string): GroupConversationSummary | null {
   }
 }
 
-function listGroupConversations(): GroupConversationSummary[] {
-  const rows = db.prepare(`SELECT id FROM group_conversations ORDER BY is_default DESC, created_at ASC`).all() as any[]
-  return rows.map((row) => groupConversationById(String(row.id))).filter(Boolean) as GroupConversationSummary[]
+function listGroupConversations(userId: string): GroupConversationSummary[] {
+  const rows = db.prepare(`SELECT id FROM group_conversations WHERE user_id=? ORDER BY is_default DESC, created_at ASC`).all(userId) as any[]
+  return rows.map((row) => groupConversationById(String(row.id), userId)).filter(Boolean) as GroupConversationSummary[]
 }
 
-function groupMemberIds(conversationId: string): string[] {
-  return (db.prepare(`SELECT member_id FROM group_conversation_members WHERE conversation_id=?`).all(conversationId) as any[])
+function groupMemberIds(conversationId: string, userId: string): string[] {
+  return (db.prepare(`SELECT m.member_id FROM group_conversation_members m
+    JOIN group_conversations c ON c.id=m.conversation_id
+    WHERE m.conversation_id=? AND c.user_id=?`).all(conversationId, userId) as any[])
     .map((row) => String(row.member_id))
 }
 
-function groupAgentIds(conversationId: string): string[] {
-  const memberSet = new Set(groupMemberIds(conversationId))
+function groupAgentIds(conversationId: string, userId: string): string[] {
+  const memberSet = new Set(groupMemberIds(conversationId, userId))
   return GROUP_REPLY_AGENT_IDS.filter((id) => memberSet.has(id))
 }
 
@@ -1320,14 +1335,15 @@ function notifyActorViaDM(actor_id: string, task: any, event: any) {
   const delivery = { mode: 'dm', targets: [actor_id], dispatch_id: dispatchId, delivered: [], failed: [] }
   const meta = { task_id: task.id, event_id: event.id, event_type: event.meta?.event_type }
   db.run(
-    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [recordId, ts, `dm-${actor_id}`, 'system', null, text, '[]', '[]', '[]', null, null, 'task_notify', JSON.stringify(delivery), JSON.stringify(meta), 'system_notification', task.id, null, actor_id],
+    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [recordId, ts, `dm-${actor_id}`, 'system', null, text, '[]', '[]', '[]', null, null, 'task_notify', JSON.stringify(delivery), JSON.stringify(meta), 'system_notification', task.id, null, actor_id, task.user_id],
   )
   // Tmux injection for agents only (admin is human, no agent session for DM)
   if (actor_id !== 'admin') {
     const record: GroupRecord = {
       id: recordId, ts,
+      user_id: task.user_id,
       conversation_id: `dm-${actor_id}`,
       sender_id: 'system', sender_model: null,
       text, images: [], files: [], mentions: [],
@@ -1476,7 +1492,8 @@ function previousNonAutoPhase(type: string, current: string): string | null {
 }
 
 // Refresh task row from DB
-function loadTask(task_id: string): any | null {
+function loadTask(task_id: string, userId?: string): any | null {
+  if (userId) return db.prepare(`SELECT * FROM tasks_v2 WHERE id = ? AND user_id=?`).get(task_id, userId) || null
   return db.prepare(`SELECT * FROM tasks_v2 WHERE id = ?`).get(task_id) || null
 }
 
@@ -1601,9 +1618,9 @@ function defaultGroupResponder() {
   return defaultOn || GROUP_REPLY_AGENT_IDS.find((id) => groupAgentAutoReply(id)) || null
 }
 
-function groupTargetsFor(senderId: string, mentions: string[], hopCount = 0, conversationId = 'workgroup') {
+function groupTargetsFor(senderId: string, mentions: string[], hopCount: number, conversationId: string, userId: string) {
   const sender = GROUP_ROSTER_BY_ID.get(senderId)
-  const replyable = groupAgentIds(conversationId).filter((id) => groupAgentAutoReply(id))
+  const replyable = groupAgentIds(conversationId, userId).filter((id) => groupAgentAutoReply(id))
   if (!sender?.can_reply) {
     const effective = mentions.length ? mentions : replyable
     if (effective.includes(GROUP_ALL_TOKEN)) return replyable
@@ -1613,10 +1630,10 @@ function groupTargetsFor(senderId: string, mentions: string[], hopCount = 0, con
   return mentions.filter((id) => replyable.includes(id) && id !== senderId)
 }
 
-function groupObserverTargetsFor(senderId: string, responseTargets: string[], conversationId = 'workgroup') {
+function groupObserverTargetsFor(senderId: string, responseTargets: string[], conversationId: string, userId: string) {
   const sender = GROUP_ROSTER_BY_ID.get(senderId)
   const responseSet = new Set(responseTargets)
-  return groupAgentIds(conversationId).filter((id) => {
+  return groupAgentIds(conversationId, userId).filter((id) => {
     if (id === senderId || responseSet.has(id)) return false
     return groupAgentAutoReply(id)
   })
@@ -1836,6 +1853,7 @@ function groupMembersPayload() {
 function groupRowToRecord(row: any): GroupRecord {
   return {
     id: row.id,
+    user_id: row.user_id,
     ts: row.ts,
     conversation_id: row.conversation_id || 'workgroup',
     sender_id: row.sender_id,
@@ -1856,24 +1874,24 @@ function groupRowToRecord(row: any): GroupRecord {
   }
 }
 
-function readGroupRecords(since: string | null, limit: number, conversationId?: string, beforeId?: string | null) {
+function readGroupRecords(userId: string, since: string | null, limit: number, conversationId?: string, beforeId?: string | null) {
   const safeLimit = Math.min(Math.max(limit || 120, 1), 500)
   let rows: any[]
   // AIC-90: before_id 历史分页 — 取 ts < anchor.ts (按 ts DESC) limit 条 + reverse 让最早在头
   if (beforeId) {
-    const anchor = db.prepare(`SELECT ts FROM group_messages WHERE id = ?`).get(beforeId) as any
+    const anchor = db.prepare(`SELECT ts FROM group_messages WHERE id = ? AND user_id=?`).get(beforeId, userId) as any
     if (!anchor) return []
     rows = conversationId
-      ? (db.prepare(`SELECT * FROM group_messages WHERE conversation_id = ? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(conversationId, anchor.ts, safeLimit) as any[]).reverse()
-      : (db.prepare(`SELECT * FROM group_messages WHERE ts < ? ORDER BY ts DESC LIMIT ?`).all(anchor.ts, safeLimit) as any[]).reverse()
+      ? (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id = ? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(userId, conversationId, anchor.ts, safeLimit) as any[]).reverse()
+      : (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(userId, anchor.ts, safeLimit) as any[]).reverse()
   } else if (conversationId) {
     rows = since
-      ? db.prepare(`SELECT * FROM group_messages WHERE conversation_id = ? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(conversationId, since, safeLimit) as any[]
-      : (db.prepare(`SELECT * FROM group_messages WHERE conversation_id = ? ORDER BY ts DESC LIMIT ?`).all(conversationId, safeLimit) as any[]).reverse()
+      ? db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id = ? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(userId, conversationId, since, safeLimit) as any[]
+      : (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id = ? ORDER BY ts DESC LIMIT ?`).all(userId, conversationId, safeLimit) as any[]).reverse()
   } else {
     rows = since
-      ? db.prepare(`SELECT * FROM group_messages WHERE ts > ? ORDER BY ts ASC LIMIT ?`).all(since, safeLimit) as any[]
-      : (db.prepare(`SELECT * FROM group_messages ORDER BY ts DESC LIMIT ?`).all(safeLimit) as any[]).reverse()
+      ? db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(userId, since, safeLimit) as any[]
+      : (db.prepare(`SELECT * FROM group_messages WHERE user_id=? ORDER BY ts DESC LIMIT ?`).all(userId, safeLimit) as any[]).reverse()
   }
   return rows.map(groupRowToRecord)
 }
@@ -1973,7 +1991,7 @@ function setGroupAgentAutoReply(agentId: string, enabled: boolean) {
   )
 }
 
-function appendGroupRecord(input: any, mentions: string[], delivery: any) {
+function appendGroupRecord(input: any, mentions: string[], delivery: any, userId: string) {
   const senderId = String(input.sender_id || 'admin').trim()
   const member = GROUP_ROSTER_BY_ID.get(senderId)
   if (!member) throw new Error(`unknown sender_id: ${senderId}`)
@@ -1988,6 +2006,7 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any) {
   const ts = groupNowIso()
   const record: GroupRecord = {
     id: groupId('grp'),
+    user_id: userId,
     ts,
     conversation_id: String(input.conversation_id || 'workgroup'),
     sender_id: senderId,
@@ -2007,8 +2026,8 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any) {
     owner: String(input.owner || '').trim() || (delivery.targets?.[0] || null),
   }
   db.run(
-    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       record.id,
       record.ts,
@@ -2028,6 +2047,7 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any) {
       record.task_id,
       record.parent_task_id,
       record.owner,
+      record.user_id,
     ],
   )
   // AIC-51: previously agent post → markAgentIdle as a "round done" heuristic.
@@ -2041,8 +2061,8 @@ function saveGroupDelivery(recordId: string, delivery: any) {
   db.run(`UPDATE group_messages SET delivery = ? WHERE id = ?`, [JSON.stringify(delivery), recordId])
 }
 
-function groupContextLines(limit = 16) {
-  return readGroupRecords(null, limit, 'workgroup').map((rec) => {
+function groupContextLines(userId: string, conversationId: string, limit = 16) {
+  return readGroupRecords(userId, null, limit, conversationId).map((rec) => {
     const member = GROUP_ROSTER_BY_ID.get(rec.sender_id)
     const name = member?.display_name || rec.sender_id
     const text = rec.text.replace(/\s+/g, ' ').slice(0, 180)
@@ -2110,22 +2130,25 @@ function dmAgentFor(conversationId: string | null | undefined): string | null {
   return member && member.kind === 'agent' && member.can_reply ? agent : null
 }
 
-function allowedGroupConversationsForSender(senderId: string): Set<string> {
+function allowedGroupConversationsForSender(senderId: string, userId: string): Set<string> {
   if (senderId === 'admin') {
-    return new Set([...listGroupConversations().map((group) => group.id), ...GROUP_REPLY_AGENT_IDS.map((id) => `dm-${id}`)])
+    return new Set([...listGroupConversations(userId).map((group) => group.id), ...GROUP_REPLY_AGENT_IDS.map((id) => `dm-${id}`)])
   }
   const member = GROUP_ROSTER_BY_ID.get(senderId)
   if (member?.kind === 'agent' && member.can_reply) {
-    const groupIds = (db.prepare(`SELECT conversation_id FROM group_conversation_members WHERE member_id=?`).all(senderId) as any[])
+    const groupIds = (db.prepare(`SELECT m.conversation_id FROM group_conversation_members m
+      JOIN group_conversations c ON c.id=m.conversation_id
+      WHERE m.member_id=? AND c.user_id=?`).all(senderId, userId) as any[])
       .map((row) => String(row.conversation_id))
     return new Set([...groupIds, `dm-${senderId}`])
   }
   return new Set(['workgroup'])
 }
 
-function assertGroupConversationAllowed(senderId: string, conversationId: string | null | undefined) {
-  const normalizedConversationId = String(conversationId || 'workgroup').trim() || 'workgroup'
-  const allowed = allowedGroupConversationsForSender(senderId)
+function assertGroupConversationAllowed(senderId: string, conversationId: string | null | undefined, userId: string) {
+  const normalizedConversationId = String(conversationId || '').trim()
+  if (!normalizedConversationId) throw new Error('conversation_id required')
+  const allowed = allowedGroupConversationsForSender(senderId, userId)
   if (!allowed.has(normalizedConversationId)) {
     throw new Error(`sender ${senderId} cannot post to ${normalizedConversationId}`)
   }
@@ -2240,6 +2263,7 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
     const turnRouteId = groupId('turn')
     _agentTurnRoutes.enqueue(target, {
       id: turnRouteId,
+      userId: record.user_id,
       conversationId: record.conversation_id,
       observeOnly,
       dispatchId: record.delivery.dispatch_id,
@@ -2598,6 +2622,35 @@ Bun.serve({
       }
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/conversations' && isAuthed) {
+      ensureUserDefaultConversation(currentUser!)
+      return Response.json({ ok: true, conversations: userRepo.listConversations(currentUser!.id) })
+    }
+
+    const conversationMessagesMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/)
+    if (req.method === 'GET' && conversationMessagesMatch && isAuthed) {
+      const conversationId = decodeURIComponent(conversationMessagesMatch[1])
+      if (!userRepo.getConversation(currentUser!.id, conversationId) && !dmAgentFor(conversationId)) {
+        return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
+      }
+      return Response.json({ ok: true, messages: userRepo.listMessages(currentUser!.id, conversationId) })
+    }
+
+    const agentMemoryMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/memory$/)
+    if (agentMemoryMatch && isAuthed) {
+      const agentId = decodeURIComponent(agentMemoryMatch[1])
+      if (!ROLE_AGENT_IDS.includes(agentId as typeof ROLE_AGENT_IDS[number])) {
+        return Response.json({ ok: false, error: 'unknown agent' }, { status: 404 })
+      }
+      if (req.method === 'GET') {
+        return Response.json({ ok: true, memory: userRepo.memory(currentUser!.id, agentId) })
+      }
+      if (req.method === 'PUT') {
+        const body = await req.json().catch(() => ({})) as any
+        return Response.json({ ok: true, memory: userRepo.saveMemory(currentUser!.id, agentId, String(body.content || '')) })
+      }
+    }
+
     // Workgroup roster: GET /group/roster
     if (req.method === 'GET' && url.pathname === '/group/roster' && isAuthed) {
       return Response.json({
@@ -2667,7 +2720,8 @@ Bun.serve({
 
     // Multi-workgroup management.
     if (req.method === 'GET' && url.pathname === '/groups' && isAuthed) {
-      return Response.json({ ok: true, groups: listGroupConversations() })
+      ensureUserDefaultConversation(currentUser!)
+      return Response.json({ ok: true, groups: listGroupConversations(currentUser!.id) })
     }
 
     if (req.method === 'POST' && url.pathname === '/groups' && isAuthed) {
@@ -2681,14 +2735,14 @@ Bun.serve({
         const now = groupNowIso()
         db.run(`BEGIN IMMEDIATE`)
         try {
-          db.run(`INSERT INTO group_conversations (id, name, created_at, created_by, is_default) VALUES (?, ?, ?, 'admin', 0)`, [id, name, now])
+          db.run(`INSERT INTO group_conversations (id, name, created_at, created_by, is_default, user_id) VALUES (?, ?, ?, ?, 0, ?)`, [id, name, now, currentUser!.id, currentUser!.id])
           saveConversationMembers(id, memberIds)
           db.run(`COMMIT`)
         } catch (e) {
           try { db.run(`ROLLBACK`) } catch {}
           throw e
         }
-        return Response.json({ ok: true, group: groupConversationById(id) }, { status: 201 })
+        return Response.json({ ok: true, group: groupConversationById(id, currentUser!.id) }, { status: 201 })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
       }
@@ -2698,7 +2752,7 @@ Bun.serve({
     if (req.method === 'PUT' && groupManageMatch && isAuthed) {
       try {
         const groupIdValue = decodeURIComponent(groupManageMatch[1])
-        const existing = groupConversationById(groupIdValue)
+        const existing = groupConversationById(groupIdValue, currentUser!.id)
         if (!existing) return Response.json({ ok: false, error: '群不存在' }, { status: 404 })
         const body = await req.json() as any
         const name = String(body.name ?? existing.name).trim().slice(0, 60)
@@ -2714,7 +2768,7 @@ Bun.serve({
           try { db.run(`ROLLBACK`) } catch {}
           throw e
         }
-        return Response.json({ ok: true, group: groupConversationById(groupIdValue) })
+        return Response.json({ ok: true, group: groupConversationById(groupIdValue, currentUser!.id) })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
       }
@@ -2749,8 +2803,12 @@ Bun.serve({
       const since = url.searchParams.get('since')
       const beforeId = url.searchParams.get('before_id')        // AIC-90: 历史分页
       const limit = parseInt(url.searchParams.get('limit') || '120')
-      const conversationId = url.searchParams.get('conversation_id') || 'workgroup'
-      const records = readGroupRecords(since, limit, conversationId, beforeId)
+      const defaultConversation = ensureUserDefaultConversation(currentUser!)
+      const conversationId = url.searchParams.get('conversation_id') || defaultConversation.id
+      if (!allowedGroupConversationsForSender('admin', currentUser!.id).has(conversationId)) {
+        return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
+      }
+      const records = readGroupRecords(currentUser!.id, since, limit, conversationId, beforeId)
       // AIC-90: 历史分页返 cursor (= 最早一条 id, client 下次传 before_id 用) + has_more
       // 兼容老 caller (不传 before_id 行为不变, cursor=null has_more=false)
       const isHistoryFetch = !!beforeId
@@ -2774,13 +2832,15 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const text = String(body.text || '')
-        const senderId = String(body.sender_id || 'admin').trim()
+        // Browser clients cannot choose an identity. The authenticated user is
+        // represented as the human `admin` actor inside their private workspace.
+        const senderId = 'admin'
         // v2 system virtual identity: external clients cannot impersonate system.
         // notifyActorViaDM (server-internal) writes directly to group_messages without going through this endpoint.
         if (senderId === 'system') return Response.json({ ok: false, error: 'sender_id=system is internal-only' }, { status: 403 })
         // Reject any message targeting dm-system (system has no DM channel to reply into).
         if (String(body.conversation_id || '') === 'dm-system') return Response.json({ ok: false, error: 'dm-system is not a valid conversation' }, { status: 400 })
-        assertGroupConversationAllowed(senderId, body.conversation_id)
+        assertGroupConversationAllowed(senderId, body.conversation_id, currentUser!.id)
         const hopCount = parseInt(String(body.hop_count || '0')) || 0
 
         // Direct message (1:1) conversation, e.g. conversation_id='dm-agent1'.
@@ -2796,14 +2856,14 @@ Bun.serve({
           }
           const dmTargets = senderId === dmAgent ? [] : [dmAgent]
           const dmDelivery = { targets: dmTargets, mode: 'dm', dispatch_id: groupId('dsp'), delivered: [], failed: [] }
-          const dmRecord = appendGroupRecord({ ...body, sender_id: senderId }, [], dmDelivery)
+          const dmRecord = appendGroupRecord({ ...body, sender_id: senderId }, [], dmDelivery, currentUser!.id)
           if (dmTargets.length > 0) dispatchGroupRecord(dmRecord, dmTargets, hopCount)
           return Response.json({ ok: true, record: dmRecord, targets: dmTargets, observers: [] })
         }
 
         const mentions = normalizeGroupMentions(body.mentions, text)
         const conversationId = String(body.conversation_id || 'workgroup')
-        const targets = groupTargetsFor(senderId, mentions, hopCount, conversationId)
+        const targets = groupTargetsFor(senderId, mentions, hopCount, conversationId, currentUser!.id)
         const delivery = {
           targets,
           mode: mentions.includes(GROUP_ALL_TOKEN) ? 'all' : (mentions.length ? 'mention' : 'default'),
@@ -2811,9 +2871,9 @@ Bun.serve({
           delivered: [],
           failed: [],
         }
-        const record = appendGroupRecord({ ...body, sender_id: senderId }, mentions, delivery)
+        const record = appendGroupRecord({ ...body, sender_id: senderId }, mentions, delivery, currentUser!.id)
         if (targets.length > 0) dispatchGroupRecord(record, targets, hopCount)
-        const observers = groupObserverTargetsFor(senderId, targets, conversationId)
+        const observers = groupObserverTargetsFor(senderId, targets, conversationId, currentUser!.id)
         if (observers.length > 0) dispatchGroupRecord(record, observers, hopCount, true)
         return Response.json({ ok: true, record, targets, observers })
       } catch (e: any) {
@@ -2913,23 +2973,17 @@ Bun.serve({
     if (req.method === 'POST' && url.pathname === '/seen' && isAuthed) {
       try {
         const body = await req.json() as any
-        const actorId = String(body.actor_id || '').trim()
+        const actorId = 'admin'
         const channel = String(body.channel || '').trim()
         const lastSeenId = String(body.last_seen_id || '').trim()
         if (!actorId || !channel || !lastSeenId) {
           return Response.json({ ok: false, error: 'actor_id, channel, last_seen_id required' }, { status: 400 })
         }
-        const mode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
-        const isSelf = mode === 'header' && body.sender_id === actorId
-        const isPm = mode === 'cookie' || mode === 'local' || (mode === 'header' && body.sender_id === 'admin')
-        if (!isSelf && !isPm) {
-          return Response.json({ ok: false, error: `actor ${actorId} must auth as self or PM proxy` }, { status: 403 })
-        }
         const now = groupNowIso()
         db.run(
-          `INSERT INTO actor_channel_seen (actor_id, channel, last_seen_id, updated_at) VALUES (?, ?, ?, ?)
-           ON CONFLICT(actor_id, channel) DO UPDATE SET last_seen_id = excluded.last_seen_id, updated_at = excluded.updated_at`,
-          [actorId, channel, lastSeenId, now],
+          `INSERT INTO actor_channel_seen (user_id, actor_id, channel, last_seen_id, updated_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, actor_id, channel) DO UPDATE SET last_seen_id = excluded.last_seen_id, updated_at = excluded.updated_at`,
+          [currentUser!.id, actorId, channel, lastSeenId, now],
         )
         return Response.json({ ok: true, updated_at: now })
       } catch (e: any) {
@@ -2938,9 +2992,8 @@ Bun.serve({
     }
 
     if (req.method === 'GET' && url.pathname === '/seen' && isAuthed) {
-      const actorId = (url.searchParams.get('actor_id') || '').trim()
-      if (!actorId) return Response.json({ ok: false, error: 'actor_id query param required' }, { status: 400 })
-      const rows = db.prepare(`SELECT channel, last_seen_id, updated_at FROM actor_channel_seen WHERE actor_id = ?`).all(actorId) as any[]
+      const actorId = 'admin'
+      const rows = db.prepare(`SELECT channel, last_seen_id, updated_at FROM actor_channel_seen WHERE user_id=? AND actor_id = ?`).all(currentUser!.id, actorId) as any[]
       const channels: Record<string, { last_seen_id: string; updated_at: string }> = {}
       for (const r of rows) channels[r.channel] = { last_seen_id: r.last_seen_id, updated_at: r.updated_at }
       return Response.json({ ok: true, actor_id: actorId, channels })
@@ -2975,8 +3028,8 @@ Bun.serve({
     if (req.method === 'GET' && url.pathname === '/group/tasks' && isAuthed) {
       const status = url.searchParams.get('status') || ''
       const category = url.searchParams.get('category') || ''
-      const where: string[] = []
-      const params: any[] = []
+      const where: string[] = ['user_id = ?']
+      const params: any[] = [currentUser!.id]
       if (status === 'draft') {
         where.push(`status = 'active' AND phase = 'draft'`)
       } else if (status === 'active') {
@@ -3255,11 +3308,11 @@ Bun.serve({
 
     // Helper: resolve PM auth (cookie / local / Bearer+sender_id=admin) and "actor as me" auth (Bearer + matching sender_id).
     const v2AuthInfo = () => {
-      const mode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
-      return { mode }
+      return { mode: currentUser ? 'session' : null }
     }
-    const v2IsPm = (info: { mode: string }, body: any) =>
-      info.mode === 'cookie' || info.mode === 'local' || (info.mode === 'header' && body?.sender_id === 'admin')
+    // Every authenticated user is the human/PM inside their own private workspace.
+    // The global admin role is reserved for tenant management, not task ownership.
+    const v2IsPm = (info: { mode: string | null }, _body: any) => info.mode === 'session'
 
     // AIC-87: v2 categories CRUD — 接替 v1 /group/tasks/categories (后者已 410)。
     // 数据共用 task_categories 表 (v1/v2 共享分类元数据,v2 tasks_v2.category 也读这张)。
@@ -3412,9 +3465,7 @@ Bun.serve({
     if (req.method === 'DELETE' && /^\/tasks\/phase_templates\/[^/]+$/.test(url.pathname) && isAuthed) {
       try {
         const info = v2AuthInfo()
-        if (info.mode !== 'cookie' && info.mode !== 'local') {
-          return Response.json({ ok: false, error: 'only PM (cookie/local) can delete phase templates' }, { status: 403 })
-        }
+        if (!v2IsPm(info, null)) return Response.json({ ok: false, error: 'only PM can delete phase templates' }, { status: 403 })
         const id = decodeURIComponent(url.pathname.slice('/tasks/phase_templates/'.length))
         if (!PHASE_TEMPLATES[id]) return Response.json({ ok: false, error: 'phase template not found' }, { status: 404 })
         if (RESERVED_PHASE_IDS.has(id)) return Response.json({ ok: false, error: `phase template '${id}' is reserved (runtime hardcoded); not deletable` }, { status: 409 })
@@ -3497,9 +3548,7 @@ Bun.serve({
     if (req.method === 'DELETE' && /^\/tasks\/workflow_templates\/[^/]+$/.test(url.pathname) && isAuthed) {
       try {
         const info = v2AuthInfo()
-        if (info.mode !== 'cookie' && info.mode !== 'local') {
-          return Response.json({ ok: false, error: 'only PM (cookie/local) can delete workflow templates' }, { status: 403 })
-        }
+        if (!v2IsPm(info, null)) return Response.json({ ok: false, error: 'only PM can delete workflow templates' }, { status: 403 })
         const key = decodeURIComponent(url.pathname.slice('/tasks/workflow_templates/'.length))
         if (!WORKFLOW_TEMPLATES[key]) return Response.json({ ok: false, error: 'template not found' }, { status: 404 })
         const openCount = (db.prepare(`SELECT COUNT(*) AS n FROM tasks_v2 WHERE type = ? AND status = 'open'`).get(key) as any).n
@@ -3521,8 +3570,8 @@ Bun.serve({
       const category = url.searchParams.get('category') || ''
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 200)
       const offset = parseInt(url.searchParams.get('offset') || '0')
-      const where: string[] = []
-      const params: any[] = []
+      const where: string[] = ['user_id = ?']
+      const params: any[] = [currentUser!.id]
       // 2026-06-20: mirror /group/tasks's 3-bucket semantics on v2. Previously this
       // only matched 'open' / 'closed'; passing status='draft' silently fell
       // through to no filter and returned every task in the table.
@@ -3537,7 +3586,7 @@ Bun.serve({
       }
       if (type) { where.push('type = ?'); params.push(type) }
       if (category) { where.push('category = ?'); params.push(category) }
-      const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+      const whereSql = `WHERE ${where.join(' AND ')}`
       const total = (db.prepare(`SELECT COUNT(*) AS n FROM tasks_v2 ${whereSql}`).get(...params) as any).n
       const rows = db.prepare(`SELECT * FROM tasks_v2 ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params, limit, offset) as any[]
       for (const row of rows) {
@@ -3563,7 +3612,7 @@ Bun.serve({
       if (!taskId || taskId.includes('/')) {
         // fall through; might be sub-resource path
       } else {
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         attachPendingFields(task)
         const events = (db.prepare(`SELECT * FROM task_events WHERE task_id=? ORDER BY id ASC`).all(taskId) as any[]).map(e => ({
@@ -3579,6 +3628,7 @@ Bun.serve({
     // 12.13 GET /tasks/:id/events — long poll for new events on a task
     if (req.method === 'GET' && url.pathname.startsWith('/tasks/') && url.pathname.endsWith('/events') && isAuthed) {
       const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/events'.length))
+      if (!loadTask(taskId, currentUser!.id)) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
       // AIC-117 cycle 2: accept `since` as alias for `since_event_id` (scope 字面写的是 `since=ULID`).
       const sinceEventId = url.searchParams.get('since_event_id') || url.searchParams.get('since') || ''
       // before_id 历史分页 (跟 /group/poll 同款, before_event_id 兼容老 caller)
@@ -3626,7 +3676,7 @@ Bun.serve({
       const sinceCursor = url.searchParams.get('since_cursor') || ''
       const timeout = Math.min(parseInt(url.searchParams.get('timeout') || '30'), 30) * 1000
       const buildSnapshot = () => {
-        const rows = db.prepare(`SELECT * FROM tasks_v2 WHERE status='open' ORDER BY updated_at DESC`).all() as any[]
+        const rows = db.prepare(`SELECT * FROM tasks_v2 WHERE user_id=? AND status='open' ORDER BY updated_at DESC`).all(currentUser!.id) as any[]
         for (const row of rows) {
           attachPendingFields(row)
           const latest = db.prepare(`SELECT id, ts, kind, actor_id, meta, body FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1`).get(row.id) as any
@@ -3691,15 +3741,15 @@ Bun.serve({
         const id = `AIC-${seq}`
         const now = groupNowIso()
         db.run(
-          `INSERT INTO tasks_v2 (id, title, description, type, category, current_phase, status, created_at, created_by, updated_at) VALUES (?, ?, ?, ?, ?, 'draft', 'open', ?, ?, ?)`,
-          [id, title, body.description || '', type, body.category || '', now, body.sender_id || 'admin', now],
+          `INSERT INTO tasks_v2 (id, title, description, type, category, current_phase, status, created_at, created_by, updated_at, user_id, conversation_id) VALUES (?, ?, ?, ?, ?, 'draft', 'open', ?, ?, ?, ?, ?)`,
+          [id, title, body.description || '', type, body.category || '', now, 'admin', now, currentUser!.id, body.conversation_id || null],
         )
         // Insert the draft phase's role checks (PM is the "owner" of draft, no actual check needed but row exists for cycle tracking)
         db.run(
           `INSERT INTO task_phase_role_checks (task_id, phase, cycle, role_id) VALUES (?, 'draft', 1, 'pm')`, [id],
         )
         insertTaskEvent(id, 'system_event', body.sender_id || 'admin', `${ACTOR_DISPLAY_NAMES[body.sender_id || 'admin']} 创建了任务`, { event_type: 'task_created' })
-        const task = attachPendingFields(loadTask(id))
+        const task = attachPendingFields(loadTask(id, currentUser!.id))
         wakeTaskWaiters(id)
         return Response.json({ ok: true, task })
       } catch (e: any) {
@@ -3714,7 +3764,7 @@ Bun.serve({
         const info = v2AuthInfo()
         if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can publish tasks' }, { status: 403 })
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/publish'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         if (task.current_phase !== 'draft') return Response.json({ ok: false, error: `task is in '${task.current_phase}', not draft` }, { status: 400 })
         const phases = WORKFLOW_TEMPLATES[task.type]?.phases || []
@@ -3722,7 +3772,7 @@ Bun.serve({
         const firstPhase = phases[draftIdx + 1]
         if (!firstPhase) return Response.json({ ok: false, error: 'no next phase defined' }, { status: 500 })
         enterPhase(task, firstPhase.key, 'draft', 'publish')
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated })
       } catch (e: any) {
@@ -3735,7 +3785,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/advance'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const phaseDef = findPhaseDef(task.type, task.current_phase)
         if (!phaseDef) return Response.json({ ok: false, error: `bad phase ${task.current_phase}` }, { status: 500 })
@@ -3776,7 +3826,7 @@ Bun.serve({
         )
         // Check whether phase fully checked → advance
         const advanced = maybeAdvancePhase(loadTask(taskId))
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated, advanced })
       } catch (e: any) {
@@ -3789,7 +3839,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/reject'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const phaseDef = findPhaseDef(task.type, task.current_phase)
         if (!phaseDef) return Response.json({ ok: false, error: `bad phase ${task.current_phase}` }, { status: 500 })
@@ -3815,7 +3865,7 @@ Bun.serve({
           event_type: 'phase_reject_action', from_phase: task.current_phase, from_phase_label: phaseDef.label, to_phase: prevPhase, to_phase_label: findPhaseDef(task.type, prevPhase)?.label, comment, rejected_by_actor: actorId,
         })
         enterPhase(task, prevPhase, task.current_phase, 'reject')
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated })
       } catch (e: any) {
@@ -3830,7 +3880,7 @@ Bun.serve({
         const info = v2AuthInfo()
         if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can rollback' }, { status: 403 })
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/rollback'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const toPhase = String(body.to_phase || '').trim()
         const phases = WORKFLOW_TEMPLATES[task.type]?.phases || []
@@ -3844,7 +3894,7 @@ Bun.serve({
           event_type: 'phase_rollback_action', from_phase: task.current_phase, from_phase_label: findPhaseDef(task.type, task.current_phase)?.label, to_phase: toPhase, to_phase_label: findPhaseDef(task.type, toPhase)?.label, comment,
         })
         enterPhase(task, toPhase, task.current_phase, 'rollback')
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated })
       } catch (e: any) {
@@ -3857,7 +3907,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/comments'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const actorId = String(body.actor_id || '').trim()
         if (!actorId) return Response.json({ ok: false, error: 'actor_id required' }, { status: 400 })
@@ -3897,7 +3947,7 @@ Bun.serve({
         const info = v2AuthInfo()
         if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can edit tasks' }, { status: 403 })
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const sets: string[] = []
         const vals: any[] = []
@@ -3908,7 +3958,7 @@ Bun.serve({
         sets.push('updated_at = ?'); vals.push(groupNowIso())
         vals.push(taskId)
         db.run(`UPDATE tasks_v2 SET ${sets.join(', ')} WHERE id = ?`, vals)
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated })
       } catch (e: any) {
@@ -3919,11 +3969,8 @@ Bun.serve({
     // 12.10 DELETE /tasks/:id — delete task and cascade events/checks (PM only)
     if (req.method === 'DELETE' && /^\/tasks\/[^/]+$/.test(url.pathname) && isAuthed) {
       const info = v2AuthInfo()
-      if (info.mode !== 'cookie' && info.mode !== 'local') {
-        return Response.json({ ok: false, error: 'only PM (cookie/local) can delete tasks' }, { status: 403 })
-      }
       const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length))
-      const task = loadTask(taskId)
+      const task = loadTask(taskId, currentUser!.id)
       if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
       // Cascade delete (FK ON DELETE CASCADE handles events / checks / seen_marks)
       db.run(`DELETE FROM tasks_v2 WHERE id = ?`, taskId)
@@ -3937,7 +3984,8 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/seen'.length))
-        const actorId = String(body.actor_id || '').trim()
+        if (!loadTask(taskId, currentUser!.id)) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
+        const actorId = 'admin'
         const eventId = String(body.last_seen_event_id || '').trim()
         if (!actorId || !eventId) return Response.json({ ok: false, error: 'actor_id + last_seen_event_id required' }, { status: 400 })
         const ts = groupNowIso()
@@ -3980,8 +4028,8 @@ Bun.serve({
         const groupChs = channels.filter(c => !c.startsWith('task:'))
         const includeGroup = channels.length === 0 || groupChs.length > 0
         if (includeGroup) {
-          const conds: string[] = [`text LIKE ? ESCAPE '\\'`, `(message_type IS NULL OR message_type != 'system_notification')`]
-          const params: any[] = [likePattern]
+          const conds: string[] = [`user_id=?`, `text LIKE ? ESCAPE '\\'`, `(message_type IS NULL OR message_type != 'system_notification')`]
+          const params: any[] = [currentUser!.id, likePattern]
           if (groupChs.length > 0) {
             conds.push(`conversation_id IN (${groupChs.map(() => '?').join(',')})`)
             params.push(...groupChs)
@@ -4010,19 +4058,20 @@ Bun.serve({
         const taskChs = channels.filter(c => c.startsWith('task:')).map(c => c.slice('task:'.length))
         const includeTask = channels.length === 0 || taskChs.length > 0 || channels.includes('task')
         if (includeTask) {
-          const conds: string[] = [`body LIKE ? ESCAPE '\\'`, `kind = 'user_comment'`]
-          const params: any[] = [likePattern]
+          const conds: string[] = [`t.user_id=?`, `e.body LIKE ? ESCAPE '\\'`, `e.kind = 'user_comment'`]
+          const params: any[] = [currentUser!.id, likePattern]
           if (taskChs.length > 0) {
-            conds.push(`task_id IN (${taskChs.map(() => '?').join(',')})`)
+            conds.push(`e.task_id IN (${taskChs.map(() => '?').join(',')})`)
             params.push(...taskChs)
           }
           if (senders.length > 0) {
-            conds.push(`actor_id IN (${senders.map(() => '?').join(',')})`)
+            conds.push(`e.actor_id IN (${senders.map(() => '?').join(',')})`)
             params.push(...senders)
           }
-          if (since) { conds.push(`ts >= ?`); params.push(since) }
-          if (before) { conds.push(`ts <= ?`); params.push(before) }
-          const rows = db.prepare(`SELECT id, task_id, actor_id, body, ts, kind FROM task_events WHERE ${conds.join(' AND ')} ORDER BY ts DESC LIMIT ?`).all(...params, limit) as any[]
+          if (since) { conds.push(`e.ts >= ?`); params.push(since) }
+          if (before) { conds.push(`e.ts <= ?`); params.push(before) }
+          const rows = db.prepare(`SELECT e.id, e.task_id, e.actor_id, e.body, e.ts, e.kind FROM task_events e
+            JOIN tasks_v2 t ON t.id=e.task_id WHERE ${conds.join(' AND ')} ORDER BY e.ts DESC LIMIT ?`).all(...params, limit) as any[]
           for (const r of rows) {
             all.push({
               channel: `task:${r.task_id}`,
@@ -4073,6 +4122,7 @@ Bun.serve({
         let result: { found: boolean; source_table?: 'group_messages' | 'task_events'; timestamp?: string; before_id?: string | null } = { found: false }
         if (channel.startsWith('task:')) {
           const taskId = channel.slice('task:'.length)
+          if (!loadTask(taskId, currentUser!.id)) return Response.json({ ok: true, channel, message_id: messageId, found: false })
           const row = db.prepare(`SELECT id, ts FROM task_events WHERE id=? AND task_id=?`).get(messageId, taskId) as any
           if (row) {
             const next = db.prepare(`SELECT id FROM task_events WHERE task_id=? AND ts > ? ORDER BY ts ASC LIMIT 1`).get(taskId, row.ts) as any
@@ -4080,9 +4130,9 @@ Bun.serve({
           }
         } else {
           // workgroup / dm-agent1 / dm-agent2 → group_messages
-          const grpRow = db.prepare(`SELECT id, ts FROM group_messages WHERE id=? AND conversation_id=?`).get(messageId, channel) as any
+          const grpRow = db.prepare(`SELECT id, ts FROM group_messages WHERE id=? AND conversation_id=? AND user_id=?`).get(messageId, channel, currentUser!.id) as any
           if (grpRow) {
-            const next = db.prepare(`SELECT id FROM group_messages WHERE conversation_id=? AND ts > ? ORDER BY ts ASC LIMIT 1`).get(channel, grpRow.ts) as any
+            const next = db.prepare(`SELECT id FROM group_messages WHERE conversation_id=? AND user_id=? AND ts > ? ORDER BY ts ASC LIMIT 1`).get(channel, currentUser!.id, grpRow.ts) as any
             result = { found: true, source_table: 'group_messages', timestamp: grpRow.ts, before_id: next?.id ?? null }
           }
         }

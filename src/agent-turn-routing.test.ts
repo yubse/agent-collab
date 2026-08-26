@@ -6,6 +6,7 @@ describe('AgentTurnRouteQueue', () => {
     const routes = new AgentTurnRouteQueue()
     routes.enqueue('product', {
       id: 'normal',
+      userId: 'user-a',
       conversationId: 'product-group',
       observeOnly: false,
       dispatchId: 'dispatch-normal',
@@ -16,6 +17,7 @@ describe('AgentTurnRouteQueue', () => {
     })
     routes.enqueue('product', {
       id: 'observe',
+      userId: 'user-a',
       conversationId: 'product-group',
       observeOnly: true,
       dispatchId: 'dispatch-observe',
@@ -40,6 +42,7 @@ describe('AgentTurnRouteQueue', () => {
     for (const id of ['first', 'rejected', 'last']) {
       routes.enqueue('creative', {
         id,
+        userId: 'user-a',
         conversationId: 'workgroup',
         observeOnly: id === 'last',
         dispatchId: `dispatch-${id}`,
@@ -59,6 +62,7 @@ describe('AgentTurnRouteQueue', () => {
     const routes = new AgentTurnRouteQueue()
     routes.enqueue('social', {
       id: 'observe',
+      userId: 'user-a',
       conversationId: 'workgroup',
       observeOnly: true,
       dispatchId: 'dispatch-observe',
@@ -70,6 +74,7 @@ describe('AgentTurnRouteQueue', () => {
     expect(routes.hasResponseTurn('social')).toBe(false)
     routes.enqueue('social', {
       id: 'normal',
+      userId: 'user-a',
       conversationId: 'workgroup',
       observeOnly: false,
       dispatchId: 'dispatch-normal',
