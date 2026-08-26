@@ -63,9 +63,9 @@
   --shadow:0 1px 3px rgba(26,23,20,0.06),0 10px 22px rgba(26,23,20,0.04);
   --warn:#dd8259; --good:#7c9d6b; --info:#7896b8; --mute:#b8b0a5;
   --error:#c4574d;
-  --actorA:#f7d3d0; --actorB:#cdddec; --actorC:#f4d990; --pm:#e6dccd;
-  --actorA-soft:#fbe5e2; --actorB-soft:#e0ebf5; --actorC-soft:#fbe9b4; --pm-soft:#f0e8d6;
-  --actorA-deep:#a85a52; --actorB-deep:#3a648c; --actorC-deep:#9a6f1e;
+  --actorA:#cdddec; --actorB:#dccfe8; --actorC:#cee0c5; --actorD:#f4d990; --pm:#e6dccd;
+  --actorA-soft:#e0ebf5; --actorB-soft:#eee5f5; --actorC-soft:#e3f0dd; --actorD-soft:#fbe9b4; --pm-soft:#f0e8d6;
+  --actorA-deep:#3a648c; --actorB-deep:#76548f; --actorC-deep:#4f7546; --actorD-deep:#9a6f1e;
   --app-bar-bg:rgba(243,237,228,0.86);
 }
 [data-ws-theme="dark"]{
@@ -76,9 +76,9 @@
   --shadow:0 1px 3px rgba(0,0,0,0.5),0 10px 22px rgba(0,0,0,0.28);
   --warn:#ec9f7e; --good:#a3c592; --info:#9ab5d3; --mute:#6a6258;
   --error:#d97a7a;
-  --actorA:#5a3a37; --actorB:#2f4a64; --actorC:#5a4a23; --pm:#3a342a;
-  --actorA-soft:#3a2522; --actorB-soft:#1f3346; --actorC-soft:#3d3217; --pm-soft:#2a241d;
-  --actorA-deep:#f7d3d0; --actorB-deep:#cdddec; --actorC-deep:#f4d990;
+  --actorA:#2f4a64; --actorB:#4b385c; --actorC:#304a2d; --actorD:#5a4a23; --pm:#3a342a;
+  --actorA-soft:#1f3346; --actorB-soft:#33243f; --actorC-soft:#20351e; --actorD-soft:#3d3217; --pm-soft:#2a241d;
+  --actorA-deep:#cdddec; --actorB-deep:#dccfe8; --actorC-deep:#cee0c5; --actorD-deep:#f4d990;
   --app-bar-bg:rgba(22,19,15,0.86);
 }
 
@@ -115,7 +115,7 @@ button, textarea, input { font: inherit; }
   border-bottom: 1px solid var(--border-2);
 }
 .ws-app-bar-inner {
-  max-width: 1280px; margin: 0 auto;
+  max-width: 1600px; margin: 0 auto;
   padding: 14px 28px;
   display: flex; align-items: center; gap: 20px;
 }
@@ -156,7 +156,93 @@ button, textarea, input { font: inherit; }
 .ws-theme-btn:hover { background: var(--surface-2); border-color: var(--ink-3); }
 
 /* === Layout === */
-.ws-container { max-width: 1280px; margin: 0 auto; padding: 20px 28px; flex: none; width: 100%; }
+.ws-container { width: 100%; }
+.ws-workspace-shell {
+  width: 100%; max-width: 1600px; margin: 0 auto;
+  padding: 16px 20px 20px;
+  flex: 1; min-height: 0;
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  gap: 16px;
+}
+.ws-workstation-sidebar {
+  min-width: 0; min-height: 0; height: 100%;
+  padding: 16px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow-sm);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.ws-workstation-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 12px;
+}
+.ws-workstation-title { min-width: 0; }
+.ws-workstation-title .ws-section-label { white-space: nowrap; }
+.ws-workstation-title .ws-section-meta { margin-top: 4px; }
+.ws-workstation-manage {
+  flex: none;
+  border: 1px solid var(--border); background: var(--surface); color: var(--ink-2);
+  width: 34px; height: 34px; padding: 0; border-radius: 9px;
+  font: inherit; font-size: 13px; cursor: pointer;
+  display: grid; place-items: center;
+}
+.ws-workstation-manage:hover { background: var(--surface-3); }
+.ws-workstation-manage #manageBtnLabel { display: none; }
+.ws-group-switcher { flex: none; margin-bottom: 14px; }
+.ws-group-switcher-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 8px;
+}
+.ws-group-add-btn {
+  width: 28px; height: 28px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--ink-2);
+  display: grid; place-items: center; cursor: pointer; font-size: 17px; line-height: 1;
+}
+.ws-group-add-btn:hover { background: var(--surface-3); color: var(--ink); }
+.ws-group-list { display: flex; flex-direction: column; gap: 5px; }
+.ws-group-row { display: grid; grid-template-columns: minmax(0, 1fr) 28px; gap: 4px; }
+.ws-group-select {
+  min-width: 0; border: 1px solid transparent; background: transparent;
+  border-radius: 9px; padding: 8px 9px; color: var(--ink-2); cursor: pointer;
+  display: flex; align-items: center; gap: 8px; text-align: left;
+}
+.ws-group-select:hover { background: var(--surface); }
+.ws-group-select.active {
+  background: var(--surface); border-color: var(--border);
+  color: var(--ink); box-shadow: var(--shadow-sm);
+}
+.ws-group-icon { flex: none; font-size: 15px; }
+.ws-group-copy { min-width: 0; flex: 1; }
+.ws-group-name { display: block; font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ws-group-members-preview {
+  display: block; margin-top: 2px; font-family: 'JetBrains Mono', monospace;
+  font-size: 9.5px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ws-group-unread {
+  min-width: 17px; height: 17px; padding: 0 4px; border-radius: 9px;
+  background: var(--warn); color: #fff; font-size: 9px; display: grid; place-items: center;
+}
+.ws-group-edit {
+  border: none; background: transparent; color: var(--ink-3); border-radius: 7px;
+  cursor: pointer; padding: 0; display: grid; place-items: center; font-size: 13px;
+}
+.ws-group-edit:hover { background: var(--surface); color: var(--ink); }
+.ws-sidebar-divider { height: 1px; background: var(--border); margin: 0 -2px 14px; }
+
+.ws-group-member-options { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.ws-group-member-option {
+  border: 1px solid var(--border); border-radius: 12px; padding: 11px 12px;
+  background: var(--surface-2); display: flex; align-items: center; gap: 10px;
+  cursor: pointer;
+}
+.ws-group-member-option:has(input:checked) { border-color: var(--ink-3); background: var(--surface-3); }
+.ws-group-member-option input { accent-color: var(--ink); }
+.ws-group-member-avatar { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; background: var(--surface); }
+.ws-group-member-name { display: block; font-size: 13px; font-weight: 600; }
+.ws-group-member-sub { display: block; margin-top: 2px; font-family: 'JetBrains Mono', monospace; font-size: 9.5px; color: var(--ink-3); }
 .ws-section-label {
   font-family: 'JetBrains Mono', monospace; font-size: 11px;
   letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3);
@@ -166,16 +252,28 @@ button, textarea, input { font: inherit; }
 }
 
 /* === Workstation strip === */
-.ws-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.ws-strip {
+  /* Own the remaining sidebar height. Without an explicit flex basis the grid
+     itself shrinks to fit the sidebar and its auto rows compress every card,
+     which makes card content look stacked/overlapped once the roster grows. */
+  flex: 1 1 0; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  display: grid; grid-template-columns: 1fr; align-content: start; gap: 10px;
+  grid-auto-rows: max-content;
+  padding: 1px 6px 10px 1px;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
 .ws-agent-card {
   background: var(--surface);
-  border-radius: 18px; padding: 14px;
+  border: 1px solid var(--border-2);
+  border-radius: 14px; padding: 12px;
   position: relative; overflow: hidden;
   transition: border-color .2s, box-shadow .2s;
   /* AIC-53 cycle 3+ (PM "settings 卡下面有空隙"): flex column so the settings panel
    * can flex:1 + space-between to push its action buttons to the card bottom,
    * filling the height that strip's align-items:stretch gave it. */
   display: flex; flex-direction: column;
+  align-self: start;
 }
 .ws-agent-progress {
   position: absolute; bottom: 0; left: 0; right: 0; height: 3px;
@@ -206,15 +304,15 @@ button, textarea, input { font: inherit; }
   background: radial-gradient(circle at 30% 20%, var(--accent-soft), transparent 60%);
   transition: opacity .25s;
 }
-.ws-agent-row { position: relative; display: flex; gap: 14px; align-items: center; }
+.ws-agent-row { position: relative; display: flex; gap: 10px; align-items: center; }
 .ws-agent-monitor {
-  flex: none; width: 78px; height: 78px; border-radius: 14px;
+  flex: none; width: 50px; height: 50px; border-radius: 12px;
   background: var(--accent);
   position: relative; display: grid; place-items: center;
   box-shadow: inset 0 0 0 1px rgba(0,0,0,0.04);
 }
-.ws-agent-emoji { font-size: 42px; line-height: 1; }
-.ws-agent-emoji-text { font-size: 30px; line-height: 1; font-weight: 600; color: var(--accent-deep); }
+.ws-agent-emoji { font-size: 28px; line-height: 1; }
+.ws-agent-emoji-text { font-size: 23px; line-height: 1; font-weight: 600; color: var(--accent-deep); }
 .ws-agent-lamp {
   position: absolute; bottom: 6px; right: 6px;
   width: 8px; height: 8px; border-radius: 50%;
@@ -222,7 +320,7 @@ button, textarea, input { font: inherit; }
 }
 .ws-agent-meta { flex: 1; min-width: 0; }
 .ws-agent-name-row { display: flex; align-items: center; gap: 6px; }
-.ws-agent-name { font-weight: 600; font-size: 16px; letter-spacing: -0.01em; }
+.ws-agent-name { font-weight: 600; font-size: 14px; letter-spacing: -0.01em; }
 .ws-agent-model-chip {
   font-family: 'JetBrains Mono', monospace; font-size: 10px;
   color: var(--ink-3); background: var(--surface-2);
@@ -235,7 +333,7 @@ button, textarea, input { font: inherit; }
 .ws-agent-divider {
   position: relative; height: 1px;
   background: linear-gradient(90deg, transparent, var(--border), transparent);
-  margin: 14px 0 10px;
+  margin: 10px 0 8px;
 }
 .ws-agent-controls {
   position: relative; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -263,7 +361,7 @@ button, textarea, input { font: inherit; }
 
 /* === Chat panel (group + DM share) === */
 .ws-chat-panel {
-  max-width: 1280px; margin: 0 auto; padding: 8px 28px 24px;
+  max-width: none; margin: 0; padding: 0;
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
   width: 100%;
@@ -274,6 +372,47 @@ button, textarea, input { font: inherit; }
   box-shadow: var(--shadow);
   display: flex; flex-direction: column;
   flex: 1; min-height: 0;
+}
+
+.ws-workspace-shell > main {
+  min-width: 0; min-height: 0;
+}
+.ws-workspace-shell .ws-dm-shell,
+.ws-workspace-shell .ws-tasks-shell,
+.ws-workspace-shell .ws-detail-shell {
+  max-width: none;
+  margin: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+@media (max-width: 680px) {
+  .ws-app-bar-inner { padding: 10px 12px; gap: 10px; }
+  .ws-workspace-shell {
+    padding: 10px 12px 12px;
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 10px;
+  }
+  .ws-workstation-sidebar { max-height: 320px; padding: 11px 12px; }
+  .ws-workstation-head { margin-bottom: 8px; }
+  .ws-workstation-title { display: flex; align-items: baseline; gap: 10px; }
+  .ws-workstation-title .ws-section-meta { margin-top: 0; }
+  .ws-strip {
+    flex: none;
+    grid-template-columns: repeat(2, minmax(230px, 1fr));
+    grid-auto-rows: max-content;
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-gutter: auto;
+  }
+  .ws-agent-card { min-width: 230px; }
+  .ws-group-switcher { margin-bottom: 10px; }
+  .ws-group-list { flex-direction: row; overflow-x: auto; padding-bottom: 2px; }
+  .ws-group-row { grid-template-columns: minmax(150px, 1fr) 28px; flex: none; }
+  .ws-sidebar-divider { display: none; }
+  .ws-chat-header { padding: 11px 14px; }
+  .ws-chat-messages { padding: 14px 16px; }
+  .ws-composer-wrap { padding: 12px 16px 14px; }
 }
 .ws-chat-header {
   padding: 14px 18px 14px;
@@ -2058,19 +2197,30 @@ button, textarea, input { font: inherit; }
     </div>
   </header>
 
-  <!-- === WORKSTATION STRIP === -->
-  <section class="ws-container">
-    <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:12px;">
-      <div style="display:flex; align-items:baseline; gap:14px;">
+  <div class="ws-workspace-shell">
+  <!-- === WORKSTATION SIDEBAR === -->
+  <aside class="ws-container ws-workstation-sidebar">
+    <section class="ws-group-switcher" aria-label="工作群列表">
+      <div class="ws-group-switcher-head">
+        <div class="ws-section-label">群聊 · GROUPS</div>
+        <button class="ws-group-add-btn" id="btnCreateGroup" title="新建工作群" aria-label="新建工作群">+</button>
+      </div>
+      <div class="ws-group-list" id="groupList">
+        <!-- rendered by renderGroupList() -->
+      </div>
+    </section>
+    <div class="ws-sidebar-divider"></div>
+    <div class="ws-workstation-head">
+      <div class="ws-workstation-title">
         <div class="ws-section-label">工位 · WORKSTATIONS</div>
         <div class="ws-section-meta" id="stripMeta">— live / 3 total</div>
       </div>
-      <button id="btnToggleManageAll" title="展开/收起所有工位卡的设置面板" style="border:1px solid var(--border); background:var(--surface); color:var(--ink-2); padding:5px 11px; border-radius:8px; font:inherit; font-size:12px; cursor:pointer; display:inline-flex; align-items:center; gap:6px;"><span>⚙</span><span id="manageBtnLabel">管理</span></button>
+      <button class="ws-workstation-manage" id="btnToggleManageAll" title="展开/收起所有工位卡的设置面板" aria-label="管理工位"><span>⚙</span><span id="manageBtnLabel">管理</span></button>
     </div>
-    <div class="ws-strip" id="agentStrip">
+    <div class="ws-strip" id="agentStrip" data-ws-scroll="y">
       <!-- rendered by renderAgentStrip() -->
     </div>
-  </section>
+  </aside>
 
   <!-- === Views === -->
   <main>
@@ -2086,7 +2236,7 @@ button, textarea, input { font: inherit; }
             <div class="ws-chat-title-row">
               <span class="ws-chat-title" id="groupChatTitle">工作群</span>
               <span class="ws-chat-divider">｜</span>
-              <span class="ws-chat-members" id="groupChatMembers">admin · agent1 · agent2</span>
+              <span class="ws-chat-members" id="groupChatMembers">admin · 产品企划 · 创意设计 · 社媒运营 · 营销增长</span>
             </div>
           </div>
           <div class="ws-chat-messages" data-ws-scroll="y" id="groupMessages">
@@ -2096,7 +2246,7 @@ button, textarea, input { font: inherit; }
             <div class="ws-mention-menu" id="mentionMenu" role="listbox" aria-label="选择 @ 提及"></div>
             <div class="ws-composer">
               <div class="ws-composer-pending" id="composerPending"></div>
-              <textarea id="composerInput" placeholder="发消息到工作群 …  输入 @ 召唤 agent1 / agent2"></textarea>
+              <textarea id="composerInput" placeholder="发消息到工作群 …  输入 @ 召唤对应角色"></textarea>
               <div class="ws-composer-row">
                 <button class="ws-composer-btn" id="btnAttachFile" title="附件">📎</button>
                 <input type="file" id="fileInput" multiple style="display:none">
@@ -2182,6 +2332,44 @@ button, textarea, input { font: inherit; }
       </div>
     </div>
   </main>
+  </div>
+
+  <!-- === CREATE / EDIT WORKGROUP modal === -->
+  <div class="ws-modal-mask" id="groupManageMask" data-modal="groupManage">
+    <div class="ws-modal" id="groupManageBox" style="width:520px;">
+      <div class="ws-modal-head">
+        <div>
+          <div class="ws-modal-title" id="groupManageTitle">新建工作群</div>
+          <div class="ws-modal-sub">选择这个群里可以收到消息的 agent</div>
+        </div>
+        <span style="flex:1"></span>
+        <button class="ws-modal-close" id="groupManageClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="ws-modal-body">
+        <label class="ws-field">
+          <div class="ws-field-label">
+            <span class="ws-field-name">群名称</span>
+            <span class="ws-field-required">必填</span>
+          </div>
+          <input type="text" class="ws-input" id="groupNameInput" maxlength="60" placeholder="例如：产品讨论组">
+        </label>
+        <div>
+          <div class="ws-field-label" style="margin-bottom:8px;">
+            <span class="ws-field-name">群成员</span>
+            <span style="font-size:11px;color:var(--ink-3);">admin 会自动加入</span>
+          </div>
+          <div class="ws-group-member-options" id="groupMemberOptions"></div>
+        </div>
+        <div id="groupManageError" style="display:none;color:var(--bad);font-size:12px;"></div>
+      </div>
+      <div class="ws-modal-foot">
+        <div class="ws-modal-foot-actions">
+          <button class="ws-modal-btn-cancel" id="groupManageCancel">取消</button>
+          <button class="ws-modal-btn-primary" id="groupManageSubmit">创建群聊</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <div class="ws-img-viewer" id="imgViewer"><img id="imgViewerImg" alt=""></div>
 
@@ -2430,17 +2618,20 @@ const STORAGE_KEY = 'wgv2:state';
 const POLL_MS = 2500;
 
 // Map server roster.id ↔ design token id. Design system has tokens for
-// workflow role keys: pm (admin) / implementer (agent1) / reviewer (agent2) / system.
-const SERVER_TO_DESIGN_ID = { admin: 'pm', agent1: 'actorA', agent2: 'actorB' };
-const DESIGN_AGENT_ORDER = ['actorA', 'actorB'];   // workstation strip order
+// Runtime actor ids mapped to stable visual design tokens.
+const SERVER_TO_DESIGN_ID = { admin: 'pm', product: 'actorA', creative: 'actorB', social: 'actorC', growth: 'actorD' };
+const DESIGN_AGENT_ORDER = ['actorA', 'actorB', 'actorC', 'actorD'];
+const ROLE_AGENT_IDS = ['product', 'creative', 'social', 'growth'];
+const ROLE_DISPLAY_NAMES = { product: '产品企划', creative: '创意设计', social: '社媒运营', growth: '营销增长' };
 
 // roster.color → status dot color (working). Falls back to --mute for idle.
 const COLOR_TO_VAR = {
-  green: 'var(--good)', orange: 'var(--warn)', blue: 'var(--info)', neutral: 'var(--mute)',
+  green: 'var(--good)', orange: 'var(--warn)', blue: 'var(--info)', purple: 'var(--actorB-deep)', neutral: 'var(--mute)',
 };
 
 const state = {
   view: 'group',
+  activeGroup: 'workgroup',
   theme: 'light',
   modal: null,
   activeTaskId: null,
@@ -2470,7 +2661,7 @@ async function fetchUsageFor(serverId, opts = {}) {
 }
 
 function startUsagePolling() {
-  const agents = ['agent1', 'agent2'];
+  const agents = ROLE_AGENT_IDS;
   // Initial fetch with render so first paint has data.
   agents.forEach(a => fetchUsageFor(a));
   // Periodic refresh: silent — let next natural render absorb the new cache.
@@ -2551,8 +2742,10 @@ function _usageFor(raw) {
 // drop in pollTasksV2 directly).
 const CHANNELS = {
   workgroup:  { type: 'group', convId: 'workgroup' },
-  'dm-agent1': { type: 'group', convId: 'dm-agent1' },
-  'dm-agent2': { type: 'group', convId: 'dm-agent2' },
+  'dm-product': { type: 'group', convId: 'dm-product' },
+  'dm-creative': { type: 'group', convId: 'dm-creative' },
+  'dm-social': { type: 'group', convId: 'dm-social' },
+  'dm-growth': { type: 'group', convId: 'dm-growth' },
 };
 let currentChannel = 'workgroup';
 const channelState = {};
@@ -2562,6 +2755,40 @@ for (const k of Object.keys(CHANNELS)) channelState[k] = {
   messages: [], cursor: null,
   oldestId: null, canLoadMore: true, loadingMore: false, lastError: null,
 };
+
+let groupConversations = [{
+  id: 'workgroup', name: '工作群', is_default: true,
+  member_ids: ['admin', ...ROLE_AGENT_IDS],
+}];
+
+function ensureGroupChannel(group) {
+  if (!group?.id) return;
+  CHANNELS[group.id] = { type: 'group', convId: group.id, managedGroup: true };
+  if (!channelState[group.id]) {
+    channelState[group.id] = {
+      messages: [], cursor: null,
+      oldestId: null, canLoadMore: true, loadingMore: false, lastError: null,
+    };
+  }
+}
+
+function activeGroupInfo() {
+  return groupConversations.find(g => g.id === state.activeGroup)
+    || groupConversations.find(g => g.id === 'workgroup')
+    || groupConversations[0];
+}
+
+async function loadGroups() {
+  const data = await apiJson('/groups');
+  if (!data?.ok || !Array.isArray(data.groups)) return;
+  groupConversations = data.groups;
+  groupConversations.forEach(ensureGroupChannel);
+  if (!groupConversations.some(g => g.id === state.activeGroup)) {
+    state.activeGroup = 'workgroup';
+    persist();
+  }
+  if (state.view === 'group') currentChannel = state.activeGroup;
+}
 
 let roster = [];           // [{id, display_name, kind, avatar, color, model, tmux, can_reply}]
 let members = {};          // id → roster entry
@@ -2616,7 +2843,7 @@ function startSeenSyncPolling() {
 
 // === AIC-63 cycle 4: actor-level identity (single bubble_bg per actor) ===
 // Server is single source — actor-keyed (no per-theme). PM edits propagate within 5min poll.
-const ACTOR_ID_BY_ROLE = { pm: 'admin', implementer: 'agent1', reviewer: 'agent2', system: 'system' };
+const ACTOR_ID_BY_ROLE = { pm: 'admin', implementer: 'product', reviewer: 'creative', system: 'system' };
 let actorStyles = {};   // { actor_id: { avatar_kind, avatar_value, bubble_bg, ink, accent } }
 let actorPresets = [];  // [hex,...] for the picker; populated by hydrateActorStyles
 async function hydrateActorStyles() {
@@ -2641,8 +2868,8 @@ function _styleForRole(roleId) {
 // JS-render-time emoji lookup. CSS-var-driven colors update automatically through
 // syncActorIdentityCssVars, but emojis live in template literals so they need
 // re-rendering. Fallback const matches the original hardcoded set for first-paint.
-const _ROLE_EMOJI_FALLBACK = { pm: '👾', implementer: '🤖', reviewer: '🤖', system: '⚙' };
-const _ACTOR_EMOJI_FALLBACK = { admin: '👾', agent1: '🤖', agent2: '🤖', system: '⚙' };
+const _ROLE_EMOJI_FALLBACK = { pm: '👾', implementer: '🧭', reviewer: '🎬', system: '⚙' };
+const _ACTOR_EMOJI_FALLBACK = { admin: '👾', product: '🧭', creative: '🎬', social: '📣', growth: '🚀', system: '⚙' };
 function _roleEmoji(roleId) {
   return _styleForRole(roleId)?.avatar_value || _ROLE_EMOJI_FALLBACK[roleId] || roleId;
 }
@@ -2683,8 +2910,7 @@ function _actorAvatarIsText(actorId) {
 // of CSS rules. -soft/-deep derive: soft = bubble_bg + alpha 0x33, deep = ink.
 function syncActorIdentityCssVars() {
   const root = document.documentElement;
-  for (const [roleId, actorId] of Object.entries(ACTOR_ID_BY_ROLE)) {
-    if (roleId === 'system') continue;  // no role-named CSS var for system
+  for (const [actorId, roleId] of Object.entries(SERVER_TO_DESIGN_ID)) {
     const s = _styleForActor(actorId); if (!s) continue;
     root.style.setProperty(`--${roleId}`,      s.bubble_bg);
     root.style.setProperty(`--${roleId}-soft`, s.bubble_bg + '33');
@@ -2695,14 +2921,18 @@ function syncActorIdentityCssVars() {
 // === AIC-63 cycle 4: identity panel (PM edits actor avatar + bg, per design) ===
 const IDENTITY_ACTOR_META = [
   { id: 'admin',  name: 'admin',  runtime: 'PM', isYou: true },
-  { id: 'agent1', name: 'agent1', runtime: '<your agent runtime>' },
-  { id: 'agent2', name: 'agent2', runtime: '<your agent runtime>' },
+  { id: 'product', name: '产品企划', runtime: 'Product Manager · Codex' },
+  { id: 'creative', name: '创意设计', runtime: 'Visual Storyteller · Codex' },
+  { id: 'social', name: '社媒运营', runtime: 'Social Media Strategist · Codex' },
+  { id: 'growth', name: '营销增长', runtime: 'Growth Hacker · Codex' },
   { id: 'system', name: 'System', runtime: 'system · 不可指派' },
 ];
 const IDENTITY_SAMPLE = {
   admin:  '嗯，先存到这里，避免推错。',
-  agent1: '已修 server.ts line 94。',
-  agent2: 'v2 task 全走 task comment。',
+  product: '建议先明确目标用户与系列结构，再拆 SKU。',
+  creative: '我会先定义叙事主线，再展开 KV 与场景。',
+  social: '同一主题会按平台语境分别改写。',
+  growth: '先把假设、指标和止损线写进实验卡。',
   system: '🎉 AIC-63 已关闭',
 };
 let identityPending = {};   // { actor_id: { avatar_kind?, avatar_value?, bubble_bg? } }
@@ -2714,7 +2944,7 @@ const SETTINGS_THEMES = [
   { id: 'dark',   label: '深色',  icon: '🌙' },
   { id: 'system', label: '跟随系统', icon: '🌗' },
 ];
-let appSettingsUsageActor = 'agent1';
+let appSettingsUsageActor = 'product';
 let _settingsSystemMQL = null;       // matchMedia handle for system theme
 // AIC-68 cycle 2: rename to openAppSettings/closeAppSettings to disambiguate
 // from the legacy task settings (workflow_templates manager) `openSettingsModal`.
@@ -2804,7 +3034,7 @@ function renderAppSettings() {
   // Actor stack (5 avatars) + dirty hint
   const stack = document.getElementById('appSettingsActorStack');
   if (stack) {
-    const actors = ['admin', 'agent1', 'agent2', 'system'];
+    const actors = ['admin', ...ROLE_AGENT_IDS, 'system'];
     stack.innerHTML = actors.map((aid, idx) => {
       const s = _styleForActor(aid);
       const bg = s?.bubble_bg || '#cdddec';
@@ -3171,6 +3401,7 @@ function loadPersisted() {
     if (!raw) return;
     const saved = JSON.parse(raw);
     if (saved.view) state.view = saved.view;
+    if (saved.activeGroup) state.activeGroup = saved.activeGroup;
     if (saved.theme === 'light' || saved.theme === 'dark' || saved.theme === 'system') state.theme = saved.theme;
     if (saved.tasksTab) state.tasksTab = saved.tasksTab;
     if (saved.activeDm) state.activeDm = saved.activeDm;
@@ -3182,7 +3413,7 @@ function persist() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       view: state.view, theme: state.theme, tasksTab: state.tasksTab,
-      activeDm: state.activeDm, activeTaskId: state.activeTaskId,
+      activeGroup: state.activeGroup, activeDm: state.activeDm, activeTaskId: state.activeTaskId,
     }));
   } catch {}
 }
@@ -3304,7 +3535,7 @@ function startBackgroundPolling() {
 // ============================================================================
 
 function _scrollContainerForChannel(ch) {
-  if (ch === 'workgroup') return document.getElementById('groupMessages');
+  if (CHANNELS[ch]?.managedGroup) return document.getElementById('groupMessages');
   if (ch && ch.startsWith('dm-')) return document.getElementById('dmMessages');
   return null;
 }
@@ -3411,8 +3642,8 @@ async function _tryLoadOlderForChannel(serverChannel) {
     // loader 返 false: 要么 canLoadMore=false (真到顶), 要么失败, 要么 oldestId 仍 null (race)
     return readyCheck() ? 'exhausted' : 'pending';
   };
-  if (serverChannel === 'workgroup') {
-    return _wrap(() => loadOlderGroup('workgroup'), () => !!channelState['workgroup']?.oldestId);
+  if (CHANNELS[serverChannel]?.managedGroup) {
+    return _wrap(() => loadOlderGroup(serverChannel), () => !!channelState[serverChannel]?.oldestId);
   }
   if (serverChannel && serverChannel.startsWith('dm-')) {
     const clientCh = _clientChannelName(serverChannel);
@@ -3533,9 +3764,11 @@ function updateAllUnreadCounts() {
 
 // Derive unread count per top-level nav tab (group / dm / tasks).
 function unreadForView(view) {
-  if (view === 'group') return unreadCounts['workgroup'] || 0;
+  if (view === 'group') {
+    return groupConversations.reduce((sum, group) => sum + (unreadCounts[group.id] || 0), 0);
+  }
   if (view === 'dm') {
-    return ['dm-agent1', 'dm-agent2']
+    return ROLE_AGENT_IDS.map(id => `dm-${id}`)
       .reduce((sum, ch) => sum + (unreadCounts[ch] || 0), 0);
   }
   if (view === 'tasks') return countTasksUnread();
@@ -3569,9 +3802,16 @@ function startPolling() {
 // ============================================================================
 function parseMentions(text) {
   const m = [], lower = text.toLowerCase();
-  if (lower.includes('@agent2') || lower.includes('@agent-b')) m.push('agent2');
-  if (lower.includes('@agent1') || lower.includes('@agent-a')) m.push('agent1');
-  if (lower.includes('@admin')) m.push('admin');
+  const aliases = {
+    product: ['product', '产品', '产品企划'],
+    creative: ['creative', '创意', '创意设计'],
+    social: ['social', '社媒', '社媒运营'],
+    growth: ['growth', '增长', '营销增长'],
+    admin: ['admin'],
+  };
+  for (const [id, handles] of Object.entries(aliases)) {
+    if (handles.some(handle => lower.includes('@' + handle))) m.push(id);
+  }
   return [...new Set(m)];
 }
 
@@ -3776,7 +4016,7 @@ function autoresizeTextarea(ta) {
 function displayName(serverId) {
   if (serverId === 'admin') return 'admin';
   const r = roster.find(x => x.id === serverId);
-  return r?.display_name || serverId;
+  return r?.display_name || ROLE_DISPLAY_NAMES[serverId] || serverId;
 }
 
 // Format a roster.model into the design-style chip label.
@@ -3940,6 +4180,7 @@ function render() {
   document.documentElement.setAttribute('data-ws-theme', _effectiveTheme());
 
   renderAgentStrip();
+  renderGroupList();
   if (state.view === 'group') {
     renderGroupChatHeader();
     renderMessages();
@@ -3960,7 +4201,7 @@ function renderAgentStrip() {
   const strip = document.getElementById('agentStrip');
   if (!strip) return;
 
-  // Build agents in design order (agent1, agent2).
+  // Build agents in the four-role design order.
   const agents = DESIGN_AGENT_ORDER.map(designId => {
     const serverId = Object.keys(SERVER_TO_DESIGN_ID).find(sid => SERVER_TO_DESIGN_ID[sid] === designId);
     return decorateAgent(serverId);
@@ -4055,7 +4296,7 @@ function renderAgentStrip() {
           </div>
         </div>
         <div style="display:flex; gap:8px;">
-          ${a.serverId === 'agent2'
+          ${a.serverId === 'growth'
             ? `<button class="ws-icon-btn" style="flex:1; border:1px solid var(--border); background:var(--surface-2); padding:8px 10px; border-radius:9px; color:var(--ink-3); cursor:default; opacity:0.75;" disabled title="由保活脚本拉起">⚓ 常驻</button>`
             : `<button class="ws-icon-btn" style="flex:1; border:1px solid var(--border); background:${a.isOnlineRaw ? 'var(--surface-2)' : 'var(--good-soft, rgba(120,180,120,0.18))'}; padding:8px 10px; border-radius:9px; color:var(--ink);" data-action="${a.isOnlineRaw ? 'clock-out' : 'clock-in'}" data-agent="${a.serverId}">${a.isOnlineRaw ? '⏰ 下班' : '☀ 上班'}</button>`}
         </div>
@@ -4065,16 +4306,112 @@ function renderAgentStrip() {
 }
 
 function renderGroupChatHeader() {
-  // Members list in the header — PM (admin) first, then agents.
-  // Title shows the live member count so it tracks roster changes.
   const membersEl = document.getElementById('groupChatMembers');
   const titleEl = document.getElementById('groupChatTitle');
-  if (!membersEl || !roster.length) return;
-  const pmRow = roster.find(r => r.id === 'admin');
-  const agentRoster = roster.filter(r => r.kind === 'agent');
-  const ordered = [...(pmRow ? [pmRow] : []), ...agentRoster];
-  membersEl.textContent = ordered.map(r => displayName(r.id)).join(' · ');
-  if (titleEl) titleEl.textContent = `工作群`;
+  const group = activeGroupInfo();
+  if (!membersEl || !group) return;
+  const ids = group.member_ids || [];
+  membersEl.textContent = ids.map(id => displayName(id)).join(' · ');
+  if (titleEl) titleEl.textContent = group.name || '工作群';
+}
+
+function renderGroupList() {
+  const el = document.getElementById('groupList');
+  if (!el) return;
+  el.innerHTML = groupConversations.map(group => {
+    const agentNames = (group.member_ids || []).filter(id => id !== 'admin').map(id => displayName(id));
+    const unread = unreadCounts[group.id] || 0;
+    return `<div class="ws-group-row">
+      <button class="ws-group-select ${state.view === 'group' && state.activeGroup === group.id ? 'active' : ''}" data-group-id="${esc(group.id)}" title="打开 ${esc(group.name)}">
+        <span class="ws-group-icon">${group.is_default ? '👥' : '💬'}</span>
+        <span class="ws-group-copy">
+          <span class="ws-group-name">${esc(group.name)}</span>
+          <span class="ws-group-members-preview">${esc(agentNames.join(' · ') || '仅 admin')}</span>
+        </span>
+        ${unread ? `<span class="ws-group-unread">${unread > 99 ? '99+' : unread}</span>` : ''}
+      </button>
+      <button class="ws-group-edit" data-group-edit="${esc(group.id)}" title="编辑群成员" aria-label="编辑 ${esc(group.name)}">•••</button>
+    </div>`;
+  }).join('');
+}
+
+function setActiveGroup(groupId) {
+  if (!CHANNELS[groupId] || !groupConversations.some(g => g.id === groupId)) return;
+  state.activeGroup = groupId;
+  state.view = 'group';
+  currentChannel = groupId;
+  persist();
+  markSeen(groupId);
+  updateAllUnreadCounts();
+  _msgsSignature = '';
+  render();
+  poll();
+}
+
+let groupManageEditingId = null;
+
+function renderGroupMemberOptions(selectedIds = []) {
+  const el = document.getElementById('groupMemberOptions');
+  if (!el) return;
+  const selected = new Set(selectedIds);
+  el.innerHTML = roster.filter(member => member.kind === 'agent').map(member => `
+    <label class="ws-group-member-option">
+      <input type="checkbox" value="${esc(member.id)}" ${selected.has(member.id) ? 'checked' : ''}>
+      <span class="ws-group-member-avatar">${esc(member.avatar || '🤖')}</span>
+      <span>
+        <span class="ws-group-member-name">${esc(displayName(member.id))}</span>
+        <span class="ws-group-member-sub">${esc(member.tmux || member.model || 'agent')}</span>
+      </span>
+    </label>`).join('');
+}
+
+function openGroupManage(groupId = null) {
+  const group = groupId ? groupConversations.find(item => item.id === groupId) : null;
+  groupManageEditingId = group?.id || null;
+  document.getElementById('groupManageTitle').textContent = group ? '编辑工作群' : '新建工作群';
+  document.getElementById('groupManageSubmit').textContent = group ? '保存修改' : '创建群聊';
+  document.getElementById('groupNameInput').value = group?.name || '';
+  document.getElementById('groupManageError').style.display = 'none';
+  renderGroupMemberOptions(group?.member_ids || roster.filter(m => m.kind === 'agent').map(m => m.id));
+  document.getElementById('groupManageMask').classList.add('open');
+  setTimeout(() => document.getElementById('groupNameInput').focus(), 0);
+}
+
+function closeGroupManage() {
+  document.getElementById('groupManageMask').classList.remove('open');
+  groupManageEditingId = null;
+}
+
+async function submitGroupManage() {
+  const name = document.getElementById('groupNameInput').value.trim();
+  const memberIds = [...document.querySelectorAll('#groupMemberOptions input:checked')].map(input => input.value);
+  const errorEl = document.getElementById('groupManageError');
+  if (!name) {
+    errorEl.textContent = '请输入群名称'; errorEl.style.display = '';
+    return;
+  }
+  if (!memberIds.length) {
+    errorEl.textContent = '请至少选择一个 agent'; errorEl.style.display = '';
+    return;
+  }
+  const submit = document.getElementById('groupManageSubmit');
+  submit.disabled = true;
+  try {
+    const path = groupManageEditingId ? `/groups/${encodeURIComponent(groupManageEditingId)}` : '/groups';
+    const data = await apiJson(path, {
+      method: groupManageEditingId ? 'PUT' : 'POST',
+      body: JSON.stringify({ name, member_ids: memberIds }),
+    });
+    if (!data?.ok) throw new Error(data?.error || '保存失败');
+    const nextGroupId = data.group?.id || groupManageEditingId || 'workgroup';
+    closeGroupManage();
+    await loadGroups();
+    setActiveGroup(nextGroupId);
+  } catch (e) {
+    errorEl.textContent = String(e?.message || e); errorEl.style.display = '';
+  } finally {
+    submit.disabled = false;
+  }
 }
 
 // Sticky-bottom for the message list:
@@ -4221,8 +4558,8 @@ function renderGroupMsg(m) {
 // DM view rendering
 // ============================================================================
 // Map DM channel ↔ server agent id.
-const DM_CHANNEL_TO_SID = { 'dm-agent1': 'agent1', 'dm-agent2': 'agent2' };
-const DM_AGENT_ORDER = ['dm-agent1', 'dm-agent2'];
+const DM_CHANNEL_TO_SID = Object.fromEntries(ROLE_AGENT_IDS.map(id => [`dm-${id}`, id]));
+const DM_AGENT_ORDER = ROLE_AGENT_IDS.map(id => `dm-${id}`);
 
 function renderDmThreads() {
   const el = document.getElementById('dmThreadList');
@@ -4383,8 +4720,10 @@ function renderDmMessages() {
 // Per-author reply marker accent (matches design's replyAccentByAuthor lookup).
 const REPLY_ACCENT_BY_SENDER = {
   admin:  'var(--warn)',
-  agent1: 'var(--actorB-deep)',
-  agent2: 'var(--actorC-deep)',
+  product: 'var(--actorA-deep)',
+  creative: 'var(--actorB-deep)',
+  social: 'var(--actorC-deep)',
+  growth: 'var(--actorD-deep)',
 };
 
 function renderDmMsg(m, prev) {
@@ -4426,10 +4765,7 @@ function renderDmMsg(m, prev) {
   // Reply preview block.
   let replyBlock = '';
   if (m.reply_preview) {
-    const replyAuthor = m.reply_preview.sender === 'agent1' ? 'agent1'
-                      : m.reply_preview.sender === 'agent2' ? 'agent2'
-                      : m.reply_preview.sender === 'admin'  ? 'admin'
-                      : (m.reply_preview.sender || 'Unknown');
+    const replyAuthor = displayName(m.reply_preview.sender || 'Unknown');
     const replyAccent = REPLY_ACCENT_BY_SENDER[m.reply_preview.sender] || 'var(--ink-3)';
     const replyText = (m.reply_preview.content || '').slice(0, 80);
     const titleFg = isFromPm ? 'rgba(255,250,243,0.78)' : 'var(--ink-2)';
@@ -4873,7 +5209,7 @@ function toggleTerminalDrawer() {
     return;
   }
   if (!terminalTabs.length) {
-    let candidate = 'agent1';  // default to agent1
+    let candidate = 'product';
     if (state.view === 'dm') {
       const sid = DM_CHANNEL_TO_SID[currentChannel];
       if (sid && TERMINAL_SESSIONS[sid]) candidate = sid;
@@ -5834,8 +6170,8 @@ function renderSettingsPhaseEditor(tpl) {
   }
   const ROLE_DEFS = [
     { key: 'pm',     label: 'PM',      emoji: '👾' },
-    { key: 'implementer',   label: 'agent1', emoji: '🤖' },
-    { key: 'reviewer',     label: 'agent2', emoji: '🤖' },
+    { key: 'implementer',   label: '产品企划', emoji: '🧭' },
+    { key: 'reviewer',     label: '创意设计', emoji: '🎬' },
     { key: 'system', label: 'System',  emoji: '⚙' },
   ];
   const isReserved = !!tpl.is_reserved;
@@ -6028,8 +6364,8 @@ function renderTypeCreateForm() {
 function renderPhaseCreateForm() {
   const ROLE_DEFS = [
     { key: 'pm',     label: 'PM',      emoji: '👾' },
-    { key: 'implementer',   label: 'agent1', emoji: '🤖' },
-    { key: 'reviewer',     label: 'agent2', emoji: '🤖' },
+    { key: 'implementer',   label: '产品企划', emoji: '🧭' },
+    { key: 'reviewer',     label: '创意设计', emoji: '🎬' },
     { key: 'system', label: 'System',  emoji: '⚙' },
   ];
   const rolesSet = new Set(entityCreateForm.required_roles);
@@ -6464,7 +6800,7 @@ function renderTaskDetail() {
           ${d.events.map(renderTaskEvent).join('')}
         </div>
         <div class="ws-feed-composer">
-          <textarea id="taskCommentInput" placeholder="写下一条评论… 用 @agent1 / @agent2 召唤"></textarea>
+          <textarea id="taskCommentInput" placeholder="写下一条评论… 用 @product / @creative 召唤"></textarea>
           <div class="ws-feed-composer-row">
             <span style="flex:1"></span>
             <button class="ws-tasks-btn-primary" id="taskCommentBtn">评论</button>
@@ -6494,7 +6830,7 @@ function renderTaskDetail() {
           //   - 后续阶段: actor is required for a future phase
           // Anyone not touching this task's workflow doesn't show up at all
           // (so a dev_lite task no longer lists agents not part of its workflow).
-          const ROLE_TO_ACTORS = { pm: ['admin'], implementer: ['agent1'], reviewer: ['agent2'], system: [] };
+          const ROLE_TO_ACTORS = { pm: ['admin'], implementer: ['product'], reviewer: ['creative'], system: [] };
           const participantIds = new Set();
           if (t.created_by) participantIds.add(t.created_by);
           pendingActors.forEach(a => participantIds.add(a));
@@ -6613,7 +6949,7 @@ function renderTaskDetail() {
 // 渲染用 actor_id 维度. 修法: 看 `checked_at != null` 即视为该 role 已确认, push role
 // 对应的 actor_ids 进 checked_by 数组 — 跟现有 actorIds map 同款.
 // (ai-collab actor_id 命名: admin/agent1/agent2.)
-const _ROLE_TO_ACTORS_FOR_CHECK = { pm: ['admin'], implementer: ['agent1'], reviewer: ['agent2'], system: ['system'] };
+const _ROLE_TO_ACTORS_FOR_CHECK = { pm: ['admin'], implementer: ['product'], reviewer: ['creative'], system: ['system'] };
 function _indexPhaseState(arr) {
   if (!Array.isArray(arr) || !arr.length) return {};
   const maxCycle = {};
@@ -6665,7 +7001,7 @@ function renderWorkflowStepper(phases, currentIdx, isClosed, task, phaseState) {
             <div class="ws-workflow-step-sub">${p.auto_advance ? 'auto' : ''}</div>
             <div class="ws-workflow-role-row">
               ${roles.map(r => {
-                const actorIds = { pm: ['admin'], implementer: ['agent1'], reviewer: ['agent2'], system: ['system'] }[r] || [];
+                const actorIds = { pm: ['admin'], implementer: ['product'], reviewer: ['creative'], system: ['system'] }[r] || [];
                 return actorIds.map(aid => {
                   const designId = SERVER_TO_DESIGN_ID[aid] || aid;
                   // AIC-121.5: rollback 后 server 不清 downstream phase
@@ -6779,8 +7115,10 @@ function scrollDmMessagesToBottom() {
 // Static candidate list (handles are what the user types after @, mapped to
 // real sender_ids by parseMentions when the message is sent).
 const MENTION_CANDIDATES = [
-  { handle: 'agent1', serverId: 'agent1' },
-  { handle: 'agent2', serverId: 'agent2' },
+  { handle: 'product', serverId: 'product' },
+  { handle: 'creative', serverId: 'creative' },
+  { handle: 'social', serverId: 'social' },
+  { handle: 'growth', serverId: 'growth' },
 ];
 
 const mentionState = {
@@ -6815,7 +7153,9 @@ function updateMentionMenu() {
   const trig = detectMentionTrigger(ta);
   if (!trig) { closeMentionMenu(); return; }
 
+  const allowedMembers = new Set(activeGroupInfo()?.member_ids || []);
   const items = MENTION_CANDIDATES
+    .filter(c => allowedMembers.has(c.serverId))
     .filter(c => !trig.query || c.handle.includes(trig.query) || displayName(c.serverId).toLowerCase().includes(trig.query))
     .map(c => {
       const r = roster.find(x => x.id === c.serverId);
@@ -6889,8 +7229,8 @@ function setView(v) {
   if (v !== 'task') state.activeTaskId = null;
   // Each view pins its own active channel so the shared composer + poll loop
   // target the right place.
-  if (v === 'group') currentChannel = 'workgroup';
-  else if (v === 'dm') currentChannel = state.activeDm || 'dm-agent1';
+  if (v === 'group') currentChannel = state.activeGroup || 'workgroup';
+  else if (v === 'dm') currentChannel = state.activeDm || 'dm-product';
   persist();
   // 2026-06-22 PM bug: 切回 dm/group 时立刻同步远端 seen state, 不等 30s timer
   hydrateSeenFromServer();
@@ -6956,7 +7296,7 @@ document.getElementById('agentStrip').addEventListener('click', async e => {
   if (action === 'open-dm') {
     // serverId → DM channel key. PM (admin) shouldn't have a DM card on strip
     // but guard anyway.
-    const ch = agent === 'agent1' ? 'dm-agent1' : agent === 'agent2' ? 'dm-agent2' : null;
+    const ch = ROLE_AGENT_IDS.includes(agent) ? `dm-${agent}` : null;
     if (ch) setActiveDm(ch);
   } else if (action === 'toggle-expand') {
     // AIC-53: two modes — ⚙ opens settings panel, 📊 opens USAGE panel. Re-click same
@@ -7687,6 +8027,19 @@ document.getElementById('taskDetailRoot').addEventListener('keydown', e => {
 });
 
 // Nav tabs + theme button
+document.getElementById('groupList').addEventListener('click', e => {
+  const edit = e.target.closest('[data-group-edit]');
+  if (edit) { openGroupManage(edit.dataset.groupEdit); return; }
+  const select = e.target.closest('[data-group-id]');
+  if (select) setActiveGroup(select.dataset.groupId);
+});
+document.getElementById('btnCreateGroup').addEventListener('click', () => openGroupManage());
+document.getElementById('groupManageClose').addEventListener('click', closeGroupManage);
+document.getElementById('groupManageCancel').addEventListener('click', closeGroupManage);
+document.getElementById('groupManageSubmit').addEventListener('click', submitGroupManage);
+document.getElementById('groupManageMask').addEventListener('click', e => {
+  if (e.target.id === 'groupManageMask') closeGroupManage();
+});
 document.querySelectorAll('#navTabs .ws-nav-tab').forEach(btn => {
   btn.addEventListener('click', () => setView(btn.dataset.view));
 });
@@ -7745,16 +8098,14 @@ let _searchReqSeq = 0; // 防 race：迟到的 fetch 不覆盖新的
 // Channel chip 定义（label + server-side key）。「任务 feed」给后端发 'task' 触发全 task 搜索。
 const _SEARCH_CHANNEL_CHIPS = [
   { key: 'workgroup', label: '工作群' },
-  { key: 'dm-agent1', label: 'agent1 私聊' },
-  { key: 'dm-agent2', label: 'agent2 私聊' },
+  ...ROLE_AGENT_IDS.map(id => ({ key: `dm-${id}`, label: `${displayName(id)} 私聊` })),
   { key: 'task',      label: '任务 feed' },
 ];
 // AIC-91 cycle 2: 删 system chip — 后端 group_messages 硬 filter message_type != 'system_notification',
 // messages / task_events 也没 sender=system，chip 选中后端三表都返 0，是死项。
 const _SEARCH_SENDER_CHIPS = [
   { key: 'admin',  label: 'admin' },
-  { key: 'agent1', label: 'agent1' },
-  { key: 'agent2', label: 'agent2' },
+  ...ROLE_AGENT_IDS.map(id => ({ key: id, label: displayName(id) })),
 ];
 // AIC-91 cycle 2: 加「自定义」chip (spec 字面 5 项)，点击弹原生 prompt 取 since/before ISO date 字符串，
 // 简化 MVP — 不做日期 picker UI，避免 scope 膨胀。
@@ -7958,8 +8309,8 @@ window.openMessage = async function (serverChannel, messageId, opts) {
   if (!serverChannel || !messageId) return;
   const pushHistory = !opts || opts.pushHistory !== false;  // default true (user-triggered)
   // 1. 切 channel
-  if (serverChannel === 'workgroup') {
-    setView('group');
+  if (CHANNELS[serverChannel]?.managedGroup) {
+    setActiveGroup(serverChannel);
   } else if (serverChannel.startsWith('dm-')) {
     const clientCh = _clientChannelName(serverChannel);
     setView('dm');
@@ -8090,12 +8441,13 @@ function _highlightMatches(text, query) {
 
 function _renderSearchChannelBadge(serverChannel) {
   let emoji = '', label = '', bg = 'var(--surface-2)', fg = 'var(--ink-2)';
-  if (serverChannel === 'workgroup') {
-    emoji = '👥'; label = '工作群';
-  } else if (serverChannel === 'dm-agent1') {
-    emoji = '🤖'; label = 'agent1 私聊'; bg = 'var(--actorB)'; fg = 'var(--ink)';
-  } else if (serverChannel === 'dm-agent2') {
-    emoji = '🤖'; label = 'agent2 私聊'; bg = 'var(--actorC)'; fg = 'var(--ink)';
+  const managedGroup = groupConversations.find(group => group.id === serverChannel);
+  if (managedGroup) {
+    emoji = managedGroup.is_default ? '👥' : '💬'; label = managedGroup.name;
+  } else if (serverChannel && DM_CHANNEL_TO_SID[serverChannel]) {
+    const sid = DM_CHANNEL_TO_SID[serverChannel];
+    const designId = SERVER_TO_DESIGN_ID[sid] || 'pm';
+    emoji = _actorAvatar(sid); label = `${displayName(sid)} 私聊`; bg = `var(--${designId})`; fg = 'var(--ink)';
   } else if (serverChannel && serverChannel.startsWith('task:')) {
     emoji = '📋'; label = serverChannel.slice(5);
   } else {
@@ -8671,13 +9023,16 @@ loadPersisted();
 // Sync currentChannel to the restored view BEFORE first render — otherwise a
 // refresh into the DM tab shows the workgroup feed (currentChannel defaults to
 // 'workgroup' but the DM view tries to render that channel's messages).
-if (state.view === 'dm') currentChannel = state.activeDm || 'dm-agent1';
-else if (state.view === 'group') currentChannel = 'workgroup';
+if (state.view === 'dm') currentChannel = state.activeDm || 'dm-product';
+else if (state.view === 'group') currentChannel = state.activeGroup || 'workgroup';
 render();  // placeholder render so the page isn't blank during the prime fetch
 (async () => {
   try {
     await loadRoster();
   } catch (e) { console.error('[init] loadRoster failed:', e); }
+  try {
+    await loadGroups();
+  } catch (e) { console.error('[init] loadGroups failed:', e); }
   render();
   startPolling();
   startBackgroundPolling();  // pulls non-current channels every 10s to keep unread badges live
@@ -8726,8 +9081,8 @@ render();  // placeholder render so the page isn't blank during the prime fetch
     const u = new URL(window.location.href);
     const ch = u.searchParams.get('ch');
     if (ch) {
-      if (ch === 'workgroup') {
-        setView('group');
+      if (CHANNELS[ch]?.managedGroup) {
+        setActiveGroup(ch);
       } else if (ch.startsWith('dm-')) {
         const clientCh = _clientChannelName(ch);
         const cfg = CHANNELS[clientCh];

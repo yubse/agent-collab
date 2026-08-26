@@ -5,15 +5,13 @@ import { Database } from 'bun:sqlite'
 import path from 'path'
 import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync, statSync, renameSync } from 'fs'
 import { homedir } from 'os'
+import { randomBytes } from 'crypto'
 import { jsonOk, jsonError, readJsonBody } from './src/responses.ts'
 import { jsonParseSafe } from './src/formatters.ts'
 import {
   IMG_PORT,
   SOURCE,
   AUTH_TOKEN,
-  AGENT1_TMUX_SESSION,
-  AGENT2_TMUX_SESSION,
-  AGENT1_CLOCK_IN_SCRIPT,
   SERVER_STARTED_AT,
   agentRoot,
   workspaceRoot,
@@ -27,20 +25,11 @@ import {
   heartbeatStatePath,
   ALLOW_QUERY_TOKEN_AUTH,
   ALLOW_REMOTE_CONTROL,
-  AGENT1_HEARTBEAT_PATH,
-  AGENT1_PROJECT_DIR,
-  AGENT2_PROJECT_DIR,
-  AGENT1_PROVIDER, AGENT2_PROVIDER,
-  AGENT1_BINARY_PATH, AGENT2_BINARY_PATH,
-  AGENT1_CWD, AGENT2_CWD,
-  AGENT1_EXTRA_ARGS, AGENT2_EXTRA_ARGS,
-  AGENT1_TMUX_SOCKET, AGENT2_TMUX_SOCKET,
-  AGENT1_TMUX_CAPTURE_INTERVAL_MS, AGENT2_TMUX_CAPTURE_INTERVAL_MS,
-  AGENT1_TMUX_FILTER_MODE, AGENT2_TMUX_FILTER_MODE,
-  AGENT1_TMUX_QUIET_MS, AGENT2_TMUX_QUIET_MS,
+  loadAgentRuntimeEnv,
   type AgentProviderKind,
 } from './src/config.ts'
 import type { AgentProvider, AgentEvent, AgentError, AgentProviderConfig } from './src/providers/provider.ts'
+import { AgentTurnRouteQueue, type AgentTurnRoute } from './src/agent-turn-routing.ts'
 import { ClaudeProvider } from './src/providers/claude.ts'
 import { CodexProvider } from './src/providers/codex.ts'
 import { TmuxProvider } from './src/providers/tmux.ts'
@@ -54,6 +43,14 @@ const RUNTIME_STATE_DIR = runtimeStateDir(import.meta.dir)
 const RUNTIME_UPLOADS_DIR = runtimeUploadsDir(import.meta.dir)
 const GENERATED_ARTIFACTS_DIR = generatedArtifactsDir(import.meta.dir)
 const HEARTBEAT_PATH = heartbeatStatePath(import.meta.dir)
+
+const ROLE_AGENT_IDS = ['product', 'creative', 'social', 'growth'] as const
+const ROLE_AGENT_CONFIGS = {
+  product: loadAgentRuntimeEnv('PRODUCT'),
+  creative: loadAgentRuntimeEnv('CREATIVE'),
+  social: loadAgentRuntimeEnv('SOCIAL'),
+  growth: loadAgentRuntimeEnv('GROWTH'),
+}
 
 function migrateLegacyFile(legacyPath: string, nextPath: string) {
   if (legacyPath === nextPath) return
@@ -118,6 +115,48 @@ db.run(`CREATE TABLE IF NOT EXISTS group_messages (
 )`)
 try { db.run(`ALTER TABLE group_messages ADD COLUMN images TEXT NOT NULL DEFAULT '[]'`) } catch {}
 try { db.run(`ALTER TABLE group_messages ADD COLUMN files TEXT NOT NULL DEFAULT '[]'`) } catch {}
+
+// Multi-workgroup metadata. Messages already carry conversation_id, so rooms and
+// membership can evolve independently without migrating chat history.
+db.run(`CREATE TABLE IF NOT EXISTS group_conversations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT 'admin',
+  is_default INTEGER NOT NULL DEFAULT 0
+)`)
+db.run(`CREATE TABLE IF NOT EXISTS group_conversation_members (
+  conversation_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  added_at TEXT NOT NULL,
+  PRIMARY KEY (conversation_id, member_id),
+  FOREIGN KEY (conversation_id) REFERENCES group_conversations(id) ON DELETE CASCADE
+)`)
+const defaultGroupCreatedAt = new Date().toISOString()
+db.run(`INSERT OR IGNORE INTO group_conversations (id, name, created_at, created_by, is_default)
+  VALUES ('workgroup', '工作群', ?, 'admin', 1)`, [defaultGroupCreatedAt])
+for (const memberId of ['admin', ...ROLE_AGENT_IDS]) {
+  db.run(`INSERT OR IGNORE INTO group_conversation_members (conversation_id, member_id, added_at)
+    VALUES ('workgroup', ?, ?)`, [memberId, defaultGroupCreatedAt])
+}
+// One-time/idempotent migration from the original two placeholder agents.
+// Custom groups keep their intent: agent1 expands into product/creative, while
+// agent2 expands into social/growth. The default group always contains all four.
+for (const [legacyId, replacements] of Object.entries({
+  agent1: ['product', 'creative'],
+  agent2: ['social', 'growth'],
+})) {
+  const groups = db.prepare(`SELECT conversation_id FROM group_conversation_members WHERE member_id=?`).all(legacyId) as any[]
+  for (const group of groups) {
+    for (const replacement of replacements) {
+      db.run(`INSERT OR IGNORE INTO group_conversation_members (conversation_id, member_id, added_at)
+        VALUES (?, ?, ?)`, [group.conversation_id, replacement, defaultGroupCreatedAt])
+    }
+  }
+  db.run(`DELETE FROM group_conversation_members WHERE member_id=?`, [legacyId])
+}
+db.run(`CREATE INDEX IF NOT EXISTS idx_group_conversation_members_member
+  ON group_conversation_members(member_id, conversation_id)`)
 
 db.run(`CREATE TABLE IF NOT EXISTS group_agent_state (
   agent_id TEXT PRIMARY KEY,
@@ -374,28 +413,45 @@ const GROUP_ROSTER: GroupMember[] = [
     tmux: null,
     can_reply: false,
   },
-  // Two placeholder agents below. Rename / re-skin / replace them when wiring your own
-  // setup. Each agent's id (`agent1` / `agent2`) is what the rest of the codebase routes by;
-  // keep them or update everywhere they're referenced (see README "怎么加 agent").
   {
-    id: 'agent2',
-    display_name: 'agent2',
+    id: 'product',
+    display_name: '产品企划',
     kind: 'agent',
-    avatar: '🤖',
-    color: 'green',
-    model: '',
-    tmux: AGENT2_PROVIDER,
+    avatar: '🧭',
+    color: 'blue',
+    model: 'Product Manager',
+    tmux: ROLE_AGENT_CONFIGS.product.provider,
     can_reply: true,
     default_responder: true,
   },
   {
-    id: 'agent1',
-    display_name: 'agent1',
+    id: 'creative',
+    display_name: '创意设计',
     kind: 'agent',
-    avatar: '🤖',
-    color: 'blue',
-    model: '',
-    tmux: AGENT1_PROVIDER,
+    avatar: '🎬',
+    color: 'purple',
+    model: 'Visual Storyteller',
+    tmux: ROLE_AGENT_CONFIGS.creative.provider,
+    can_reply: true,
+  },
+  {
+    id: 'social',
+    display_name: '社媒运营',
+    kind: 'agent',
+    avatar: '📣',
+    color: 'green',
+    model: 'Social Media Strategist',
+    tmux: ROLE_AGENT_CONFIGS.social.provider,
+    can_reply: true,
+  },
+  {
+    id: 'growth',
+    display_name: '营销增长',
+    kind: 'agent',
+    avatar: '🚀',
+    color: 'orange',
+    model: 'Growth Hacker',
+    tmux: ROLE_AGENT_CONFIGS.growth.provider,
     can_reply: true,
   },
 ]
@@ -426,41 +482,17 @@ type AgentRuntimeConfig = {
   tmuxQuietMs: number
 }
 const AGENT_RUNTIMES: Record<string, AgentRuntimeConfig> = {
-  agent1: {
-    provider: AGENT1_PROVIDER,
-    binaryPath: AGENT1_BINARY_PATH,
-    cwd: AGENT1_CWD,
-    extraArgs: AGENT1_EXTRA_ARGS,
-    tmuxSession: AGENT1_TMUX_SESSION,
-    tmuxSocket: AGENT1_TMUX_SOCKET,
-    tmuxCaptureIntervalMs: AGENT1_TMUX_CAPTURE_INTERVAL_MS,
-    tmuxFilterMode: AGENT1_TMUX_FILTER_MODE,
-    tmuxQuietMs: AGENT1_TMUX_QUIET_MS,
-  },
-  agent2: {
-    provider: AGENT2_PROVIDER,
-    binaryPath: AGENT2_BINARY_PATH,
-    cwd: AGENT2_CWD,
-    extraArgs: AGENT2_EXTRA_ARGS,
-    tmuxSession: AGENT2_TMUX_SESSION,
-    tmuxSocket: AGENT2_TMUX_SOCKET,
-    tmuxCaptureIntervalMs: AGENT2_TMUX_CAPTURE_INTERVAL_MS,
-    tmuxFilterMode: AGENT2_TMUX_FILTER_MODE,
-    tmuxQuietMs: AGENT2_TMUX_QUIET_MS,
-  },
+  product: ROLE_AGENT_CONFIGS.product,
+  creative: ROLE_AGENT_CONFIGS.creative,
+  social: ROLE_AGENT_CONFIGS.social,
+  growth: ROLE_AGENT_CONFIGS.growth,
 }
 const AGENT_PROVIDERS = new Map<string, AgentProvider>()
-// AIC-116: track the conversation each agent was last dispatched into, so
-// `handleProviderEvent` can route the assistant reply back to the right channel. Provider
-// events have no channel context of their own — the agent runtime doesn't know which
-// channel the user typed in, only the message text.
-const _agentLastDispatchChannel = new Map<string, string>()
-// AIC-132: per-agent flag tracking whether the current turn was dispatched as
-// observe-only. `handleProviderEvent` drops the assistant text when this is true —
-// agents that want to reply to an observe message must self-curl /group/send with
-// an explicit conversation_id (workgroup or dm-<id>). Reset on the next `result`
-// event so the following turn starts clean.
-const _agentIsObserveTurn = new Map<string, boolean>()
+// Provider events do not carry the workgroup conversation/observe intent that caused
+// the turn. Multiple turns can be accepted before an earlier one completes, so routing
+// context must be FIFO per agent; one global boolean/channel lets a later observe turn
+// overwrite an in-flight visible response (the Product/Creative discussion race).
+const _agentTurnRoutes = new AgentTurnRouteQueue()
 // Dedup last-appended assistant text per agent to prevent double-emit when the runtime
 // also self-curls /group/send (legacy claude CLAUDE.md convention). Hash a sliding window
 // of recent appends (TTL 60s) — same hash within window is dropped silently.
@@ -508,7 +540,7 @@ function instantiateProvider(agentId: string): AgentProvider | null {
   // tmux provider doesn't spawn a subprocess (operator-owned session) so the cwd guard
   // below doesn't apply to it. claude/codex still need cwd for settings/hooks discovery.
   if (cfg.provider !== 'tmux' && !cfg.cwd) {
-    process.stderr.write(`ai-collab: WARN agent ${agentId} has empty cwd (set AGENT${agentId === 'agent1' ? '1' : '2'}_CWD); provider will spawn with server cwd and likely miss .claude/settings.json\n`)
+    process.stderr.write(`ai-collab: WARN agent ${agentId} has empty cwd (set ${agentId.toUpperCase()}_CWD); provider will spawn with server cwd and likely miss AGENTS.md\n`)
   }
   const providerCfg: AgentProviderConfig = {
     label: agentId,
@@ -555,30 +587,51 @@ function ensureProvider(agentId: string): AgentProvider | null {
 // New ai-collab CLAUDE.md / AGENTS.md templates should NOT self-curl reply; the server
 // forwards stdout automatically.
 function handleProviderEvent(agentId: string, ev: AgentEvent): void {
-  if (ev.type === 'system_init' || ev.type === 'assistant') {
-    if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId)
+  const activeRoute = _agentTurnRoutes.current(agentId)
+  if ((ev.type === 'system_init' || ev.type === 'assistant') && activeRoute && !activeRoute.observeOnly) {
+    if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId, { dispatch_id: activeRoute.dispatchId })
   } else if (ev.type === 'result') {
-    if (isAgentWorkingInDb(agentId)) markAgentIdle(agentId)
-    // AIC-132: clear observe flag so the next turn starts clean.
-    _agentIsObserveTurn.delete(agentId)
+    _agentTurnRoutes.complete(agentId)
+    // A completed response must not make the workstation look idle when another
+    // visible response is already queued behind it. Observe-only turns stay silent.
+    if (_agentTurnRoutes.hasResponseTurn(agentId)) {
+      const nextRoute = _agentTurnRoutes.current(agentId)
+      if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId, { dispatch_id: nextRoute?.dispatchId })
+    } else if (isAgentWorkingInDb(agentId)) {
+      markAgentIdle(agentId)
+    }
+    startNextAgentTurn(agentId)
   }
 
   if (ev.type === 'assistant' && typeof ev.text === 'string' && ev.text.trim()) {
-    // AIC-132: observe-only turn — drop the auto-route. The agent saw the message for
-    // context sync, not for response; if it actually wants to reply it must self-curl
-    // /group/send with an explicit conversation_id. Without this gate the agent's
-    // text leaks into the last-dispatched (or default 'workgroup') channel — that
-    // surfaces as the agent's DM-style reply tone showing up in the workgroup.
-    if (_agentIsObserveTurn.get(agentId) === true) {
+    // Each assistant event belongs to the oldest unfinished provider turn. A later
+    // observe dispatch therefore cannot suppress an earlier visible response.
+    if (!activeRoute) {
+      process.stderr.write(`provider[${agentId}] drop assistant text without a pending turn route\n`)
+      return
+    }
+    if (activeRoute.observeOnly) {
       const preview = ev.text.trim().slice(0, 60).replace(/\n/g, ' ')
       process.stderr.write(`provider[${agentId}] observe-turn drop assistant text (${ev.text.length} chars, first="${preview}…")\n`)
       return
     }
-    const conversationId = _agentLastDispatchChannel.get(agentId) || 'workgroup'
+    const conversationId = activeRoute.conversationId
     const text = ev.text.trim()
     if (_dedupAgentReply(agentId, text)) return
     try {
       const dispatchId = groupId('dsp')
+      // Agent-authored @mentions are real response targets, not passive observers.
+      // This is what lets Creative explicitly hand a question to Product and receive
+      // Product's follow-up in the same group.
+      const mentions = normalizeGroupMentions([], text)
+      const responseTargets = groupTargetsFor(agentId, mentions, activeRoute.hopCount, conversationId)
+      const delivery = {
+        mode: mentions.length ? 'mention' : 'broadcast',
+        targets: responseTargets,
+        dispatch_id: dispatchId,
+        delivered: [],
+        failed: [],
+      }
       const record = appendGroupRecord(
         {
           sender_id: agentId,
@@ -587,17 +640,17 @@ function handleProviderEvent(agentId: string, ev: AgentEvent): void {
           message_type: 'chat',
           source: 'provider_reply',
         },
-        [],
-        { mode: 'broadcast', targets: [], dispatch_id: dispatchId, delivered: [], failed: [] },
+        mentions,
+        delivery,
       )
-      // Fan out to other agents in the same conversation (so they see each other's
-      // replies just like a human would). Skip the sender itself.
-      if (conversationId === 'workgroup') {
-        const fanOut = GROUP_ROSTER
-          .filter((m) => m.kind === 'agent' && m.id !== agentId && groupAgentAutoReply(m.id))
-          .map((m) => m.id)
-        if (fanOut.length) {
-          dispatchGroupRecord(record, fanOut, 1, /* observeOnly */ true)
+      if (responseTargets.length) {
+        dispatchGroupRecord(record, responseTargets, activeRoute.hopCount)
+      }
+      // Non-mentioned agents still receive the message as silent context.
+      if (!dmAgentFor(conversationId)) {
+        const observers = groupObserverTargetsFor(agentId, responseTargets, conversationId)
+        if (observers.length) {
+          dispatchGroupRecord(record, observers, activeRoute.hopCount, /* observeOnly */ true)
         }
       }
     } catch (e) {
@@ -614,10 +667,10 @@ function handleProviderError(agentId: string, err: AgentError): void {
     // re-instantiates and re-spawns. Without this, AGENT_PROVIDERS.has() stays true →
     // groupStatusSnapshot reports `online` for a zombie that won't actually accept input.
     AGENT_PROVIDERS.delete(agentId)
-    // AIC-132: provider died mid-turn; observe flag would never see its `result`
-    // event so wouldn't auto-clear. Clear here so the next provider instance starts
-    // with a clean slate.
-    _agentIsObserveTurn.delete(agentId)
+    // A dead provider cannot emit result events for its accepted routes. Clear them so
+    // a fresh instance starts with an unambiguous routing queue.
+    const abandonedRoutes = _agentTurnRoutes.clear(agentId)
+    for (const route of abandonedRoutes) demoteAgentTurnDelivery(agentId, route)
   }
 }
 
@@ -660,12 +713,73 @@ const GROUP_REPLY_AGENT_IDS = GROUP_ROSTER.filter((m) => m.can_reply).map((m) =>
 const GROUP_ALIASES = new Map<string, string>([
   ['all', GROUP_ALL_TOKEN],
   ['everyone', GROUP_ALL_TOKEN],
+  ['全员', GROUP_ALL_TOKEN],
   ['admin', 'admin'],
-  ['agent1', 'agent1'],
-  ['agent2', 'agent2'],
-  ['agent-a', 'agent1'],
-  ['agent-b', 'agent2'],
+  ['product', 'product'],
+  ['产品', 'product'],
+  ['产品企划', 'product'],
+  ['creative', 'creative'],
+  ['创意', 'creative'],
+  ['创意设计', 'creative'],
+  ['social', 'social'],
+  ['社媒', 'social'],
+  ['社媒运营', 'social'],
+  ['growth', 'growth'],
+  ['增长', 'growth'],
+  ['营销增长', 'growth'],
 ])
+
+type GroupConversationSummary = {
+  id: string
+  name: string
+  created_at: string
+  created_by: string
+  is_default: boolean
+  member_ids: string[]
+}
+
+function groupConversationById(id: string): GroupConversationSummary | null {
+  const row = db.prepare(`SELECT id, name, created_at, created_by, is_default FROM group_conversations WHERE id=?`).get(id) as any
+  if (!row) return null
+  const members = db.prepare(`SELECT member_id FROM group_conversation_members WHERE conversation_id=? ORDER BY member_id`).all(id) as any[]
+  return {
+    id: row.id,
+    name: row.name,
+    created_at: row.created_at,
+    created_by: row.created_by,
+    is_default: !!row.is_default,
+    member_ids: members.map((m) => String(m.member_id)),
+  }
+}
+
+function listGroupConversations(): GroupConversationSummary[] {
+  const rows = db.prepare(`SELECT id FROM group_conversations ORDER BY is_default DESC, created_at ASC`).all() as any[]
+  return rows.map((row) => groupConversationById(String(row.id))).filter(Boolean) as GroupConversationSummary[]
+}
+
+function groupMemberIds(conversationId: string): string[] {
+  return (db.prepare(`SELECT member_id FROM group_conversation_members WHERE conversation_id=?`).all(conversationId) as any[])
+    .map((row) => String(row.member_id))
+}
+
+function groupAgentIds(conversationId: string): string[] {
+  const memberSet = new Set(groupMemberIds(conversationId))
+  return GROUP_REPLY_AGENT_IDS.filter((id) => memberSet.has(id))
+}
+
+function normalizeConversationMembers(raw: any): string[] {
+  const requested = Array.isArray(raw) ? raw.map((id) => String(id).trim()) : []
+  const allowed = new Set(GROUP_ROSTER.map((member) => member.id))
+  return [...new Set(['admin', ...requested.filter((id) => allowed.has(id) && id !== 'admin')])]
+}
+
+function saveConversationMembers(conversationId: string, memberIds: string[]) {
+  const now = groupNowIso()
+  db.run(`DELETE FROM group_conversation_members WHERE conversation_id=?`, [conversationId])
+  for (const memberId of memberIds) {
+    db.run(`INSERT INTO group_conversation_members (conversation_id, member_id, added_at) VALUES (?, ?, ?)`, [conversationId, memberId, now])
+  }
+}
 
 function groupNowIso() {
   return new Date().toISOString()
@@ -871,8 +985,10 @@ type ActorStyleRow = {
 }
 const DEFAULT_ACTOR_STYLES: ActorStyleRow[] = [
   { actor_id: 'admin',  avatar_kind: 'emoji', avatar_value: '👾', bubble_bg: '#dccfe8' },
-  { actor_id: 'agent1', avatar_kind: 'emoji', avatar_value: '🤖', bubble_bg: '#cdddec' },
-  { actor_id: 'agent2', avatar_kind: 'emoji', avatar_value: '🤖', bubble_bg: '#f4d990' },
+  { actor_id: 'product', avatar_kind: 'emoji', avatar_value: '🧭', bubble_bg: '#cdddec' },
+  { actor_id: 'creative', avatar_kind: 'emoji', avatar_value: '🎬', bubble_bg: '#dccfe8' },
+  { actor_id: 'social', avatar_kind: 'emoji', avatar_value: '📣', bubble_bg: '#cee0c5' },
+  { actor_id: 'growth', avatar_kind: 'emoji', avatar_value: '🚀', bubble_bg: '#f4d990' },
   { actor_id: 'system', avatar_kind: 'emoji', avatar_value: '⚙', bubble_bg: '#d4d0c8' },
 ]
 const PRESET_BG_COLORS = [
@@ -1044,15 +1160,17 @@ seedActorStylesIfMissing()
 
 const ROLE_TO_ACTORS: Record<string, string[]> = {
   pm:          ['admin'],
-  implementer: ['agent1'],
-  reviewer:    ['agent2'],
+  implementer: ['product'],
+  reviewer:    ['creative'],
   system:      ['system'],
 }
 
 const ACTOR_DISPLAY_NAMES: Record<string, string> = {
   admin:  'admin',
-  agent1: 'agent1',
-  agent2: 'agent2',
+  product: '产品企划',
+  creative: '创意设计',
+  social: '社媒运营',
+  growth: '营销增长',
   system: 'System',
 }
 
@@ -1385,7 +1503,7 @@ function wakeTaskWaiters(taskId: string, opts: { deleted?: boolean } = {}) {
       if (latest?.meta) { try { const m = JSON.parse(latest.meta); if (Array.isArray(m?.mentions)) latestEventMentions = m.mentions } catch {} }
       row.latest_event_mentions = latestEventMentions
       const unread: Record<string, number> = {}
-      for (const actor of ['admin', 'agent1', 'agent2']) {
+      for (const actor of ['admin', ...ROLE_AGENT_IDS]) {
         const mark = db.prepare(`SELECT last_seen_event_id FROM task_seen_marks WHERE task_id=? AND actor_id=?`).get(row.id, actor) as any
         const lastId = mark?.last_seen_event_id || ''
         const n = (db.prepare(`SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND id > ?`).get(row.id, lastId) as any).n
@@ -1462,9 +1580,9 @@ function defaultGroupResponder() {
   return defaultOn || GROUP_REPLY_AGENT_IDS.find((id) => groupAgentAutoReply(id)) || null
 }
 
-function groupTargetsFor(senderId: string, mentions: string[], hopCount = 0) {
+function groupTargetsFor(senderId: string, mentions: string[], hopCount = 0, conversationId = 'workgroup') {
   const sender = GROUP_ROSTER_BY_ID.get(senderId)
-  const replyable = GROUP_REPLY_AGENT_IDS.filter((id) => groupAgentAutoReply(id))
+  const replyable = groupAgentIds(conversationId).filter((id) => groupAgentAutoReply(id))
   if (!sender?.can_reply) {
     const effective = mentions.length ? mentions : replyable
     if (effective.includes(GROUP_ALL_TOKEN)) return replyable
@@ -1474,10 +1592,10 @@ function groupTargetsFor(senderId: string, mentions: string[], hopCount = 0) {
   return mentions.filter((id) => replyable.includes(id) && id !== senderId)
 }
 
-function groupObserverTargetsFor(senderId: string, responseTargets: string[]) {
+function groupObserverTargetsFor(senderId: string, responseTargets: string[], conversationId = 'workgroup') {
   const sender = GROUP_ROSTER_BY_ID.get(senderId)
   const responseSet = new Set(responseTargets)
-  return GROUP_REPLY_AGENT_IDS.filter((id) => {
+  return groupAgentIds(conversationId).filter((id) => {
     if (id === senderId || responseSet.has(id)) return false
     return groupAgentAutoReply(id)
   })
@@ -1497,7 +1615,10 @@ function groupObserverTargetsFor(senderId: string, responseTargets: string[]) {
 // AIC-60: per-agent session context tokens — mirrors Hub iOS CTX card.
 // Each agent writes its own heartbeat from a Stop/SessionStart hook (or equivalent).
 const AGENT_HEARTBEAT_PATHS: Record<string, string> = {
-  agent1: AGENT1_HEARTBEAT_PATH,
+  product: ROLE_AGENT_CONFIGS.product.heartbeatPath,
+  creative: ROLE_AGENT_CONFIGS.creative.heartbeatPath,
+  social: ROLE_AGENT_CONFIGS.social.heartbeatPath,
+  growth: ROLE_AGENT_CONFIGS.growth.heartbeatPath,
 }
 function readAgentContext(agentId: string): { tokens: number | null; percent: number | null; detail: string | null } {
   const path = AGENT_HEARTBEAT_PATHS[agentId]
@@ -1540,9 +1661,7 @@ function findProjectDirContainingSid(sid: string): string | null {
 }
 
 function agentProjectDirOverride(agentId: string): string {
-  if (agentId === 'agent1') return AGENT1_PROJECT_DIR
-  if (agentId === 'agent2') return AGENT2_PROJECT_DIR
-  return ''
+  return ROLE_AGENT_CONFIGS[agentId as keyof typeof ROLE_AGENT_CONFIGS]?.projectDir || ''
 }
 
 // Map agentId → { transcript jsonl path, sid }. Drives /api/transcript + /api/agent-billing.
@@ -1761,8 +1880,10 @@ function updateGroupAgentState(agentId: string, patch: Record<string, any>) {
 // "working" status text shown on each agent's worker card. Per-agent phrase pools — pick
 // something playful or just leave the generic defaults. Customize per agent personality.
 const WORKING_PHRASES: Record<string, string[]> = {
-  agent1: ['正在思考...', '处理中...', '写代码中...', 'Thinking...', 'Working...'],
-  agent2: ['正在思考...', '处理中...', '审查中...', 'Reviewing...', 'Working...'],
+  product: ['梳理需求中...', '规划系列中...', '拆解 SKU 中...', '校准上市节奏...'],
+  creative: ['构思画面中...', '搭建视觉叙事...', '打磨提示词中...', '整理 KV 方向...'],
+  social: ['规划内容中...', '适配平台语境...', '排内容日历中...', '分析互动机会...'],
+  growth: ['设计增长实验...', '优化转化漏斗...', '寻找增长杠杆...', '核算活动回报...'],
 }
 function pickWorkingPhrase(agentId: string): string {
   const pool = WORKING_PHRASES[agentId]
@@ -1805,7 +1926,7 @@ function markAgentIdle(agentId: string) {
 // AIC-119: per-agent statusline cache. agent runtime's statusline.sh fire-and-forget POST 整 stdin
 // JSON 进来 → web 终端面板底部 row 5s poll cached + age_ms 自己判 stale. server 重启 cache 丢失无害.
 const AGENT_STATUSLINE_CACHE = new Map<string, { data: any; ts: number }>()
-const AGENT_STATUSLINE_IDS = new Set(['agent1', 'agent2'])
+const AGENT_STATUSLINE_IDS = new Set<string>(ROLE_AGENT_IDS)
 
 function isAgentWorkingInDb(agentId: string): boolean {
   const row = db.prepare(`SELECT status_text, is_typing FROM group_agent_state WHERE agent_id = ?`).get(agentId) as any
@@ -1816,7 +1937,7 @@ function isAgentWorkingInDb(agentId: string): boolean {
 function groupAgentAutoReply(agentId: string) {
   const row = db.prepare(`SELECT auto_reply FROM group_agent_settings WHERE agent_id = ?`).get(agentId) as any
   if (row) return Boolean(row.auto_reply)
-  return agentId === 'agent1' || agentId === 'agent2'
+  return ROLE_AGENT_IDS.includes(agentId as typeof ROLE_AGENT_IDS[number])
 }
 
 function setGroupAgentAutoReply(agentId: string, enabled: boolean) {
@@ -1959,25 +2080,7 @@ function buildTaskInjection(record: GroupRecord, recipientActor: string): string
   return result
 }
 
-function buildAgent2Injection(record: GroupRecord, hopCount: number, observeOnly = false) {
-  // v2 task system_notification → [task / ...] envelope
-  const taskEnv = buildTaskInjection(record, 'agent2')
-  if (taskEnv) return taskEnv
-  const sender = GROUP_ROSTER_BY_ID.get(record.sender_id)?.display_name || record.sender_id
-  const isDm = !!dmAgentFor(record.conversation_id)
-  const head = isDm
-    ? `[私聊 / ${sender} · 请 curl 回复到 dm-agent2]`
-    : `[workgroup${observeOnly ? ' observe' : ''} / ${sender}]`
-  const meta = [
-    `message_id=${record.id}`,
-    record.task_id ? `task_id=${record.task_id}` : '',
-    `hop_count=${hopCount}`,
-  ].filter(Boolean).join('\n')
-  const footer = observeOnly && !isDm ? OBSERVE_FOOTER : ''
-  return `${head}\n${meta}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
-}
-
-// Direct-message conversation id like 'dm-agent1' → the agent id ('agent1'),
+// Direct-message conversation id like 'dm-product' → the agent id ('product'),
 // or null if it isn't a DM to a known replyable agent.
 function dmAgentFor(conversationId: string | null | undefined): string | null {
   if (!conversationId || !conversationId.startsWith('dm-')) return null
@@ -1988,11 +2091,13 @@ function dmAgentFor(conversationId: string | null | undefined): string | null {
 
 function allowedGroupConversationsForSender(senderId: string): Set<string> {
   if (senderId === 'admin') {
-    return new Set(['workgroup', ...GROUP_REPLY_AGENT_IDS.map((id) => `dm-${id}`)])
+    return new Set([...listGroupConversations().map((group) => group.id), ...GROUP_REPLY_AGENT_IDS.map((id) => `dm-${id}`)])
   }
   const member = GROUP_ROSTER_BY_ID.get(senderId)
   if (member?.kind === 'agent' && member.can_reply) {
-    return new Set(['workgroup', `dm-${senderId}`])
+    const groupIds = (db.prepare(`SELECT conversation_id FROM group_conversation_members WHERE member_id=?`).all(senderId) as any[])
+      .map((row) => String(row.conversation_id))
+    return new Set([...groupIds, `dm-${senderId}`])
   }
   return new Set(['workgroup'])
 }
@@ -2023,19 +2128,66 @@ function groupAttachmentsBlock(record: GroupRecord): string {
 // must be an explicit self-curl with a chosen conversation_id.
 const OBSERVE_FOOTER = `\n\n（旁听消息，用来同步工作群上下文。默认不回；server 这一 turn 不会 auto-route 你的 assistant text 到任何频道。真想说话必须自己 curl /group/send，由你显式指定 conversation_id（"workgroup" 公开回 / "dm-<your-id>" 私聊回）。）`
 
-function buildPlainBridgePrompt(record: GroupRecord, observeOnly = false) {
-  // v2 task system_notification → [task / ...] envelope (recipient = agent1 when injecting via this path)
-  const taskEnv = buildTaskInjection(record, 'agent1')
+function buildBridgePrompt(record: GroupRecord, recipient: string, hopCount: number, observeOnly = false) {
+  const taskEnv = buildTaskInjection(record, recipient)
   if (taskEnv) return taskEnv
   const sender = GROUP_ROSTER_BY_ID.get(record.sender_id)?.display_name || record.sender_id
-  const head = dmAgentFor(record.conversation_id)
-    ? `[私聊 / ${sender} · 请 curl 回复到 dm-agent1]`
+  const isDm = !!dmAgentFor(record.conversation_id)
+  const head = isDm
+    ? `[私聊 / ${sender} / ${recipient}]`
     : `[workgroup${observeOnly ? ' observe' : ''} / ${sender}]`
-  const footer = observeOnly && !dmAgentFor(record.conversation_id) ? OBSERVE_FOOTER : ''
-  return `${head}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
+  const meta = [
+    `message_id=${record.id}`,
+    record.task_id ? `task_id=${record.task_id}` : '',
+    `hop_count=${hopCount}`,
+  ].filter(Boolean).join('\n')
+  const footer = observeOnly && !isDm ? OBSERVE_FOOTER : ''
+  return `${head}\n${meta}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
 }
 
 // AIC-116: injectToTmux removed. Dispatch goes through `provider.send()` in dispatchGroupRecord.
+
+function demoteAgentTurnDelivery(agentId: string, route: AgentTurnRoute) {
+  try {
+    const row = db.prepare(`SELECT delivery FROM group_messages WHERE id=?`).get(route.recordId) as any
+    if (!row?.delivery) return
+    const delivery = JSON.parse(row.delivery)
+    const deliveredList = route.observeOnly ? delivery.observed : delivery.delivered
+    const failedList = route.observeOnly
+      ? (delivery.observe_failed = delivery.observe_failed || [])
+      : (delivery.failed = delivery.failed || [])
+    const index = Array.isArray(deliveredList) ? deliveredList.indexOf(agentId) : -1
+    if (index !== -1) deliveredList.splice(index, 1)
+    if (!failedList.includes(agentId)) failedList.push(agentId)
+    saveGroupDelivery(route.recordId, delivery)
+  } catch (saveErr) {
+    console.error(`dispatchGroupRecord: failed to demote ${agentId} in delivery record:`, saveErr)
+  }
+}
+
+/**
+ * Providers such as Codex may treat input sent during an active turn as steering
+ * for that same turn. Starting exactly one queued prompt at a time gives every
+ * dispatch one assistant/result lifecycle and therefore one stable route.
+ */
+function startNextAgentTurn(agentId: string) {
+  const route = _agentTurnRoutes.startNext(agentId)
+  if (!route) return
+  const provider = ensureProvider(agentId)
+  if (!provider) {
+    _agentTurnRoutes.remove(agentId, route.id)
+    demoteAgentTurnDelivery(agentId, route)
+    startNextAgentTurn(agentId)
+    return
+  }
+  provider.send(route.prompt).catch((e: any) => {
+    console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
+    _agentTurnRoutes.remove(agentId, route.id)
+    demoteAgentTurnDelivery(agentId, route)
+    if (isAgentWorkingInDb(agentId) && !_agentTurnRoutes.hasResponseTurn(agentId)) markAgentIdle(agentId)
+    startNextAgentTurn(agentId)
+  })
+}
 
 function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: number, observeOnly = false) {
   // AIC-116: legacy key injection → provider.send(). Provider auto-spawns its subprocess on
@@ -2048,7 +2200,6 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
   // Optimistically mark `delivered` then correct after-the-fact if send() rejects async.
   const delivered: string[] = []
   const failed: string[] = []
-  const correctableTargets: string[] = []  // targets we optimistically pushed but may need to demote
   for (const target of targets) {
     const member = GROUP_ROSTER_BY_ID.get(target)
     if (!member || member.kind !== 'agent') {
@@ -2061,44 +2212,24 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
       failed.push(target)
       continue
     }
-    const text = target === 'agent2'
-      ? buildAgent2Injection(record, hopCount + 1, observeOnly)
-      : buildPlainBridgePrompt(record, observeOnly)
+    const text = buildBridgePrompt(record, target, hopCount + 1, observeOnly)
     if (!observeOnly) markAgentWorking(target, { dispatch_id: record.delivery.dispatch_id })
-    // AIC-116: record which conversation this agent was dispatched into so
-    // handleProviderEvent can write its assistant reply back into the right channel.
-    if (!observeOnly) _agentLastDispatchChannel.set(target, record.conversation_id)
-    // AIC-132: tag this turn as observe-only so `handleProviderEvent` drops the
-    // assistant text instead of auto-appending it to a channel. Set BEFORE provider.send
-    // so the agent's first assistant event (which can arrive before send() resolves on
-    // long streams) already sees the flag.
-    _agentIsObserveTurn.set(target, observeOnly)
-    // Optimistic delivered; corrected via the .catch() below when send() rejects async.
-    delivered.push(target)
-    correctableTargets.push(target)
-    provider.send(text).catch((e: any) => {
-      // AIC-116 cycle 2: send() rejected → spawn / init / handshake failure.
-      // Agent never accepted the message. Demote from delivered → failed, re-persist delivery,
-      // and mark idle so the UI dot goes neutral instead of "working forever".
-      console.error(`dispatchGroupRecord: provider.send to ${target} rejected:`, e)
-      if (isAgentWorkingInDb(target)) markAgentIdle(target)
-      // Re-read the current delivery (other concurrent .catch() handlers may have updated
-      // it) and atomically demote this target.
-      try {
-        const row = db.prepare(`SELECT delivery FROM group_messages WHERE id=?`).get(record.id) as any
-        if (row?.delivery) {
-          const cur = JSON.parse(row.delivery)
-          const list = observeOnly ? cur.observed : cur.delivered
-          const failList = observeOnly ? (cur.observe_failed = cur.observe_failed || []) : (cur.failed = cur.failed || [])
-          const idx = Array.isArray(list) ? list.indexOf(target) : -1
-          if (idx !== -1) list.splice(idx, 1)
-          if (!failList.includes(target)) failList.push(target)
-          saveGroupDelivery(record.id, cur)
-        }
-      } catch (saveErr) {
-        console.error(`dispatchGroupRecord: failed to demote ${target} in delivery record:`, saveErr)
-      }
+    // Queue before starting the provider turn: streaming assistant events may arrive
+    // before send() resolves, while later prompts must wait for this turn's result.
+    const turnRouteId = groupId('turn')
+    _agentTurnRoutes.enqueue(target, {
+      id: turnRouteId,
+      conversationId: record.conversation_id,
+      observeOnly,
+      dispatchId: record.delivery.dispatch_id,
+      recordId: record.id,
+      prompt: text,
+      started: false,
+      hopCount: hopCount + 1,
     })
+    // Optimistic delivered; startNextAgentTurn corrects it if send() rejects.
+    delivered.push(target)
+    startNextAgentTurn(target)
   }
   if (observeOnly) {
     record.delivery.observed = delivered
@@ -2465,7 +2596,7 @@ Bun.serve({
         const isPm = authMode === 'cookie' || authMode === 'local' || (authMode === 'header' && body.sender_id === 'admin')
         if (!isPm) return Response.json({ ok: false, error: 'only PM can edit actor styles' }, { status: 403 })
         const actorId = decodeURIComponent(url.pathname.split('/')[3])
-        const VALID_ACTORS = new Set(['admin', 'agent1', 'agent2', 'system'])
+        const VALID_ACTORS = new Set(['admin', ...ROLE_AGENT_IDS, 'system'])
         if (!VALID_ACTORS.has(actorId)) return Response.json({ ok: false, error: `unknown actor_id '${actorId}'` }, { status: 400 })
         const patch: Record<string, string> = {}
         for (const field of ['avatar_kind', 'avatar_value', 'bubble_bg'] as const) {
@@ -2499,6 +2630,61 @@ Bun.serve({
     // silent 404, helping any stale client surface itself.
     if (req.method === 'PUT' && /^\/api\/actor-styles\/[^/]+\/[^/]+$/.test(url.pathname) && isAuthed) {
       return Response.json({ ok: false, error: 'AIC-63 cycle 4: per-theme + avatar-broadcast endpoints removed. Use PUT /api/actor-styles/:actor_id instead.' }, { status: 410 })
+    }
+
+    // Multi-workgroup management.
+    if (req.method === 'GET' && url.pathname === '/groups' && isAuthed) {
+      return Response.json({ ok: true, groups: listGroupConversations() })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/groups' && isAuthed) {
+      try {
+        const body = await req.json() as any
+        const name = String(body.name || '').trim().slice(0, 60)
+        if (!name) return Response.json({ ok: false, error: '群名称不能为空' }, { status: 400 })
+        const memberIds = normalizeConversationMembers(body.member_ids)
+        if (memberIds.length < 2) return Response.json({ ok: false, error: '请至少选择一个 agent' }, { status: 400 })
+        const id = `group-${randomBytes(6).toString('hex')}`
+        const now = groupNowIso()
+        db.run(`BEGIN IMMEDIATE`)
+        try {
+          db.run(`INSERT INTO group_conversations (id, name, created_at, created_by, is_default) VALUES (?, ?, ?, 'admin', 0)`, [id, name, now])
+          saveConversationMembers(id, memberIds)
+          db.run(`COMMIT`)
+        } catch (e) {
+          try { db.run(`ROLLBACK`) } catch {}
+          throw e
+        }
+        return Response.json({ ok: true, group: groupConversationById(id) }, { status: 201 })
+      } catch (e: any) {
+        return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
+      }
+    }
+
+    const groupManageMatch = url.pathname.match(/^\/groups\/([^/]+)$/)
+    if (req.method === 'PUT' && groupManageMatch && isAuthed) {
+      try {
+        const groupIdValue = decodeURIComponent(groupManageMatch[1])
+        const existing = groupConversationById(groupIdValue)
+        if (!existing) return Response.json({ ok: false, error: '群不存在' }, { status: 404 })
+        const body = await req.json() as any
+        const name = String(body.name ?? existing.name).trim().slice(0, 60)
+        if (!name) return Response.json({ ok: false, error: '群名称不能为空' }, { status: 400 })
+        const memberIds = body.member_ids === undefined ? existing.member_ids : normalizeConversationMembers(body.member_ids)
+        if (memberIds.length < 2) return Response.json({ ok: false, error: '请至少选择一个 agent' }, { status: 400 })
+        db.run(`BEGIN IMMEDIATE`)
+        try {
+          db.run(`UPDATE group_conversations SET name=? WHERE id=?`, [name, groupIdValue])
+          saveConversationMembers(groupIdValue, memberIds)
+          db.run(`COMMIT`)
+        } catch (e) {
+          try { db.run(`ROLLBACK`) } catch {}
+          throw e
+        }
+        return Response.json({ ok: true, group: groupConversationById(groupIdValue) })
+      } catch (e: any) {
+        return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
+      }
     }
 
     // Workgroup response gates: GET /group/settings
@@ -2583,7 +2769,8 @@ Bun.serve({
         }
 
         const mentions = normalizeGroupMentions(body.mentions, text)
-        const targets = groupTargetsFor(senderId, mentions, hopCount)
+        const conversationId = String(body.conversation_id || 'workgroup')
+        const targets = groupTargetsFor(senderId, mentions, hopCount, conversationId)
         const delivery = {
           targets,
           mode: mentions.includes(GROUP_ALL_TOKEN) ? 'all' : (mentions.length ? 'mention' : 'default'),
@@ -2593,7 +2780,7 @@ Bun.serve({
         }
         const record = appendGroupRecord({ ...body, sender_id: senderId }, mentions, delivery)
         if (targets.length > 0) dispatchGroupRecord(record, targets, hopCount)
-        const observers = groupObserverTargetsFor(senderId, targets)
+        const observers = groupObserverTargetsFor(senderId, targets, conversationId)
         if (observers.length > 0) dispatchGroupRecord(record, observers, hopCount, true)
         return Response.json({ ok: true, record, targets, observers })
       } catch (e: any) {
@@ -2917,11 +3104,11 @@ Bun.serve({
         if (body.action === 'rollback_implement') {
           db.run(`UPDATE group_tasks SET phase = 'implement', implement_check = 0, pm_check_implement = 0, review_check = 0, pm_check_review = 0, implement_started_at = ?, implement_ended_at = NULL, review_started_at = NULL, review_ended_at = NULL, updated_at = ? WHERE id = ?`, [now, now, taskId])
           const updated = db.prepare(`SELECT * FROM group_tasks WHERE id = ?`).get(taskId)
-          const msg = `🔄 任务「${task.title}」打回到实施阶段 → @agent1 请重新实施${rollbackComment ? '\n💬 ' + rollbackComment : ''}`
+          const msg = `🔄 任务「${task.title}」打回到实施阶段 → @product 请重新实施${rollbackComment ? '\n💬 ' + rollbackComment : ''}`
           await fetch(`http://127.0.0.1:${IMG_PORT}/group/send`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
-            body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['agent1'], task_id: taskId })
+            body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['product'], task_id: taskId })
           })
           return Response.json({ ok: true, task: updated })
         }
@@ -2954,7 +3141,7 @@ Bun.serve({
           // Role guard: PM = cookie / local / app (Bearer + sender_id=admin); agent = Bearer + matching sender_id
           const authMode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
           const isPm = authMode === 'cookie' || authMode === 'local' || (authMode === 'header' && body.sender_id === 'admin')
-          const agentForCheck: Record<string, string> = { implement_check: 'agent1', review_check: 'agent2' }
+          const agentForCheck: Record<string, string> = { implement_check: 'product', review_check: 'creative' }
           if (checkField === currentPhaseChecks.agent) {
             const expectedAgent = agentForCheck[checkField]
             if (body.sender_id !== expectedAgent) {
@@ -2979,20 +3166,20 @@ Bun.serve({
 
           if (fresh.phase === 'evaluate' && fresh.evaluate_check && fresh.pm_check_evaluate) {
             db.run(`UPDATE group_tasks SET phase = 'implement', evaluate_ended_at = ?, implement_started_at = ?, implement_check = 0, pm_check_implement = 0, review_check = 0, pm_check_review = 0, updated_at = ? WHERE id = ?`, [now, now, now, taskId])
-            const msg = `✅ 任务「${task.title}」评估通过 → @agent1 请开始实施`
+            const msg = `✅ 任务「${task.title}」评估通过 → @product 请开始实施`
             await fetch(`http://127.0.0.1:${IMG_PORT}/group/send`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
-              body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['agent1'], task_id: taskId })
+              body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['product'], task_id: taskId })
             })
             advanced = true
           } else if (fresh.phase === 'implement' && fresh.implement_check && fresh.pm_check_implement) {
             db.run(`UPDATE group_tasks SET phase = 'review', implement_ended_at = ?, review_started_at = ?, review_check = 0, pm_check_review = 0, updated_at = ? WHERE id = ?`, [now, now, now, taskId])
-            const msg = `✅ 任务「${task.title}」实施完成 → @agent2 请 review`
+            const msg = `✅ 任务「${task.title}」实施完成 → @creative 请 review`
             await fetch(`http://127.0.0.1:${IMG_PORT}/group/send`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
-              body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['agent2'], task_id: taskId })
+              body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['creative'], task_id: taskId })
             })
             advanced = true
           } else if (fresh.phase === 'review' && fresh.review_check && fresh.pm_check_review) {
@@ -3421,7 +3608,7 @@ Bun.serve({
           row.latest_event_mentions = latestEventMentions
           // unread_count per actor
           const unread: Record<string, number> = {}
-          for (const actor of ['admin', 'agent1', 'agent2']) {
+          for (const actor of ['admin', ...ROLE_AGENT_IDS]) {
             const mark = db.prepare(`SELECT last_seen_event_id FROM task_seen_marks WHERE task_id=? AND actor_id=?`).get(row.id, actor) as any
             const lastId = mark?.last_seen_event_id || ''
             const n = (db.prepare(`SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND id > ?`).get(row.id, lastId) as any).n
@@ -3454,11 +3641,11 @@ Bun.serve({
         // PM (admin) can always create; agent1 can create on its own (agent2 is
         // review-only). sender_id is trusted because Bearer + matching sender_id
         // is the agent's own auth mode, and PM cookie/local goes through v2IsPm.
-        const AGENT_CREATORS = new Set(['agent1'])
+        const AGENT_CREATORS = new Set(['product'])
         const isPm = v2IsPm(info, body)
         const isAuthedAgent = info.mode === 'header' && AGENT_CREATORS.has(body.sender_id)
         if (!isPm && !isAuthedAgent) {
-          return Response.json({ ok: false, error: 'creating tasks requires PM auth, or Bearer as agent1' }, { status: 403 })
+          return Response.json({ ok: false, error: 'creating tasks requires PM auth, or Bearer as product' }, { status: 403 })
         }
         const title = String(body.title || '').trim()
         const type = String(body.type || '').trim()
@@ -3997,7 +4184,8 @@ Bun.serve({
     if (req.method === 'GET' && /^\/usage\/[^/]+$/.test(url.pathname) && isAuthed) {
       if (!usageProbeEnabled) return usagePlaceholderResp()
       const agentId = decodeURIComponent(url.pathname.slice('/usage/'.length))
-      if (agentId === 'agent1') {
+      const runtime = AGENT_RUNTIMES[agentId]
+      if (runtime?.provider === 'claude') {
         const usage = await fetchClaudeUsageCached()
         if ('error' in usage) return Response.json({ available: false, reason: usage.error }, { status: 200 })
         const planLabel = usage.subscriptionType ? `Claude ${String(usage.subscriptionType).replace(/^./, c => c.toUpperCase())} ${(usage.rateLimitTier || '').replace(/^default_claude_max_/, '').replace(/^claude_/, '') || ''}`.trim() : 'Claude'
@@ -4011,7 +4199,7 @@ Bun.serve({
           weekly_resets_at: usage.seven_day?.resets_at || null,
         })
       }
-      if (agentId === 'agent2') {
+      if (runtime?.provider === 'codex') {
         // AIC-54: real Codex usage data from ~/.codex/logs_2.sqlite.
         const c = fetchCodexUsageCached()
         if ('error' in c) return Response.json({ available: false, reason: c.error })
@@ -4044,8 +4232,8 @@ Bun.serve({
     // file > 5MB, tail last 5MB and drop partial first line.
     if (req.method === 'GET' && url.pathname === '/api/transcript' && isAuthed) {
       try {
-        const agent = (url.searchParams.get('agent') || 'agent1').trim()
-        if (agent !== 'agent1' && agent !== 'agent2') {
+        const agent = (url.searchParams.get('agent') || 'product').trim()
+        if (!ROLE_AGENT_IDS.includes(agent as typeof ROLE_AGENT_IDS[number])) {
           return Response.json({ ok: false, error: `transcript not supported for agent: ${agent}`, agent }, { status: 410 })
         }
         const resolved = resolveTranscriptPath(agent)
@@ -4122,7 +4310,7 @@ Bun.serve({
     // Other agent ids → 410.
     if (req.method === 'GET' && /^\/api\/agent-billing\/[^/]+$/.test(url.pathname) && isAuthed) {
       const agentId = decodeURIComponent(url.pathname.slice('/api/agent-billing/'.length))
-      if (agentId !== 'agent1' && agentId !== 'agent2') {
+      if (!ROLE_AGENT_IDS.includes(agentId as typeof ROLE_AGENT_IDS[number])) {
         return Response.json({ ok: false, error: `agent-billing not supported for agent: ${agentId}`, agentId }, { status: 410 })
       }
       const usage = readAgentLastTurnUsage(agentId)

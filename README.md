@@ -84,9 +84,16 @@ git clone https://github.com/20Totodile/agent-collab.git
 cd agent-collab
 bun install
 
-# 指定 agent 的工作目录
-export AGENT1_CWD="/path/to/agent1/workspace"
-export AGENT2_CWD="/path/to/agent2/workspace"
+# 本分支预置 4 个品牌工作角色，默认 provider 均为 codex
+export PRODUCT_PROVIDER=codex
+export CREATIVE_PROVIDER=codex
+export SOCIAL_PROVIDER=codex
+export GROWTH_PROVIDER=codex
+
+export PRODUCT_CWD="/path/to/product/workspace"
+export CREATIVE_CWD="/path/to/creative/workspace"
+export SOCIAL_CWD="/path/to/social/workspace"
+export GROWTH_CWD="/path/to/growth/workspace"
 
 bun server.ts
 ```
@@ -107,9 +114,11 @@ bun server.ts
 
 每个 agent 是一个长寿命的 CLI 子进程，跨多次对话复用同一个 session。Server 通过 `AgentProvider` 接口管理子进程生命周期。想接其他 CLI 的话，实现这个接口即可，详见 `src/providers/provider.ts`。
 
-## 添加更多 agent
+## 当前 Agent
 
-仓库自带两个 placeholder agent（agent1 / agent2）。添加第三个 agent 需要在 `server.ts` 的几个常量里加一项，详见 [TECHNICAL.md](TECHNICAL.md)。
+本分支预置四个独立角色：产品企划（`product`）、创意设计（`creative`）、社媒运营（`social`）和营销增长（`growth`）。每个角色使用自己的工作目录与 `AGENTS.md`，可在工作群中 @ 指定角色，也可建立独立工作群或直接私聊。
+
+添加或调整 Agent 时，需要同步更新 `server.ts` 的 roster/runtime、前端身份映射和对应工作目录的人设文件，详见 [TECHNICAL.md](TECHNICAL.md)。
 
 ## 技术文档
 

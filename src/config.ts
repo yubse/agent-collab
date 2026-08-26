@@ -131,6 +131,26 @@ function parseFilterModeEnv(raw: string | undefined): 'strict' | 'loose' | 'off'
 }
 export const AGENT1_TMUX_FILTER_MODE = parseFilterModeEnv(process.env.AGENT1_TMUX_FILTER_MODE)
 export const AGENT2_TMUX_FILTER_MODE = parseFilterModeEnv(process.env.AGENT2_TMUX_FILTER_MODE)
+
+// Role-named runtimes used by the brand/marketing workgroup. Keeping this loader
+// generic makes the roster extensible without adding another block of exported
+// constants every time a specialist is introduced.
+export function loadAgentRuntimeEnv(prefix: string, fallbackProvider: AgentProviderKind = 'codex') {
+  const key = prefix.toUpperCase().replace(/[^A-Z0-9]+/g, '_')
+  return {
+    provider: parseProvider(process.env[`${key}_PROVIDER`], fallbackProvider),
+    binaryPath: process.env[`${key}_BINARY_PATH`] || '',
+    cwd: process.env[`${key}_CWD`] || '',
+    extraArgs: parseExtraArgs(process.env[`${key}_EXTRA_ARGS`]),
+    tmuxSession: process.env[`${key}_TMUX_SESSION`] || defaultTmuxSession(),
+    tmuxSocket: process.env[`${key}_TMUX_SOCKET`] || '',
+    tmuxCaptureIntervalMs: parseIntervalMs(process.env[`${key}_TMUX_CAPTURE_INTERVAL_MS`], 5000),
+    tmuxFilterMode: parseFilterModeEnv(process.env[`${key}_TMUX_FILTER_MODE`]),
+    tmuxQuietMs: parseIntervalMs(process.env[`${key}_TMUX_QUIET_MS`], 30_000),
+    heartbeatPath: process.env[`${key}_HEARTBEAT_PATH`] || '',
+    projectDir: process.env[`${key}_PROJECT_DIR`] || '',
+  }
+}
 // Optional agent startup script.
 export const AGENT1_CLOCK_IN_SCRIPT = process.env.AGENT1_CLOCK_IN_SCRIPT || ''
 export const SERVER_STARTED_AT = new Date().toISOString()
