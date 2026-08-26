@@ -2486,6 +2486,15 @@ button, textarea, input { font: inherit; }
             <span style="flex:none; font-size:16px; color:var(--ink-3);">›</span>
           </button>
         </div>
+
+        <!-- CONNECTOR DEVICES -->
+        <div style="padding:0 20px 20px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:9px;">
+            <span style="font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:0.14em; color:var(--ink-3); text-transform:uppercase;">Codex Connector</span>
+            <button data-action="connector-add" style="border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:5px 9px; color:var(--ink); cursor:pointer; font:inherit; font-size:11px;">＋ 添加设备</button>
+          </div>
+          <div id="appSettingsDevicesBox" style="background:var(--surface-2); border-radius:11px; padding:11px 13px; font-size:11.5px; color:var(--ink-2);">加载中…</div>
+        </div>
       </div>
 
       <!-- footer -->
@@ -2784,7 +2793,7 @@ async function loadGroups() {
   groupConversations = data.groups;
   groupConversations.forEach(ensureGroupChannel);
   if (!groupConversations.some(g => g.id === state.activeGroup)) {
-    state.activeGroup = 'workgroup';
+    state.activeGroup = groupConversations.find(g => g.is_default)?.id || groupConversations[0]?.id || 'workgroup';
     persist();
   }
   if (state.view === 'group') currentChannel = state.activeGroup;
@@ -2945,6 +2954,8 @@ const SETTINGS_THEMES = [
   { id: 'system', label: '跟随系统', icon: '🌗' },
 ];
 let appSettingsUsageActor = 'product';
+let connectorDevices = [];
+let connectorPairing = null;
 let _settingsSystemMQL = null;       // matchMedia handle for system theme
 // AIC-68 cycle 2: rename to openAppSettings/closeAppSettings to disambiguate
 // from the legacy task settings (workflow_templates manager) `openSettingsModal`.
@@ -2952,6 +2963,7 @@ function openAppSettings() {
   document.getElementById('appSettingsMask').classList.add('open');
   renderAppSettings();
   fetchUsageFor(appSettingsUsageActor).then(renderAppSettings);
+  loadConnectorDevices();
   hydrateActorStyles();   // ensure avatar stack + dirty count fresh
 }
 function closeAppSettings() {
@@ -2982,6 +2994,20 @@ function _bindSystemThemeListener() {
   }
 }
 function _onSystemThemeChange() { render(); renderAppSettings(); }
+async function loadConnectorDevices() {
+  try {
+    const data = await apiJson('/api/connectors');
+    connectorDevices = Array.isArray(data.devices) ? data.devices : [];
+  } catch (e) { console.error('loadConnectorDevices', e); }
+  renderAppSettings();
+}
+async function createConnectorPairingCode() {
+  try {
+    const data = await apiJson('/api/connectors/pairing-code', { method: 'POST', body: '{}' });
+    connectorPairing = { code: data.pairing_code, expiresAt: data.expires_at };
+    renderAppSettings();
+  } catch (e) { alert('生成配对码失败：' + (e.message || e)); }
+}
 function renderAppSettings() {
   const mask = document.getElementById('appSettingsMask');
   if (!mask || !mask.classList.contains('open')) return;
@@ -3046,6 +3072,20 @@ function renderAppSettings() {
     const n = _identityDirtyCount();
     if (n > 0) { dirtyEl.style.display = 'inline'; dirtyEl.textContent = `· ${n} 处未保存`; }
     else dirtyEl.style.display = 'none';
+  }
+  const devicesBox = document.getElementById('appSettingsDevicesBox');
+  if (devicesBox) {
+    const pairing = connectorPairing ? `<div style="padding:10px 12px; margin-bottom:9px; border:1px dashed var(--warn); border-radius:9px; background:var(--surface);">
+      <div style="font-size:10px; color:var(--ink-3); margin-bottom:4px;">在 Connector 中输入此一次性配对码</div>
+      <div style="font-family:'JetBrains Mono',monospace; font-size:24px; letter-spacing:.18em; color:var(--ink); font-weight:700;">${esc(connectorPairing.code)}</div>
+      <div style="font-size:10px; color:var(--ink-3); margin-top:4px;">10 分钟内有效，使用后立即失效</div>
+    </div>` : '';
+    const rows = connectorDevices.length ? connectorDevices.map(device => `<div style="display:flex; align-items:center; gap:9px; padding:7px 0; border-top:1px solid var(--border-2);">
+      <span style="width:8px;height:8px;border-radius:50%;background:${device.status === 'online' ? 'var(--good)' : 'var(--ink-3)'};"></span>
+      <span style="flex:1;color:var(--ink);">${esc(device.device_name)}</span>
+      <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--ink-3);">${device.status === 'online' ? '在线' : '离线'}</span>
+    </div>`).join('') : '<div style="padding:5px 0;">还没有已配对设备。Connector 必须在线，Agent 才能调用你本机的 Codex。</div>';
+    devicesBox.innerHTML = pairing + rows;
   }
 }
 
@@ -8056,6 +8096,8 @@ document.getElementById('appSettingsMask').addEventListener('click', e => {
   } else if (act === 'app-settings-open-identity') {
     closeAppSettings();
     openIdentityModal();
+  } else if (act === 'connector-add') {
+    createConnectorPairingCode();
   } else if (act === 'app-settings-shortcuts') {
     showWipToast('快捷键面板 WIP');
   }

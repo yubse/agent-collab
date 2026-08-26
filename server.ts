@@ -2614,11 +2614,17 @@ Bun.serve<ConnectorSocketData>({
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
       const data = await req.arrayBuffer()
       await Bun.write(path.join(UPLOADS_DIR, filename), data)
+      db.run(`INSERT INTO uploaded_assets (filename, user_id, original_name, byte_size, created_at) VALUES (?, ?, ?, ?, ?)`, [
+        filename, currentUser!.id, origName, data.byteLength, groupNowIso(),
+      ])
       return Response.json({ filename, original: origName, size: data.byteLength })
     }
 
     if (req.method === 'GET' && url.pathname.startsWith('/images/')) {
       const filename = decodeURIComponent(url.pathname.slice(8))
+      const owner = db.prepare(`SELECT user_id FROM uploaded_assets WHERE filename=?`).get(filename) as any
+      if (owner && owner.user_id !== currentUser!.id) return new Response('not found', { status: 404 })
+      if (!owner && currentUser!.id !== LEGACY_ADMIN_ID) return new Response('not found', { status: 404 })
       const filePath = resolveStoredMediaPath(filename)
       const file = Bun.file(filePath)
       if (await file.exists()) return new Response(file)

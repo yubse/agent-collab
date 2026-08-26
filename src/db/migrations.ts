@@ -136,6 +136,21 @@ const MIGRATIONS: Migration[] = [
       db.run(`DROP TABLE actor_channel_seen_legacy`)
     },
   },
+  {
+    version: 4,
+    name: 'user_scoped_uploads',
+    up(db) {
+      db.run(`CREATE TABLE IF NOT EXISTS uploaded_assets (
+        filename TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        byte_size INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_uploaded_assets_owner ON uploaded_assets(user_id, created_at)`)
+    },
+  },
 ]
 
 export function runMigrations(db: Database): void {
