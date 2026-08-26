@@ -64,10 +64,10 @@ export const AGENT2_PROJECT_DIR = process.env.AGENT2_PROJECT_DIR || ''
 //   'tmux'   — tmux capture-pane / send-keys (opt-in; capture output is raw terminal bytes,
 //              capture-pane sanitizer strips obvious secrets — see src/providers/tmux.ts)
 // New providers added in future just extend the union — see src/providers/*.ts.
-export type AgentProviderKind = 'claude' | 'codex' | 'tmux'
+export type AgentProviderKind = 'claude' | 'codex' | 'tmux' | 'remote-codex'
 function parseProvider(raw: string | undefined, fallback: AgentProviderKind): AgentProviderKind {
   const v = (raw || '').toLowerCase()
-  if (v === 'claude' || v === 'codex' || v === 'tmux') return v
+  if (v === 'claude' || v === 'codex' || v === 'tmux' || v === 'remote-codex') return v
   return fallback
 }
 export const AGENT1_PROVIDER: AgentProviderKind = parseProvider(process.env.AGENT1_PROVIDER, 'claude')
@@ -135,7 +135,7 @@ export const AGENT2_TMUX_FILTER_MODE = parseFilterModeEnv(process.env.AGENT2_TMU
 // Role-named runtimes used by the brand/marketing workgroup. Keeping this loader
 // generic makes the roster extensible without adding another block of exported
 // constants every time a specialist is introduced.
-export function loadAgentRuntimeEnv(prefix: string, fallbackProvider: AgentProviderKind = 'codex') {
+export function loadAgentRuntimeEnv(prefix: string, fallbackProvider: AgentProviderKind = 'remote-codex') {
   const key = prefix.toUpperCase().replace(/[^A-Z0-9]+/g, '_')
   return {
     provider: parseProvider(process.env[`${key}_PROVIDER`], fallbackProvider),

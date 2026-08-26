@@ -33,6 +33,17 @@ import { AgentTurnRouteQueue, type AgentTurnRoute } from './src/agent-turn-routi
 import { ClaudeProvider } from './src/providers/claude.ts'
 import { CodexProvider } from './src/providers/codex.ts'
 import { TmuxProvider } from './src/providers/tmux.ts'
+import { RemoteCodexProvider } from './src/providers/remote-codex.ts'
+import { ConnectorRegistry } from './src/connector/registry.ts'
+import { ConnectorDispatcher } from './src/connector/dispatcher.ts'
+import { parseConnectorMessage } from './src/connector/protocol.ts'
+import {
+  authenticateDevice,
+  createPairingCode,
+  listDevices,
+  redeemPairingCode,
+  setDeviceStatus,
+} from './src/connector/pairing.ts'
 import { hasRequestAuth, isLocalRequestHost, requestAuthMode } from './src/auth.ts'
 // AIC-65: handleTodosRoutes import removed — iOS todo 跟 task 撞定位，整个 todo 模块退役
 import { dangerousEndpointFor, hasRemoteControlConfirm, logDangerousOperation } from './src/security.ts'
@@ -374,6 +385,8 @@ db.run(`CREATE TABLE IF NOT EXISTS actor_theme_styles (
 // table exists so old databases can be upgraded in-place without data loss.
 runMigrations(db)
 const userRepo = new UserRepository(db)
+const connectorRegistry = new ConnectorRegistry()
+const connectorDispatcher = new ConnectorDispatcher(connectorRegistry)
 if (process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD) {
   await ensureLegacyAdminPassword(db, process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD)
 }
@@ -519,11 +532,11 @@ const _agentTurnRoutes = new AgentTurnRouteQueue()
 // also self-curls /group/send (legacy claude CLAUDE.md convention). Hash a sliding window
 // of recent appends (TTL 60s) — same hash within window is dropped silently.
 const _agentReplyDedup = new Map<string, Map<string, number>>()
-function _dedupAgentReply(agentId: string, text: string): boolean {
+function _dedupAgentReply(providerKey: string, text: string): boolean {
   // returns true when this text was just appended (caller should skip)
   const now = Date.now()
-  let inner = _agentReplyDedup.get(agentId)
-  if (!inner) { inner = new Map(); _agentReplyDedup.set(agentId, inner) }
+  let inner = _agentReplyDedup.get(providerKey)
+  if (!inner) { inner = new Map(); _agentReplyDedup.set(providerKey, inner) }
   // expire entries > 60s
   for (const [k, ts] of inner) if (now - ts > 60_000) inner.delete(k)
   const key = text.length > 200 ? text.slice(0, 200) + '|' + text.length : text
@@ -532,8 +545,13 @@ function _dedupAgentReply(agentId: string, text: string): boolean {
   return false
 }
 
-function agentStateFilePath(agentId: string): string {
-  return path.join(RUNTIME_STATE_DIR, `agent_${agentId}.json`)
+function runtimeProviderKey(userId: string, conversationId: string, agentId: string): string {
+  return `${userId}:${conversationId}:${agentId}`
+}
+
+function agentStateFilePath(userId: string, conversationId: string, agentId: string): string {
+  const safe = (value: string) => value.replace(/[^A-Za-z0-9_.-]/g, '_')
+  return path.join(RUNTIME_STATE_DIR, 'users', safe(userId), safe(conversationId), `agent_${safe(agentId)}.json`)
 }
 
 // AIC-124 fork sync: per-provider chat_supervisor runtime dir. agent1 / agent2 each get
@@ -556,7 +574,7 @@ function agentSupervisorDir(agentId: string): string {
 // can be moved without breaking the path.
 const CHAT_SUPERVISOR_ENTRYPOINT = path.join(import.meta.dir, 'src', 'providers', 'chat', 'chat_supervisor.ts')
 
-function instantiateProvider(agentId: string): AgentProvider | null {
+function instantiateProvider(userId: string, conversationId: string, agentId: string): AgentProvider | null {
   const cfg = AGENT_RUNTIMES[agentId]
   if (!cfg) return null
   // tmux provider doesn't spawn a subprocess (operator-owned session) so the cwd guard
@@ -567,11 +585,14 @@ function instantiateProvider(agentId: string): AgentProvider | null {
   const providerCfg: AgentProviderConfig = {
     label: agentId,
     cwd: cfg.cwd || undefined,
-    stateFilePath: agentStateFilePath(agentId),
+    stateFilePath: agentStateFilePath(userId, conversationId, agentId),
     binaryPath: cfg.binaryPath || undefined,
     extraArgs: cfg.extraArgs.length ? cfg.extraArgs : undefined,
-    onEvent: (ev: AgentEvent) => handleProviderEvent(agentId, ev),
-    onError: (err: AgentError) => handleProviderError(agentId, err),
+    onEvent: (ev: AgentEvent) => handleProviderEvent(userId, conversationId, agentId, ev),
+    onError: (err: AgentError) => handleProviderError(userId, conversationId, agentId, err),
+  }
+  if (cfg.provider === 'remote-codex') {
+    return new RemoteCodexProvider(connectorDispatcher, connectorRegistry, { userId, conversationId, agentId })
   }
   if (cfg.provider === 'codex') return new CodexProvider(providerCfg)
   if (cfg.provider === 'tmux') {
@@ -592,11 +613,12 @@ function instantiateProvider(agentId: string): AgentProvider | null {
   })
 }
 
-function ensureProvider(agentId: string): AgentProvider | null {
-  const existing = AGENT_PROVIDERS.get(agentId)
+function ensureProvider(userId: string, conversationId: string, agentId: string): AgentProvider | null {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const existing = AGENT_PROVIDERS.get(key)
   if (existing) return existing
-  const p = instantiateProvider(agentId)
-  if (p) AGENT_PROVIDERS.set(agentId, p)
+  const p = instantiateProvider(userId, conversationId, agentId)
+  if (p) AGENT_PROVIDERS.set(key, p)
   return p
 }
 
@@ -608,21 +630,22 @@ function ensureProvider(agentId: string): AgentProvider | null {
 // (legacy claude CLAUDE.md convention) — recent identical text within 60s is dropped.
 // New ai-collab CLAUDE.md / AGENTS.md templates should NOT self-curl reply; the server
 // forwards stdout automatically.
-function handleProviderEvent(agentId: string, ev: AgentEvent): void {
-  const activeRoute = _agentTurnRoutes.current(agentId)
+function handleProviderEvent(userId: string, conversationId: string, agentId: string, ev: AgentEvent): void {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const activeRoute = _agentTurnRoutes.current(key)
   if ((ev.type === 'system_init' || ev.type === 'assistant') && activeRoute && !activeRoute.observeOnly) {
     if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId, { dispatch_id: activeRoute.dispatchId })
   } else if (ev.type === 'result') {
-    _agentTurnRoutes.complete(agentId)
+    _agentTurnRoutes.complete(key)
     // A completed response must not make the workstation look idle when another
     // visible response is already queued behind it. Observe-only turns stay silent.
-    if (_agentTurnRoutes.hasResponseTurn(agentId)) {
-      const nextRoute = _agentTurnRoutes.current(agentId)
+    if (_agentTurnRoutes.hasResponseTurn(key)) {
+      const nextRoute = _agentTurnRoutes.current(key)
       if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId, { dispatch_id: nextRoute?.dispatchId })
     } else if (isAgentWorkingInDb(agentId)) {
       markAgentIdle(agentId)
     }
-    startNextAgentTurn(agentId)
+    startNextAgentTurn(userId, conversationId, agentId)
   }
 
   if (ev.type === 'assistant' && typeof ev.text === 'string' && ev.text.trim()) {
@@ -639,7 +662,7 @@ function handleProviderEvent(agentId: string, ev: AgentEvent): void {
     }
     const conversationId = activeRoute.conversationId
     const text = ev.text.trim()
-    if (_dedupAgentReply(agentId, text)) return
+    if (_dedupAgentReply(key, text)) return
     try {
       const dispatchId = groupId('dsp')
       // Agent-authored @mentions are real response targets, not passive observers.
@@ -682,17 +705,18 @@ function handleProviderEvent(agentId: string, ev: AgentEvent): void {
   }
 }
 
-function handleProviderError(agentId: string, err: AgentError): void {
+function handleProviderError(userId: string, conversationId: string, agentId: string, err: AgentError): void {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
   console.error(`provider[${agentId}] error: kind=${err.kind} msg=${err.message}`)
   if (err.kind === 'process_exited' || err.kind === 'spawn_failed') {
     if (isAgentWorkingInDb(agentId)) markAgentIdle(agentId)
     // AIC-116 cycle 2: drop the dead provider instance so the next dispatch
     // re-instantiates and re-spawns. Without this, AGENT_PROVIDERS.has() stays true →
     // groupStatusSnapshot reports `online` for a zombie that won't actually accept input.
-    AGENT_PROVIDERS.delete(agentId)
+    AGENT_PROVIDERS.delete(key)
     // A dead provider cannot emit result events for its accepted routes. Clear them so
     // a fresh instance starts with an unambiguous routing queue.
-    const abandonedRoutes = _agentTurnRoutes.clear(agentId)
+    const abandonedRoutes = _agentTurnRoutes.clear(key)
     for (const route of abandonedRoutes) demoteAgentTurnDelivery(agentId, route)
   }
 }
@@ -700,21 +724,23 @@ function handleProviderError(agentId: string, err: AgentError): void {
 // 上班: ensure a provider instance exists. Subprocess spawn is deferred to first send() —
 // no work needed here beyond instantiation. Returns `already=true` when a provider was
 // already alive (PM sees agent online), `already=false` for a fresh instantiation.
-function agentClockIn(agentId: string) {
-  const existing = AGENT_PROVIDERS.get(agentId)
+function agentClockIn(userId: string, conversationId: string, agentId: string) {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const existing = AGENT_PROVIDERS.get(key)
   const wasAlive = !!existing?.isAlive
-  const p = ensureProvider(agentId)
+  const p = ensureProvider(userId, conversationId, agentId)
   if (!p) return { ok: false, error: `no provider runtime configured for ${agentId}` }
   markAgentIdle(agentId)
   return { ok: true, already: wasAlive }
 }
 
 // Close the agent's provider (graceful shutdown — provider.close() ends stdin and waits exit).
-async function killAgentSession(agentId: string) {
-  const p = AGENT_PROVIDERS.get(agentId)
+async function killAgentSession(userId: string, conversationId: string, agentId: string) {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const p = AGENT_PROVIDERS.get(key)
   if (!p) return { ok: true, alreadyOff: true }
   try { await p.close() } catch {}
-  AGENT_PROVIDERS.delete(agentId)
+  AGENT_PROVIDERS.delete(key)
   updateGroupAgentState(agentId, { last_seen: groupNowIso(), is_typing: 0, typing_since: null, status_text: 'clocked out' })
   return { ok: true }
 }
@@ -724,11 +750,12 @@ async function killAgentSession(agentId: string) {
 // shutdown sequence (memory consolidation etc), that should happen via a dedicated
 // per-agent `clockOutPrompt` send() before close() rather than being smuggled through
 // a legacy key-press path. Not in AIC-116 scope; future improvement.
-async function agentClockOut(agentId: string) {
-  const p = AGENT_PROVIDERS.get(agentId)
+async function agentClockOut(userId: string, conversationId: string, agentId: string) {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const p = AGENT_PROVIDERS.get(key)
   if (!p) return { ok: true, alreadyOff: true }
   try { await p.close() } catch {}
-  AGENT_PROVIDERS.delete(agentId)
+  AGENT_PROVIDERS.delete(key)
   updateGroupAgentState(agentId, { last_seen: groupNowIso(), is_typing: 0, typing_since: null, status_text: 'clocked out' })
   return { ok: true }
 }
@@ -1705,8 +1732,8 @@ function agentProjectDirOverride(agentId: string): string {
 // Map agentId → { transcript jsonl path, sid }. Drives /api/transcript + /api/agent-billing.
 // Returns null when: agent has no live provider / provider isn't claude / provider hasn't yet
 // captured a session_id (no assistant event yet) / file missing on disk.
-function resolveTranscriptPath(agentId: string): { path: string; sid: string } | null {
-  const provider = AGENT_PROVIDERS.get(agentId)
+function resolveTranscriptPath(userId: string, conversationId: string, agentId: string): { path: string; sid: string } | null {
+  const provider = AGENT_PROVIDERS.get(runtimeProviderKey(userId, conversationId, agentId))
   if (!provider || provider.capabilities().providerName !== 'claude') return null
   const sid = provider.sessionId
   if (!sid) return null
@@ -1752,14 +1779,14 @@ function calcOpusTurnCostUsd(input: number, output: number, cacheRead: number, c
 // `message.usage`. Tail-read 1MB cap, not full file — at 1.5s poll cadence a
 // 16MB+ jsonl would double IO; the latest assistant event is always near the
 // tail. Mirrors main repo readAgentLastTurnUsage (AIC-113).
-function readAgentLastTurnUsage(agentId: string): {
+function readAgentLastTurnUsage(userId: string, conversationId: string, agentId: string): {
   input_tokens: number
   output_tokens: number
   cache_read_input_tokens: number
   cache_creation_input_tokens: number
   cost_usd: number
 } | null {
-  const resolved = resolveTranscriptPath(agentId)
+  const resolved = resolveTranscriptPath(userId, conversationId, agentId)
   if (!resolved) return null
   try {
     const TAIL_CAP = 1_000_000
@@ -1806,15 +1833,19 @@ function readAgentLastTurnUsage(agentId: string): {
   return null
 }
 
-function groupStatusSnapshot() {
+function groupStatusSnapshot(userId?: string) {
   const agents: Record<string, any> = {}
   for (const member of GROUP_ROSTER.filter((m) => m.kind === 'agent')) {
     const row = db.prepare(`SELECT * FROM group_agent_state WHERE agent_id = ?`).get(member.id) as any
     // AIC-116: online iff a long-lived provider instance is registered for this agent. Even if
     // the underlying subprocess is between sends (process spawns on first send, exits on close),
     // "online" tracks operator intent — the agent slot is configured + provisioned.
-    const provider = AGENT_PROVIDERS.get(member.id)
-    const online = !!provider
+    const localPrefix = userId ? `${userId}:` : ''
+    const localSuffix = `:${member.id}`
+    const hasLocalProvider = userId ? [...AGENT_PROVIDERS.keys()].some((key) => key.startsWith(localPrefix) && key.endsWith(localSuffix)) : false
+    const online = AGENT_RUNTIMES[member.id]?.provider === 'remote-codex'
+      ? Boolean(userId && connectorRegistry.isUserOnline(userId))
+      : hasLocalProvider
     const ctx = readAgentContext(member.id)
     agents[member.id] = {
       state: online ? 'online' : 'offline',
@@ -1840,8 +1871,8 @@ function groupStatusSnapshot() {
   return { agents }
 }
 
-function groupMembersPayload() {
-  const status = groupStatusSnapshot().agents
+function groupMembersPayload(userId?: string) {
+  const status = groupStatusSnapshot(userId).agents
   return GROUP_ROSTER.map((member) => ({
     ...member,
     name: member.display_name,
@@ -2193,7 +2224,7 @@ function buildBridgePrompt(record: GroupRecord, recipient: string, hopCount: num
 
 function demoteAgentTurnDelivery(agentId: string, route: AgentTurnRoute) {
   try {
-    const row = db.prepare(`SELECT delivery FROM group_messages WHERE id=?`).get(route.recordId) as any
+    const row = db.prepare(`SELECT delivery FROM group_messages WHERE id=? AND user_id=?`).get(route.recordId, route.userId) as any
     if (!row?.delivery) return
     const delivery = JSON.parse(row.delivery)
     const deliveredList = route.observeOnly ? delivery.observed : delivery.delivered
@@ -2214,22 +2245,23 @@ function demoteAgentTurnDelivery(agentId: string, route: AgentTurnRoute) {
  * for that same turn. Starting exactly one queued prompt at a time gives every
  * dispatch one assistant/result lifecycle and therefore one stable route.
  */
-function startNextAgentTurn(agentId: string) {
-  const route = _agentTurnRoutes.startNext(agentId)
+function startNextAgentTurn(userId: string, conversationId: string, agentId: string) {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const route = _agentTurnRoutes.startNext(key)
   if (!route) return
-  const provider = ensureProvider(agentId)
+  const provider = ensureProvider(userId, conversationId, agentId)
   if (!provider) {
-    _agentTurnRoutes.remove(agentId, route.id)
+    _agentTurnRoutes.remove(key, route.id)
     demoteAgentTurnDelivery(agentId, route)
-    startNextAgentTurn(agentId)
+    startNextAgentTurn(userId, conversationId, agentId)
     return
   }
   provider.send(route.prompt).catch((e: any) => {
     console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
-    _agentTurnRoutes.remove(agentId, route.id)
+    _agentTurnRoutes.remove(key, route.id)
     demoteAgentTurnDelivery(agentId, route)
-    if (isAgentWorkingInDb(agentId) && !_agentTurnRoutes.hasResponseTurn(agentId)) markAgentIdle(agentId)
-    startNextAgentTurn(agentId)
+    if (isAgentWorkingInDb(agentId) && !_agentTurnRoutes.hasResponseTurn(key)) markAgentIdle(agentId)
+    startNextAgentTurn(userId, conversationId, agentId)
   })
 }
 
@@ -2250,7 +2282,7 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
       failed.push(target)
       continue
     }
-    const provider = ensureProvider(target)
+    const provider = ensureProvider(record.user_id, record.conversation_id, target)
     if (!provider) {
       console.error(`dispatchGroupRecord: no provider runtime configured for ${target}`)
       failed.push(target)
@@ -2261,7 +2293,8 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
     // Queue before starting the provider turn: streaming assistant events may arrive
     // before send() resolves, while later prompts must wait for this turn's result.
     const turnRouteId = groupId('turn')
-    _agentTurnRoutes.enqueue(target, {
+    const key = runtimeProviderKey(record.user_id, record.conversation_id, target)
+    _agentTurnRoutes.enqueue(key, {
       id: turnRouteId,
       userId: record.user_id,
       conversationId: record.conversation_id,
@@ -2274,7 +2307,7 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
     })
     // Optimistic delivered; startNextAgentTurn corrects it if send() rejects.
     delivered.push(target)
-    startNextAgentTurn(target)
+    startNextAgentTurn(record.user_id, record.conversation_id, target)
   }
   if (observeOnly) {
     record.delivery.observed = delivered
@@ -2467,21 +2500,28 @@ function fetchCodexUsageCached(): any {
 
 // AIC-116: startAgentLifecycleWatcher() removed — provider events drive working/idle status.
 
+type ConnectorSocketData = { deviceId: string | null; userId: string | null }
+
 // Image HTTP server for upload/download
-Bun.serve({
+Bun.serve<ConnectorSocketData>({
   port: IMG_PORT,
   // AIC-52: was '0.0.0.0' which exposed 3009 on every interface — anyone on the
   // same wifi could hit the API. cloudflared connects from this host, so the
   // public tunnel keeps working; LAN devices that previously skipped auth lose
   // their backdoor.
   hostname: '127.0.0.1',
-  async fetch(req) {
+  async fetch(req, server) {
     const url = new URL(req.url)
+    if (req.method === 'GET' && url.pathname === '/connector') {
+      if (server.upgrade(req, { data: { deviceId: null, userId: null } })) return undefined
+      return Response.json({ ok: false, error: 'websocket upgrade required' }, { status: 426 })
+    }
     const dangerousEndpoint = dangerousEndpointFor(req.method, url.pathname)
     const currentUser = authenticatedUser(db, req)
     const isSecureRequest = url.protocol === 'https:' || req.headers.get('x-forwarded-proto') === 'https'
     const publicPath = url.pathname === '/web/login.html'
       || (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login' || url.pathname === '/api/auth/bootstrap'))
+      || (req.method === 'POST' && url.pathname === '/api/connectors/pair')
       || (req.method === 'POST' && url.pathname === '/api/agent-statusline' && isLocalRequestHost(url.hostname))
 
     // One-time bootstrap. The existing operator token authorizes setting the
@@ -2510,6 +2550,22 @@ Bun.serve({
         return Response.json({ ok: true, user }, { headers: { 'Set-Cookie': sessionCookie(session.token, isSecureRequest) } })
       } catch {
         return Response.json({ ok: false, error: 'bad request' }, { status: 400 })
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/connectors/pair') {
+      try {
+        const body = await req.json() as any
+        const paired = redeemPairingCode(db, String(body.pairing_code || ''), String(body.device_name || ''))
+        return Response.json({
+          ok: true,
+          device: paired.device,
+          device_token: paired.deviceToken,
+          websocket_url: '/connector',
+          protocol_version: 1,
+        }, { status: 201 })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'pairing failed' }, { status: 400 })
       }
     }
 
@@ -2622,6 +2678,15 @@ Bun.serve({
       }
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/connectors' && isAuthed) {
+      return Response.json({ ok: true, devices: listDevices(db, currentUser!.id) })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/connectors/pairing-code' && isAuthed) {
+      const pairing = createPairingCode(db, currentUser!.id)
+      return Response.json({ ok: true, pairing_code: pairing.code, expires_at: pairing.expiresAt }, { status: 201 })
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/conversations' && isAuthed) {
       ensureUserDefaultConversation(currentUser!)
       return Response.json({ ok: true, conversations: userRepo.listConversations(currentUser!.id) })
@@ -2656,8 +2721,8 @@ Bun.serve({
       return Response.json({
         ok: true,
         roster: GROUP_ROSTER,
-        members: groupMembersPayload(),
-        status: groupStatusSnapshot(),
+        members: groupMembersPayload(currentUser!.id),
+        status: groupStatusSnapshot(currentUser!.id),
       })
     }
 
@@ -2791,7 +2856,7 @@ Bun.serve({
         return Response.json({
           ok: true,
           auto_reply: Object.fromEntries(GROUP_REPLY_AGENT_IDS.map((id) => [id, groupAgentAutoReply(id)])),
-          status: groupStatusSnapshot(),
+          status: groupStatusSnapshot(currentUser!.id),
         })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -2822,8 +2887,8 @@ Bun.serve({
         cursor,
         has_more: hasMore,
         roster: GROUP_ROSTER,
-        members: groupMembersPayload(),
-        status: groupStatusSnapshot(),
+        members: groupMembersPayload(currentUser!.id),
+        status: groupStatusSnapshot(currentUser!.id),
       })
     }
 
@@ -2897,7 +2962,7 @@ Bun.serve({
           dispatch_id: body.dispatch_id || null,
           status_text: body.status_text || null,
         })
-        return Response.json({ ok: true, status: groupStatusSnapshot() })
+        return Response.json({ ok: true, status: groupStatusSnapshot(currentUser!.id) })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
       }
@@ -2908,7 +2973,8 @@ Bun.serve({
     if (req.method === 'POST' && url.pathname === '/group/agent/clock-in' && isAuthed) {
       try {
         const body = await req.json() as any
-        const result = agentClockIn(String(body.agent_id || '').trim())
+        const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
+        const result = agentClockIn(currentUser!.id, conversationId, String(body.agent_id || '').trim())
         return Response.json(result, { status: result.ok ? 200 : 400 })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -2919,7 +2985,8 @@ Bun.serve({
     if (req.method === 'POST' && url.pathname === '/group/agent/clock-out' && isAuthed) {
       try {
         const body = await req.json() as any
-        const result = agentClockOut(String(body.agent_id || '').trim())
+        const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
+        const result = agentClockOut(currentUser!.id, conversationId, String(body.agent_id || '').trim())
         return Response.json(result, { status: result.ok ? 200 : 400 })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -2930,7 +2997,8 @@ Bun.serve({
     if (req.method === 'POST' && url.pathname === '/group/agent/clock-out-ready' && isAuthed) {
       try {
         const body = await req.json() as any
-        const result = killAgentSession(String(body.agent_id || '').trim())
+        const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
+        const result = killAgentSession(currentUser!.id, conversationId, String(body.agent_id || '').trim())
         return Response.json(result, { status: result.ok ? 200 : 400 })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -3012,7 +3080,7 @@ Bun.serve({
           typing_since: body.is_typing ? groupNowIso() : null,
           status_text: body.status_text || null,
         })
-        return Response.json({ ok: true, status: groupStatusSnapshot() })
+        return Response.json({ ok: true, status: groupStatusSnapshot(currentUser!.id) })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
       }
@@ -4319,7 +4387,8 @@ Bun.serve({
         if (!ROLE_AGENT_IDS.includes(agent as typeof ROLE_AGENT_IDS[number])) {
           return Response.json({ ok: false, error: `transcript not supported for agent: ${agent}`, agent }, { status: 410 })
         }
-        const resolved = resolveTranscriptPath(agent)
+        const conversationId = url.searchParams.get('conversation_id') || ensureUserDefaultConversation(currentUser!).id
+        const resolved = resolveTranscriptPath(currentUser!.id, conversationId, agent)
         if (!resolved) {
           return Response.json({ ok: false, error: `unable to resolve transcript for agent: ${agent} (session not running, sid missing, or not a claude binary?)`, agent })
         }
@@ -4396,7 +4465,8 @@ Bun.serve({
       if (!ROLE_AGENT_IDS.includes(agentId as typeof ROLE_AGENT_IDS[number])) {
         return Response.json({ ok: false, error: `agent-billing not supported for agent: ${agentId}`, agentId }, { status: 410 })
       }
-      const usage = readAgentLastTurnUsage(agentId)
+      const conversationId = url.searchParams.get('conversation_id') || ensureUserDefaultConversation(currentUser!).id
+      const usage = readAgentLastTurnUsage(currentUser!.id, conversationId, agentId)
       if (!usage) {
         return Response.json({ ok: true, agentId, available: false, reason: 'no usage data (session not running / no assistant event yet)', turn_count: null })
       }
@@ -4433,6 +4503,62 @@ Bun.serve({
 
 
     return new Response('not found', { status: 404 })
+  },
+  websocket: {
+    open() {
+      // Authentication happens in the mandatory first `hello` frame.
+    },
+    message(ws, message) {
+      try {
+        const parsed = parseConnectorMessage(typeof message === 'string' ? message : Buffer.from(message).toString('utf8'))
+        if (!ws.data.deviceId || !ws.data.userId) {
+          if (parsed.type !== 'hello') {
+            ws.close(4003, 'hello required')
+            return
+          }
+          const device = authenticateDevice(db, parsed.device_token)
+          if (!device) {
+            ws.send(JSON.stringify({ type: 'hello_ack', status: 'error', error: 'invalid device token' }))
+            ws.close(4003, 'authentication failed')
+            return
+          }
+          ws.data.deviceId = device.id
+          ws.data.userId = device.user_id
+          connectorRegistry.register({
+            deviceId: device.id,
+            userId: device.user_id,
+            deviceName: device.device_name,
+            socket: ws,
+          })
+          setDeviceStatus(db, device.id, 'online')
+          ws.send(JSON.stringify({
+            type: 'hello_ack',
+            status: 'ok',
+            user_id: device.user_id,
+            heartbeat_interval: 30,
+          }))
+          return
+        }
+        connectorRegistry.touch(ws.data.deviceId)
+        if (parsed.type === 'heartbeat') {
+          setDeviceStatus(db, ws.data.deviceId, 'online')
+          ws.send(JSON.stringify({ type: 'heartbeat_ack', received_at: new Date().toISOString() }))
+          return
+        }
+        if (parsed.type === 'execution_result') {
+          connectorDispatcher.handleResult(ws.data.deviceId, ws.data.userId, parsed)
+          return
+        }
+        ws.close(4002, 'unexpected message')
+      } catch {
+        ws.close(4002, 'invalid connector message')
+      }
+    },
+    close(ws) {
+      if (!ws.data.deviceId) return
+      connectorRegistry.unregister(ws.data.deviceId, ws)
+      setDeviceStatus(db, ws.data.deviceId, 'offline')
+    },
   },
 })
 process.stderr.write(`ai-collab: HTTP server on http://127.0.0.1:${IMG_PORT}\n`)
