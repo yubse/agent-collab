@@ -43,6 +43,7 @@ import {
   authenticatedUser,
   clearSessionCookie,
   createSession,
+  createUser,
   ensureLegacyAdminPassword,
   revokeSession,
   sessionCookie,
@@ -2453,27 +2454,42 @@ Bun.serve({
   async fetch(req) {
     const url = new URL(req.url)
     const dangerousEndpoint = dangerousEndpointFor(req.method, url.pathname)
-    const authMode = requestAuthMode(req, url, AUTH_TOKEN, {
-      
-      allowQueryToken: ALLOW_QUERY_TOKEN_AUTH,
-    })
+    const currentUser = authenticatedUser(db, req)
+    const isSecureRequest = url.protocol === 'https:' || req.headers.get('x-forwarded-proto') === 'https'
+    const publicPath = url.pathname === '/web/login.html'
+      || (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login' || url.pathname === '/api/auth/bootstrap'))
+      || (req.method === 'POST' && url.pathname === '/api/agent-statusline' && isLocalRequestHost(url.hostname))
 
-    // Global auth: all routes require auth or localhost origin
-    const hasAuth = authMode !== null
-    if (authMode === 'query') {
-      logDangerousOperation('deprecated_query_token_auth', {
-        method: req.method,
-        path: url.pathname,
-        host: url.hostname,
-      })
+    // One-time bootstrap. The existing operator token authorizes setting the
+    // first admin password, but never becomes a user session or user identity.
+    if (req.method === 'POST' && url.pathname === '/api/auth/bootstrap') {
+      if (req.headers.get('authorization') !== `Bearer ${AUTH_TOKEN}`) {
+        return Response.json({ ok: false, error: 'invalid bootstrap authorization' }, { status: 403 })
+      }
+      try {
+        const body = await req.json() as any
+        const changed = await ensureLegacyAdminPassword(db, String(body.password || ''))
+        if (!changed) return Response.json({ ok: false, error: 'admin already initialized' }, { status: 409 })
+        const session = createSession(db, LEGACY_ADMIN_ID)
+        return Response.json({ ok: true }, { headers: { 'Set-Cookie': sessionCookie(session.token, isSecureRequest) } })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'bootstrap failed' }, { status: 400 })
+      }
     }
 
-    // Login page & login POST: exempt from auth
-    // AIC-119: statusline POST 也 exempt (本机 fire-and-forget, 不带 token), 但限 localhost.
-    if (url.pathname === '/web/login.html' || (req.method === 'POST' && url.pathname === '/web/login')
-        || (req.method === 'POST' && url.pathname === '/api/agent-statusline' && isLocalRequestHost(url.hostname))) {
-      // fall through to handlers below
-    } else if (!hasAuth) {
+    if (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login')) {
+      try {
+        const body = await req.json() as any
+        const user = await authenticatePassword(db, String(body.username || ''), String(body.password || ''))
+        if (!user) return Response.json({ ok: false, error: '用户名或密码错误' }, { status: 401 })
+        const session = createSession(db, user.id)
+        return Response.json({ ok: true, user }, { headers: { 'Set-Cookie': sessionCookie(session.token, isSecureRequest) } })
+      } catch {
+        return Response.json({ ok: false, error: 'bad request' }, { status: 400 })
+      }
+    }
+
+    if (!currentUser && !publicPath) {
       if (dangerousEndpoint) {
         logDangerousOperation('unauthorized_dangerous_request', {
           method: req.method,
@@ -2483,26 +2499,12 @@ Bun.serve({
           host: url.hostname,
         })
       }
-      // For web page GETs (HTML entry points only — NOT static assets like .js/.css/.png),
-      // auto-set the aicollab_auth cookie and redirect to the original page. The browser will then
-      // include the cookie on subsequent XHR / asset fetches that DO require auth.
-      // Open-source onboarding: users don't type a token; the server-derived AUTH_TOKEN (from
-      // env or runtime-data/state/token.txt) is bound to the cookie on first GET. Anyone able
-      // to reach the server thus gets in — bind the server to 127.0.0.1 if you don't want that.
       const isHtmlEntry = url.pathname === '/' || url.pathname === '/web' || url.pathname === '/web/'
         || url.pathname.endsWith('.html')
         || url.pathname === '/web/workgroup-v2'
       if (req.method === 'GET' && isHtmlEntry) {
-        const target = url.pathname === '/' || url.pathname === '/web' || url.pathname === '/web/' || url.pathname === '/web/workgroup-v2'
-          ? '/web/workgroup-v2/index.html'
-          : url.pathname
-        return new Response(null, {
-          status: 302,
-          headers: {
-            'Location': target,
-            'Set-Cookie': `aicollab_auth=${AUTH_TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 3600}`,
-          },
-        })
+        const next = url.pathname === '/web/login.html' ? '/web/workgroup-v2/index.html' : `${url.pathname}${url.search}`
+        return new Response(null, { status: 302, headers: { Location: `/web/login.html?next=${encodeURIComponent(next)}` } })
       }
       return Response.json({ error: 'unauthorized' }, { status: 401 })
     }
@@ -2524,22 +2526,12 @@ Bun.serve({
       return new Response('not found', { status: 404 })
     }
 
-    // Login POST handler
-    if (req.method === 'POST' && url.pathname === '/web/login') {
-      try {
-        const body = await req.json() as any
-        if (body.password === AUTH_TOKEN) {
-          return new Response(JSON.stringify({ ok: true }), {
-            headers: {
-              'Content-Type': 'application/json',
-              'Set-Cookie': `aicollab_auth=${AUTH_TOKEN}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${30 * 24 * 3600}`
-            }
-          })
-        }
-        return Response.json({ error: 'wrong password' }, { status: 401 })
-      } catch {
-        return Response.json({ error: 'bad request' }, { status: 400 })
-      }
+    if (req.method === 'GET' && url.pathname === '/api/auth/me' && currentUser) {
+      return Response.json({ ok: true, user: currentUser })
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auth/logout' && currentUser) {
+      revokeSession(db, req)
+      return Response.json({ ok: true }, { headers: { 'Set-Cookie': clearSessionCookie(isSecureRequest) } })
     }
 
     // /, /web, /web/ 全 redirect 到 workgroup-v2 主入口（防外网书签 404）
@@ -2580,10 +2572,31 @@ Bun.serve({
     }
 
     // === HTTP Polling API (auth required) ===
-    const isAuthed = hasRequestAuth(req, url, AUTH_TOKEN, {
-      
-      allowQueryToken: ALLOW_QUERY_TOKEN_AUTH,
-    })
+    const isAuthed = Boolean(currentUser)
+
+    if (req.method === 'GET' && url.pathname === '/api/users' && isAuthed) {
+      if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'admin required' }, { status: 403 })
+      const users = db.prepare(`SELECT id, tenant_id, username, display_name, role, created_at, updated_at
+        FROM users WHERE tenant_id=? ORDER BY created_at`).all(currentUser!.tenant_id)
+      return Response.json({ ok: true, users })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/users' && isAuthed) {
+      if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'admin required' }, { status: 403 })
+      try {
+        const body = await req.json() as any
+        const user = await createUser(db, {
+          username: String(body.username || ''),
+          displayName: String(body.display_name || body.username || ''),
+          password: String(body.password || ''),
+          role: body.role === 'admin' ? 'admin' : 'user',
+          tenantId: currentUser!.tenant_id,
+        })
+        return Response.json({ ok: true, user }, { status: 201 })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'unable to create user' }, { status: 400 })
+      }
+    }
 
     // Workgroup roster: GET /group/roster
     if (req.method === 'GET' && url.pathname === '/group/roster' && isAuthed) {
