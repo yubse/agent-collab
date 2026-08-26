@@ -254,7 +254,6 @@ async function probeSocketLive(sockPath: string, timeoutMs: number): Promise<'li
       resolve(val)
     }
     const timer = setTimeout(() => settle('dead'), timeoutMs)
-    // @ts-expect-error Bun global
     const BunRt = (globalThis as any).Bun
     if (!BunRt?.connect) {
       settle('dead')
@@ -389,7 +388,6 @@ export function spawnChild(state: SupervisorState, cfg: SupervisorConfig): void 
       // child via pgroup-fanout. Supervisor is itself robust to its own pgroup
       // signals via SIGHUP-ignore below.
       env: process.env,
-      // @ts-expect-error Bun's TS lib for Bun.spawn doesn't yet expose detached on
       // the public type but the runtime accepts it (see POC h1).
       detached: true,
     }) as Subprocess<'pipe', number, number>
@@ -575,8 +573,8 @@ function loadPersistedSessionId(cfg: SupervisorConfig): string | null {
 export function startSocketServer(
   state: SupervisorState,
   cfg: SupervisorConfig,
-): TCPSocketListener<ClientState> {
-  let server: TCPSocketListener<ClientState>
+): any {
+  let server: any
   try {
     server = Bun.listen<ClientState>({
       unix: state.paths.sockPath,

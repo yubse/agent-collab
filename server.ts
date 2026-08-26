@@ -333,8 +333,11 @@ try {
   // phase_templates.required_roles + workflow_templates.phases JSON strings — string-replace
   // the role ids inside the serialized JSON. Round-trip-safe because the new ids are unique
   // tokens that don't appear elsewhere in those columns.
-  db.run(`UPDATE phase_templates    SET required_roles = REPLACE(required_roles, '"otto"', '"implementer"') WHERE required_roles LIKE '%"otto"%'`)
-  db.run(`UPDATE phase_templates    SET required_roles = REPLACE(required_roles, '"lio"',  '"reviewer"')    WHERE required_roles LIKE '%"lio"%'`)
+  const phaseTemplatesExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='phase_templates'`).get()
+  if (phaseTemplatesExists) {
+    db.run(`UPDATE phase_templates SET required_roles = REPLACE(required_roles, '"otto"', '"implementer"') WHERE required_roles LIKE '%"otto"%'`)
+    db.run(`UPDATE phase_templates SET required_roles = REPLACE(required_roles, '"lio"',  '"reviewer"')    WHERE required_roles LIKE '%"lio"%'`)
+  }
   db.run(`UPDATE workflow_templates SET phases         = REPLACE(phases,         '"otto"', '"implementer"') WHERE phases         LIKE '%"otto"%'`)
   db.run(`UPDATE workflow_templates SET phases         = REPLACE(phases,         '"lio"',  '"reviewer"')    WHERE phases         LIKE '%"lio"%'`)
 } catch (e) { console.error('role-key migration failed:', e) }
@@ -387,13 +390,14 @@ runMigrations(db)
 const userRepo = new UserRepository(db)
 const connectorRegistry = new ConnectorRegistry()
 const connectorDispatcher = new ConnectorDispatcher(connectorRegistry)
+db.run(`UPDATE connector_devices SET status='offline' WHERE status!='offline'`)
 if (process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD) {
   await ensureLegacyAdminPassword(db, process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD)
 }
 // Initialize AIC sequence — start above v1 task count to avoid id collision (cosmetic)
 try {
   const v1Count = (db.prepare(`SELECT COUNT(*) AS n FROM group_tasks`).get() as any).n || 0
-  db.run(`INSERT OR IGNORE INTO task_id_seq (prefix, next) VALUES ('AIC', ?)`, Math.max(1, v1Count + 1))
+  db.run(`INSERT OR IGNORE INTO task_id_seq (prefix, next) VALUES ('AIC', ?)`, [Math.max(1, v1Count + 1)])
 } catch {}
 
 type GroupMember = {
@@ -1527,7 +1531,7 @@ function loadTask(task_id: string, userId?: string): any | null {
 
 // Long poll waiters: events (per task) and summary (all open tasks)
 type TaskEventWaiter = { taskId: string; sinceEventId: string; resolve: (r: Response) => void; timer: ReturnType<typeof setTimeout> }
-type TaskSummaryWaiter = { sinceCursor: string; resolve: (r: Response) => void; timer: ReturnType<typeof setTimeout> }
+type TaskSummaryWaiter = { userId: string; sinceCursor: string; resolve: (r: Response) => void; timer: ReturnType<typeof setTimeout> }
 const taskEventWaiters = new Set<TaskEventWaiter>()
 const taskSummaryWaiters = new Set<TaskSummaryWaiter>()
 
@@ -1555,7 +1559,7 @@ function wakeTaskWaiters(taskId: string, opts: { deleted?: boolean } = {}) {
     clearTimeout(w.timer)
     taskSummaryWaiters.delete(w)
     // Build a fresh snapshot inline (logic duplicated from the summary handler; kept simple intentionally)
-    const rows = db.prepare(`SELECT * FROM tasks_v2 WHERE status='open' ORDER BY updated_at DESC`).all() as any[]
+    const rows = db.prepare(`SELECT * FROM tasks_v2 WHERE user_id=? AND status='open' ORDER BY updated_at DESC`).all(w.userId) as any[]
     for (const row of rows) {
       attachPendingFields(row)
       const latest = db.prepare(`SELECT id, ts, kind, actor_id, meta, body FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1`).get(row.id) as any
@@ -1663,6 +1667,10 @@ function groupObserverTargetsFor(senderId: string, responseTargets: string[], co
   const responseSet = new Set(responseTargets)
   return groupAgentIds(conversationId, userId).filter((id) => {
     if (id === senderId || responseSet.has(id)) return false
+    // Remote Connector mode keeps conversation context on Server and injects it
+    // when an agent is actually addressed. Do not spend one Codex turn per silent
+    // observer just to synchronize context.
+    if (AGENT_RUNTIMES[id]?.provider === 'remote-codex') return false
     return groupAgentAutoReply(id)
   })
 }
@@ -2231,9 +2239,17 @@ function buildBridgePrompt(record: GroupRecord, recipient: string, hopCount: num
     } catch {}
   }
   const privateMemory = userRepo.memory(record.user_id, recipient)?.content?.trim() || ''
+  const recentContext = readGroupRecords(record.user_id, null, 12, record.conversation_id)
+    .filter((item) => item.id !== record.id)
+    .map((item) => {
+      const name = GROUP_ROSTER_BY_ID.get(item.sender_id)?.display_name || item.sender_id
+      return `${name}: ${item.text.replace(/\s+/g, ' ').slice(0, 500)}`
+    })
+    .join('\n')
   const serverContext = [
     sharedDefinition ? `[共享 Agent Definition]\n${sharedDefinition}` : '',
     privateMemory ? `[当前用户私有 Memory]\n${privateMemory}` : '',
+    recentContext ? `[当前 Conversation 近期上下文]\n${recentContext}` : '',
   ].filter(Boolean).join('\n\n')
   const request = `${head}\n${meta}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
   return serverContext ? `${serverContext}\n\n[本次请求]\n${request}` : request
@@ -2768,9 +2784,7 @@ Bun.serve<ConnectorSocketData>({
     if (req.method === 'PUT' && /^\/api\/actor-styles\/[^/]+$/.test(url.pathname) && isAuthed) {
       try {
         const body = await req.json().catch(() => ({})) as any
-        const authMode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
-        const isPm = authMode === 'cookie' || authMode === 'local' || (authMode === 'header' && body.sender_id === 'admin')
-        if (!isPm) return Response.json({ ok: false, error: 'only PM can edit actor styles' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can edit shared actor styles' }, { status: 403 })
         const actorId = decodeURIComponent(url.pathname.split('/')[3])
         const VALID_ACTORS = new Set(['admin', ...ROLE_AGENT_IDS, 'system'])
         if (!VALID_ACTORS.has(actorId)) return Response.json({ ok: false, error: `unknown actor_id '${actorId}'` }, { status: 400 })
@@ -2927,7 +2941,6 @@ Bun.serve<ConnectorSocketData>({
         const senderId = 'admin'
         // v2 system virtual identity: external clients cannot impersonate system.
         // notifyActorViaDM (server-internal) writes directly to group_messages without going through this endpoint.
-        if (senderId === 'system') return Response.json({ ok: false, error: 'sender_id=system is internal-only' }, { status: 403 })
         // Reject any message targeting dm-system (system has no DM channel to reply into).
         if (String(body.conversation_id || '') === 'dm-system') return Response.json({ ok: false, error: 'dm-system is not a valid conversation' }, { status: 400 })
         assertGroupConversationAllowed(senderId, body.conversation_id, currentUser!.id)
@@ -2939,8 +2952,7 @@ Bun.serve<ConnectorSocketData>({
         // Channel restriction: only the DM owner (the agent) or PM can send here.
         const dmAgent = dmAgentFor(String(body.conversation_id || ''))
         if (dmAgent) {
-          const dmAuthMode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
-          const dmIsPm = dmAuthMode === 'cookie' || dmAuthMode === 'local' || (dmAuthMode === 'header' && senderId === 'admin')
+          const dmIsPm = senderId === 'admin'
           if (senderId !== dmAgent && !dmIsPm) {
             return Response.json({ ok: false, error: `only ${dmAgent} or PM can send to dm-${dmAgent}` }, { status: 403 })
           }
@@ -3011,7 +3023,7 @@ Bun.serve<ConnectorSocketData>({
       try {
         const body = await req.json() as any
         const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
-        const result = agentClockOut(currentUser!.id, conversationId, String(body.agent_id || '').trim())
+        const result = await agentClockOut(currentUser!.id, conversationId, String(body.agent_id || '').trim())
         return Response.json(result, { status: result.ok ? 200 : 400 })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -3023,7 +3035,7 @@ Bun.serve<ConnectorSocketData>({
       try {
         const body = await req.json() as any
         const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
-        const result = killAgentSession(currentUser!.id, conversationId, String(body.agent_id || '').trim())
+        const result = await killAgentSession(currentUser!.id, conversationId, String(body.agent_id || '').trim())
         return Response.json(result, { status: result.ok ? 200 : 400 })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -3188,8 +3200,8 @@ Bun.serve<ConnectorSocketData>({
       const body = await req.json() as any
       const name = String(body.name || '').trim()
       if (!name) return Response.json({ ok: false, error: 'name required' }, { status: 400 })
-      db.run(`DELETE FROM task_categories WHERE name = ?`, name)
-      db.run(`UPDATE group_tasks SET category = '' WHERE category = ?`, name)
+      db.run(`DELETE FROM task_categories WHERE name = ?`, [name])
+      db.run(`UPDATE group_tasks SET category = '' WHERE category = ?`, [name])
       return Response.json({ ok: true })
     }
 
@@ -3391,7 +3403,7 @@ Bun.serve<ConnectorSocketData>({
       const taskId = decodeURIComponent(url.pathname.slice('/group/tasks/'.length))
       const task = db.prepare(`SELECT id FROM group_tasks WHERE id = ?`).get(taskId)
       if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
-      db.run(`DELETE FROM group_tasks WHERE id = ?`, taskId)
+      db.run(`DELETE FROM group_tasks WHERE id = ?`, [taskId])
       return Response.json({ ok: true, deleted: taskId })
     }
 
@@ -3415,7 +3427,7 @@ Bun.serve<ConnectorSocketData>({
     }
     if (req.method === 'POST' && url.pathname === '/tasks/categories' && isAuthed) {
       const body = await req.json().catch(() => ({})) as any
-      if (!v2IsPm(v2AuthInfo(), body)) return Response.json({ ok: false, error: 'only PM can manage categories' }, { status: 403 })
+      if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared categories' }, { status: 403 })
       const name = String(body.name || '').trim()
       if (!name) return Response.json({ ok: false, error: 'name required' }, { status: 400 })
       try { db.run(`INSERT INTO task_categories (name, created_at) VALUES (?, ?)`, [name, groupNowIso()]) } catch {}
@@ -3423,12 +3435,12 @@ Bun.serve<ConnectorSocketData>({
     }
     if (req.method === 'DELETE' && url.pathname === '/tasks/categories' && isAuthed) {
       const body = await req.json().catch(() => ({})) as any
-      if (!v2IsPm(v2AuthInfo(), body)) return Response.json({ ok: false, error: 'only PM can manage categories' }, { status: 403 })
+      if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared categories' }, { status: 403 })
       const name = String(body.name || '').trim()
       if (!name) return Response.json({ ok: false, error: 'name required' }, { status: 400 })
-      db.run(`DELETE FROM task_categories WHERE name = ?`, name)
-      db.run(`UPDATE group_tasks SET category = '' WHERE category = ?`, name)
-      db.run(`UPDATE tasks_v2 SET category = '' WHERE category = ?`, name)
+      db.run(`DELETE FROM task_categories WHERE name = ?`, [name])
+      db.run(`UPDATE group_tasks SET category = '' WHERE category = ?`, [name])
+      db.run(`UPDATE tasks_v2 SET category = '' WHERE category = ?`, [name])
       return Response.json({ ok: true })
     }
 
@@ -3466,7 +3478,7 @@ Bun.serve<ConnectorSocketData>({
       try {
         const body = await req.json() as any
         const info = v2AuthInfo()
-        if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can manage phase templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared phase templates' }, { status: 403 })
         const id = body.id ? String(body.id).trim() : `p_${generateULID().slice(0, 10).toLowerCase()}`
         const normalized = {
           id,
@@ -3501,7 +3513,7 @@ Bun.serve<ConnectorSocketData>({
       try {
         const body = await req.json() as any
         const info = v2AuthInfo()
-        if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can manage phase templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared phase templates' }, { status: 403 })
         const id = decodeURIComponent(url.pathname.slice('/tasks/phase_templates/'.length))
         if (!PHASE_TEMPLATES[id]) return Response.json({ ok: false, error: 'phase template not found' }, { status: 404 })
         if (RESERVED_PHASE_IDS.has(id)) return Response.json({ ok: false, error: `phase template '${id}' is reserved (runtime hardcoded); not editable` }, { status: 409 })
@@ -3558,7 +3570,7 @@ Bun.serve<ConnectorSocketData>({
     if (req.method === 'DELETE' && /^\/tasks\/phase_templates\/[^/]+$/.test(url.pathname) && isAuthed) {
       try {
         const info = v2AuthInfo()
-        if (!v2IsPm(info, null)) return Response.json({ ok: false, error: 'only PM can delete phase templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can delete shared phase templates' }, { status: 403 })
         const id = decodeURIComponent(url.pathname.slice('/tasks/phase_templates/'.length))
         if (!PHASE_TEMPLATES[id]) return Response.json({ ok: false, error: 'phase template not found' }, { status: 404 })
         if (RESERVED_PHASE_IDS.has(id)) return Response.json({ ok: false, error: `phase template '${id}' is reserved (runtime hardcoded); not deletable` }, { status: 409 })
@@ -3566,7 +3578,7 @@ Bun.serve<ConnectorSocketData>({
         if (refs.length > 0) {
           return Response.json({ ok: false, error: `cannot delete phase template '${id}': still referenced by ${refs.length} workflow(s): ${refs.map(r => r[0]).join(', ')}` }, { status: 409 })
         }
-        db.run(`DELETE FROM phase_templates WHERE id = ?`, id)
+        db.run(`DELETE FROM phase_templates WHERE id = ?`, [id])
         reloadPhaseTemplates()
         reloadWorkflowTemplates()
         return Response.json({ ok: true, deleted: id })
@@ -3581,7 +3593,7 @@ Bun.serve<ConnectorSocketData>({
       try {
         const body = await req.json() as any
         const info = v2AuthInfo()
-        if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can manage workflow templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared workflow templates' }, { status: 403 })
         const key = String(body.key || '').trim()
         const label = String(body.label || '').trim()
         if (!/^[a-z][a-z0-9_]{1,40}$/.test(key)) return Response.json({ ok: false, error: 'key must match ^[a-z][a-z0-9_]{1,40}$' }, { status: 400 })
@@ -3608,7 +3620,7 @@ Bun.serve<ConnectorSocketData>({
       try {
         const body = await req.json() as any
         const info = v2AuthInfo()
-        if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can manage workflow templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared workflow templates' }, { status: 403 })
         const key = decodeURIComponent(url.pathname.slice('/tasks/workflow_templates/'.length))
         if (!WORKFLOW_TEMPLATES[key]) return Response.json({ ok: false, error: 'template not found' }, { status: 404 })
         const sets: string[] = []
@@ -3641,14 +3653,14 @@ Bun.serve<ConnectorSocketData>({
     if (req.method === 'DELETE' && /^\/tasks\/workflow_templates\/[^/]+$/.test(url.pathname) && isAuthed) {
       try {
         const info = v2AuthInfo()
-        if (!v2IsPm(info, null)) return Response.json({ ok: false, error: 'only PM can delete workflow templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can delete shared workflow templates' }, { status: 403 })
         const key = decodeURIComponent(url.pathname.slice('/tasks/workflow_templates/'.length))
         if (!WORKFLOW_TEMPLATES[key]) return Response.json({ ok: false, error: 'template not found' }, { status: 404 })
         const openCount = (db.prepare(`SELECT COUNT(*) AS n FROM tasks_v2 WHERE type = ? AND status = 'open'`).get(key) as any).n
         if (openCount > 0) {
           return Response.json({ ok: false, error: `cannot delete type ${key}: ${openCount} open task(s) still using it` }, { status: 409 })
         }
-        db.run(`DELETE FROM workflow_templates WHERE key = ?`, key)
+        db.run(`DELETE FROM workflow_templates WHERE key = ?`, [key])
         reloadWorkflowTemplates()
         return Response.json({ ok: true, deleted: key })
       } catch (e: any) {
@@ -3804,7 +3816,7 @@ Bun.serve<ConnectorSocketData>({
           taskSummaryWaiters.delete(waiter)
           resolve(Response.json({ ok: true, ...buildSnapshot() }))
         }, timeout)
-        const waiter = { sinceCursor, resolve, timer }
+        const waiter = { userId: currentUser!.id, sinceCursor, resolve, timer }
         taskSummaryWaiters.add(waiter)
       })
     }
@@ -4066,7 +4078,7 @@ Bun.serve<ConnectorSocketData>({
       const task = loadTask(taskId, currentUser!.id)
       if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
       // Cascade delete (FK ON DELETE CASCADE handles events / checks / seen_marks)
-      db.run(`DELETE FROM tasks_v2 WHERE id = ?`, taskId)
+      db.run(`DELETE FROM tasks_v2 WHERE id = ?`, [taskId])
       // v0.7.2 Fix 6: events table is now empty for this task; pass deleted=true so detail waiters resolve 410
       wakeTaskWaiters(taskId, { deleted: true })
       return Response.json({ ok: true, deleted: taskId })

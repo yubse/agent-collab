@@ -39,6 +39,9 @@ export class RemoteCodexProvider implements AgentProvider {
         prompt: text,
       })
       if (result.content?.trim()) await this.eventCb?.({ type: 'assistant', text: result.content, raw: result })
+      // Mark the turn free before emitting `result`: the server's result handler
+      // immediately starts the next queued route on this same provider.
+      this.active = false
       await this.eventCb?.({ type: 'result', usage: result.usage || undefined, raw: result })
     } catch (error: any) {
       const message = error?.message || 'remote connector error'
@@ -52,4 +55,3 @@ export class RemoteCodexProvider implements AgentProvider {
   async interrupt(): Promise<boolean> { return false }
   async close(): Promise<void> {}
 }
-

@@ -165,7 +165,7 @@ export function agentRoot(pluginDir: string) {
 }
 
 export function runtimeDataRoot(pluginDir: string) {
-  return path.join(pluginDir, 'runtime-data')
+  return process.env.AICOLLAB_DATA_DIR || path.join(pluginDir, 'runtime-data')
 }
 
 export function runtimeStateDir(pluginDir: string) {

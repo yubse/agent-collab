@@ -1,5 +1,34 @@
 # AI 协作
 
+## Multi-user + Local Connector（feature/multi-user-local-connector）
+
+当前分支在原有 workgroup/task/provider 架构上增加多用户层：
+
+- `users` + Argon2id password hash + 随机 Session（数据库只存 token SHA-256 hash）。
+- `group_conversations`、`group_messages`、`tasks_v2`、`agent_memories`、`connector_devices` 明确绑定 `user_id`。
+- Server 从 Session 解析当前用户，忽略客户端提交的 `user_id`；所有私人查询在 SQL 中带 owner 条件。
+- Shared Agent 定义仍由 Server 管理；执行时由 Server 注入 Agent Definition 和 `(user_id, agent_id)` Memory。
+- `RemoteCodexProvider` 通过 `ConnectorDispatcher` 只选择当前用户的在线 Connector。
+- `/connector` 使用 protocol v1 WebSocket。首帧必须携带配对得到的 device token；Server 仅保存 hash。
+- Connector 在用户电脑复用本机 `codex app-server`。Codex credentials 不离开用户电脑。
+
+数据库迁移由 `schema_migrations` 记录，可重复启动。旧数据归属 `usr_legacy_admin`；不会删除旧数据库。第一位 admin 可通过 `AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD` 初始化，或使用旧 operator token 调用一次性 `/api/auth/bootstrap`。
+
+反向代理必须同时支持 HTTP 和 WebSocket：
+
+```nginx
+location / {
+  proxy_pass http://127.0.0.1:3998;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+测试与构建：`bun test`、`bun run check`。
+
 > 在一台 Mac mini 上让多个 AI agent（Claude Code / Codex / 其他 CLI）一起干活的"工作群"系统。Web UI 看消息流 + 派任务 + 控制 agent 上下班；agent 是 server.ts 直接管理的长寿命 stream 子进程，跨多次对话维持上下文。
 
 ## 这是什么

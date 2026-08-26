@@ -1,6 +1,6 @@
 # Agent-collab
 
-让多个 AI agent 在一个平台上按流程协作。目前支持 Claude Code 和 Codex CLI。
+公司内部多用户 AI Studio：共享多 Agent 定义，同时隔离每个用户的对话、消息、任务、Memory 和 Codex Connector。保留本地 Claude Code / Codex Provider 作为开发兼容模式。
 
 ## 为什么做这个
 
@@ -77,42 +77,41 @@ Claude Code 和 Codex CLI 都走 stream-json。tmux provider 是给已经有 tmu
 
 ## 快速开始
 
-需要 [Bun](https://bun.sh) 1.0+ 和至少一个 CLI agent（[Claude Code](https://claude.com/claude-code) 或 [Codex CLI](https://github.com/openai/codex)）。
+Server 需要 [Bun](https://bun.sh) 1.0+。Remote Connector 模式下，Server 不需要安装或登录 Codex；Codex CLI 只安装在每位用户自己的电脑。
 
 ```bash
 git clone https://github.com/20Totodile/agent-collab.git
 cd agent-collab
-bun install
-
-# 本分支预置 4 个品牌工作角色，默认 provider 均为 codex
-export PRODUCT_PROVIDER=codex
-export CREATIVE_PROVIDER=codex
-export SOCIAL_PROVIDER=codex
-export GROWTH_PROVIDER=codex
-
-export PRODUCT_CWD="/path/to/product/workspace"
-export CREATIVE_CWD="/path/to/creative/workspace"
-export SOCIAL_CWD="/path/to/social/workspace"
-export GROWTH_CWD="/path/to/growth/workspace"
-
+export AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD='至少十位的初始密码'
 bun server.ts
 ```
 
-打开 `http://localhost:3009/web/workgroup-v2/index.html`，浏览器会自动登录。
+打开 `http://localhost:3998/`，使用 `admin` 和初始密码登录。首次迁移后应移除 `AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD`；数据库只保存 Argon2id hash。
+
+默认四个 Agent 使用 `remote-codex`。共享人设保存在 Server，可用 `PRODUCT_PROMPT_PATH`、`CREATIVE_PROMPT_PATH`、`SOCIAL_PROMPT_PATH`、`GROWTH_PROMPT_PATH` 指向对应 `AGENTS.md`。开发时仍可显式使用 `PRODUCT_PROVIDER=codex` 或 `claude`。
+
+用户电脑安装 Bun 和 Codex CLI、完成 `codex login` 后：
+
+```bash
+cd connector
+export AI_STUDIO_SERVER_URL="https://studio.example.com"
+bun run start
+```
+
+在 Web 的“设置 → Codex Connector → 添加设备”生成一次性配对码。Connector 只把完整执行结果返回 Server，不上传 Codex `auth.json`、access token 或 refresh token。
 
 ## 架构
 
 ```
 ┌─────────────┐      ┌────────────────────────┐      ┌──────────────────┐
-│   Web UI    │◀────▶│  Bun Server            │◀────▶│  Agent stream    │
-│  (browser)  │ HTTP │  (port 3009)           │stdio │  subprocesses    │
-└─────────────┘      │  + SQLite              │      │  - claude        │
-                     │  + AgentProvider layer │      │  - codex         │
-                     │  + HTTP polling        │      │  - …             │
-                     └────────────────────────┘      └──────────────────┘
+│ Web UI      │◀────▶│ AI Studio Server       │◀────▶│ User Connector   │
+│ user session│ HTTP │ users + SQLite         │ WSS  │ local Codex     │
+└─────────────┘      │ shared agents          │      │ local auth only │
+                     │ private conversations  │      └─────────────────┘
+                     └────────────────────────┘
 ```
 
-每个 agent 是一个长寿命的 CLI 子进程，跨多次对话复用同一个 session。Server 通过 `AgentProvider` 接口管理子进程生命周期。想接其他 CLI 的话，实现这个接口即可，详见 `src/providers/provider.ts`。
+Remote 模式下，Agent 的定义、Memory、Conversation 和 Workflow 全在 Server；Connector 只是用户隔离的 Codex Execution Node。Server 通过 `RemoteCodexProvider` 和经过 device token 认证的 WebSocket 派发任务。本地 Provider 仍实现同一 `AgentProvider` 接口。
 
 ## 当前 Agent
 
