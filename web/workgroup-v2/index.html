@@ -3893,7 +3893,11 @@ async function sendCurrentMessage() {
     if (cfg.convId !== 'workgroup') body.conversation_id = cfg.convId;
     else body.mentions = parseMentions(text);
     if (replyTo) body.reply_to = replyTo.id;
-    await apiJson('/group/send', { method: 'POST', body: JSON.stringify(body) });
+    const sent = await apiJson('/group/send', { method: 'POST', body: JSON.stringify(body) });
+    const deliveryErrors = Object.values(sent?.record?.delivery?.errors || {});
+    if (deliveryErrors.includes('CODEX_CONNECTOR_OFFLINE')) {
+      showWipToast('你的 AI Studio Connector 当前未连接。');
+    }
   }
   clearReply();
   await poll();

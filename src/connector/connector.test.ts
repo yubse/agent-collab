@@ -97,7 +97,7 @@ describe('connector dispatch isolation', () => {
     const result = dispatcher.dispatch({ user_id: 'user-a', conversation_id: 'conv-a', agent_id: 'social', prompt: 'hello' })
     registry.unregister('dev-a', socket)
     await expect(result).rejects.toThrow('connector disconnected')
-    await expect(dispatcher.dispatch({ user_id: 'user-a', conversation_id: 'conv-a', agent_id: 'social', prompt: 'again' })).rejects.toThrow('no online connector')
+    await expect(dispatcher.dispatch({ user_id: 'user-a', conversation_id: 'conv-a', agent_id: 'social', prompt: 'again' })).rejects.toThrow('CODEX_CONNECTOR_OFFLINE')
   })
 
   test('test_duplicate_execution_result_is_ignored', async () => {
@@ -113,4 +113,3 @@ describe('connector dispatch isolation', () => {
     expect((await resultPromise).content).toBe('one')
   })
 })
-

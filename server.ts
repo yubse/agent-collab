@@ -10,6 +10,9 @@ import { jsonOk, jsonError, readJsonBody } from './src/responses.ts'
 import { jsonParseSafe } from './src/formatters.ts'
 import {
   IMG_PORT,
+  SERVER_HOST,
+  AI_STUDIO_PUBLIC_URL,
+  CONNECTOR_WS_URL,
   SOURCE,
   AUTH_TOKEN,
   SERVER_STARTED_AT,
@@ -114,6 +117,7 @@ function resolveStoredMediaPath(filename: string) {
 
 // SQLite for chat history
 const DB_PATH = chatDbPath(import.meta.dir)
+mkdirSync(path.dirname(DB_PATH), { recursive: true })
 const db = new Database(DB_PATH)
 // SQLite defaults to FK off; v2 schemas rely on ON DELETE CASCADE for task_events / phase_role_checks / seen_marks.
 // Without this, DELETE FROM tasks_v2 leaves orphan event rows.
@@ -597,7 +601,10 @@ function instantiateProvider(userId: string, conversationId: string, agentId: st
     onError: (err: AgentError) => handleProviderError(userId, conversationId, agentId, err),
   }
   if (cfg.provider === 'remote-codex') {
-    return new RemoteCodexProvider(connectorDispatcher, connectorRegistry, { userId, conversationId, agentId })
+    const remote = new RemoteCodexProvider(connectorDispatcher, connectorRegistry, { userId, conversationId, agentId })
+    remote.onEvent(providerCfg.onEvent!)
+    remote.onError(providerCfg.onError!)
+    return remote
   }
   if (cfg.provider === 'codex') return new CodexProvider(providerCfg)
   if (cfg.provider === 'tmux') {
@@ -2311,10 +2318,16 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
   // Optimistically mark `delivered` then correct after-the-fact if send() rejects async.
   const delivered: string[] = []
   const failed: string[] = []
+  const errors: Record<string, string> = {}
   for (const target of targets) {
     const member = GROUP_ROSTER_BY_ID.get(target)
     if (!member || member.kind !== 'agent') {
       failed.push(target)
+      continue
+    }
+    if (AGENT_RUNTIMES[target]?.provider === 'remote-codex' && !connectorRegistry.isUserOnline(record.user_id)) {
+      failed.push(target)
+      errors[target] = 'CODEX_CONNECTOR_OFFLINE'
       continue
     }
     const provider = ensureProvider(record.user_id, record.conversation_id, target)
@@ -2350,6 +2363,7 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
   } else {
     record.delivery.delivered = delivered
     record.delivery.failed = failed
+    if (Object.keys(errors).length) record.delivery.errors = errors
   }
   saveGroupDelivery(record.id, record.delivery)
   return { delivered, failed }
@@ -2537,6 +2551,23 @@ function fetchCodexUsageCached(): any {
 
 type ConnectorSocketData = { deviceId: string | null; userId: string | null }
 
+function connectorWebsocketUrl(req: Request): string {
+  if (CONNECTOR_WS_URL) return CONNECTOR_WS_URL
+  if (AI_STUDIO_PUBLIC_URL) {
+    const configured = new URL(AI_STUDIO_PUBLIC_URL)
+    configured.protocol = configured.protocol === 'https:' ? 'wss:' : 'ws:'
+    configured.pathname = '/connector'
+    configured.search = ''
+    return configured.toString()
+  }
+  const incoming = new URL(req.url)
+  const forwardedProto = req.headers.get('x-forwarded-proto')?.split(',')[0]?.trim()
+  incoming.protocol = forwardedProto === 'https' || incoming.protocol === 'https:' ? 'wss:' : 'ws:'
+  incoming.pathname = '/connector'
+  incoming.search = ''
+  return incoming.toString()
+}
+
 // Image HTTP server for upload/download
 Bun.serve<ConnectorSocketData>({
   port: IMG_PORT,
@@ -2544,9 +2575,17 @@ Bun.serve<ConnectorSocketData>({
   // same wifi could hit the API. cloudflared connects from this host, so the
   // public tunnel keeps working; LAN devices that previously skipped auth lose
   // their backdoor.
-  hostname: '127.0.0.1',
+  hostname: SERVER_HOST,
   async fetch(req, server) {
     const url = new URL(req.url)
+    if (req.method === 'GET' && url.pathname === '/healthz') {
+      try {
+        db.prepare('SELECT 1 AS ok').get()
+        return Response.json({ ok: true, service: 'ai-studio-server' })
+      } catch {
+        return Response.json({ ok: false, error: 'database unavailable' }, { status: 503 })
+      }
+    }
     if (req.method === 'GET' && url.pathname === '/connector') {
       if (server.upgrade(req, { data: { deviceId: null, userId: null } })) return undefined
       return Response.json({ ok: false, error: 'websocket upgrade required' }, { status: 426 })
@@ -2596,7 +2635,7 @@ Bun.serve<ConnectorSocketData>({
           ok: true,
           device: paired.device,
           device_token: paired.deviceToken,
-          websocket_url: '/connector',
+          websocket_url: connectorWebsocketUrl(req),
           protocol_version: 1,
         }, { status: 201 })
       } catch (error: any) {
@@ -4598,7 +4637,7 @@ Bun.serve<ConnectorSocketData>({
     },
   },
 })
-process.stderr.write(`ai-collab: HTTP server on http://127.0.0.1:${IMG_PORT}\n`)
+process.stderr.write(`ai-collab: HTTP server on http://${SERVER_HOST}:${IMG_PORT}\n`)
 // AIC-129: warn when tmux provider is enabled — capture-pane reads raw terminal bytes,
 // strict sanitizer drops obvious secrets but cannot catch novel formats.
 for (const [agentId, cfg] of Object.entries(AGENT_RUNTIMES)) {

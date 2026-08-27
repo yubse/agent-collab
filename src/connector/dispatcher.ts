@@ -19,7 +19,7 @@ export class ConnectorDispatcher {
 
   dispatch(input: Omit<ExecutionRequest, 'type' | 'request_id' | 'created_at'>, timeoutMs = this.defaultTimeoutMs): Promise<ExecutionResult> {
     const connection = this.registry.forUser(input.user_id)
-    if (!connection) return Promise.reject(new Error('no online connector for current user'))
+    if (!connection) return Promise.reject(new Error('CODEX_CONNECTOR_OFFLINE: no online connector for current user'))
     const request: ExecutionRequest = {
       ...input,
       type: 'execution_request',
@@ -66,4 +66,3 @@ export class ConnectorDispatcher {
 
   pendingCount(): number { return this.pending.size }
 }
-

@@ -8,6 +8,9 @@ import { randomBytes } from 'crypto'
 // 2026-06-27. Fork now defaults to 3998 (the LAN dev port it already used).
 // Override with AICOLLAB_PORT if you actually want to mirror upstream.
 export const IMG_PORT = Number(process.env.AICOLLAB_PORT || 3998)
+export const SERVER_HOST = process.env.AICOLLAB_HOST || '127.0.0.1'
+export const AI_STUDIO_PUBLIC_URL = (process.env.AI_STUDIO_PUBLIC_URL || '').replace(/\/$/, '')
+export const CONNECTOR_WS_URL = process.env.CONNECTOR_WS_URL || ''
 export const SOURCE = 'ai-collab'
 // AUTH_TOKEN resolution order (open-source onboarding without manual setup):
 //   1. AICOLLAB_AUTH_TOKEN env (≥ 16 chars) — explicit, recommended for LAN / tunnel deployments
@@ -17,7 +20,8 @@ export const SOURCE = 'ai-collab'
 export const AUTH_TOKEN = (() => {
   // config.ts lives at <plugin>/src/config.ts → parent of import.meta.dir is the plugin root.
   const pluginRoot = path.dirname(import.meta.dir)
-  const tokenFile = path.join(pluginRoot, 'runtime-data', 'state', 'token.txt')
+  const runtimeRoot = process.env.AICOLLAB_DATA_DIR || path.join(pluginRoot, 'runtime-data')
+  const tokenFile = path.join(runtimeRoot, 'state', 'token.txt')
   const fromEnv = process.env.AICOLLAB_AUTH_TOKEN
 
   // Helper: ensure tokenFile contains `t` (idempotent so env-mode and file-mode end up
@@ -185,7 +189,7 @@ export function legacyImageDir(pluginDir: string) {
 }
 
 export function chatDbPath(pluginDir: string) {
-  return path.join(runtimeStateDir(pluginDir), 'chat.db')
+  return process.env.AICOLLAB_DATABASE_PATH || path.join(runtimeStateDir(pluginDir), 'chat.db')
 }
 
 export function legacyChatDbPath(pluginDir: string) {

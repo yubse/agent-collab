@@ -51,6 +51,18 @@ const APPROVAL_ACCEPTING_METHODS = new Set([
   'applyPatchApproval',
 ])
 
+// Codex stderr can contain paths, HTTP headers, or echoed environment values. Keep
+// diagnostics useful without ever forwarding credential material to Connector logs.
+export function sanitizeCodexDiagnostic(value: string): string {
+  return value
+    .replace(/(?:Bearer\s+)[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9._-]{12,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, '[REDACTED]')
+    .replace(/(?:access[_ -]?token|refresh[_ -]?token|session[_ -]?secret|device[_ -]?token|password|credential)\s*[:=]\s*\S+/gi, '[REDACTED]')
+    .replace(/([?&](?:token|key|secret|code)=)[^&\s"]+/gi, '$1[REDACTED]')
+    .replace(/\S*auth\.json\S*/gi, '[REDACTED_PATH]')
+    .slice(0, 500)
+}
+
 export class CodexProvider implements AgentProvider {
   private cfg: AgentProviderConfig
   private proc: Subprocess<'pipe', 'pipe', 'pipe'> | null = null
@@ -68,6 +80,7 @@ export class CodexProvider implements AgentProvider {
   private _pending = new Map<number, PendingRequest>()
   private eventCb: ((ev: AgentEvent) => void | Promise<void>) | null = null
   private errorCb: ((err: AgentError) => void) | null = null
+  private diagnosticCb: AgentProviderConfig['onDiagnostic'] = null
   private label: string
 
   constructor(cfg: AgentProviderConfig) {
@@ -75,6 +88,7 @@ export class CodexProvider implements AgentProvider {
     this.label = cfg.label || 'codex'
     if (cfg.onEvent) this.eventCb = cfg.onEvent
     if (cfg.onError) this.errorCb = cfg.onError
+    if (cfg.onDiagnostic) this.diagnosticCb = cfg.onDiagnostic
     // Persisted session_id maps to threadId for codex (resume across server restarts).
     const persisted = this._loadPersistedSessionId()
     if (persisted) this._threadId = persisted
@@ -179,6 +193,7 @@ export class CodexProvider implements AgentProvider {
 
       this.proc.exited.then((code) => {
         const signal = (this.proc as any)?.signalCode ?? null
+        this.diagnosticCb?.({ stream: 'process', message: `exited signal=${signal ?? 'none'}`, exitCode: code })
         if ((code !== null && code !== 0) || signal) {
           this.errorCb?.({
             kind: 'process_exited',
@@ -332,10 +347,12 @@ export class CodexProvider implements AgentProvider {
             // The "panic" / "thread '...' panicked" / "fatal:" prefixes are the ones worth
             // surfacing. Anything else stays as console.error for debug visibility but
             // doesn't emit AgentError (would spam callers).
+            const safeLine = sanitizeCodexDiagnostic(line)
+            this.diagnosticCb?.({ stream: 'stderr', message: safeLine })
             if (/panic|fatal:|thread '.*' panicked|error:/i.test(line)) {
-              this.errorCb?.({ kind: 'protocol_error', message: `${this.label} stderr: ${line}`, raw: line })
-            } else {
-              console.error(this.label, 'stderr:', line)
+              this.errorCb?.({ kind: 'protocol_error', message: `${this.label} stderr: ${safeLine}`, raw: safeLine })
+            } else if (!this.diagnosticCb) {
+              console.error(this.label, 'stderr:', safeLine)
             }
           }
           nl = this.stderrBuf.indexOf('\n')
