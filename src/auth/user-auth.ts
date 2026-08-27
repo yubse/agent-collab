@@ -5,6 +5,15 @@ import { LEGACY_ADMIN_ID } from '../db/migrations.ts'
 export const SESSION_COOKIE = 'aicollab_session'
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
+// Trusted LAN MVP only: anyone who can reach the selector can choose one of
+// these profiles. The selected id is still exchanged for a server-side
+// session; downstream APIs never trust a user_id supplied by the browser.
+export const TRUSTED_LAN_PROFILES = [
+  { username: 'wenyi', displayName: '文一' },
+  { username: 'tina', displayName: 'Tina' },
+  { username: 'liuting', displayName: '刘婷' },
+] as const
+
 export type AuthenticatedUser = {
   id: string
   tenant_id: string
@@ -12,6 +21,8 @@ export type AuthenticatedUser = {
   display_name: string
   role: 'admin' | 'user'
 }
+
+export type SelectableProfile = Pick<AuthenticatedUser, 'id' | 'display_name'>
 
 export function hashSecret(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex')
@@ -50,6 +61,51 @@ export async function createUser(
   return user
 }
 
+export async function ensureDefaultProfiles(db: Database): Promise<AuthenticatedUser[]> {
+  const profiles: AuthenticatedUser[] = []
+  for (const profile of TRUSTED_LAN_PROFILES) {
+    let user = db.prepare(`SELECT id, tenant_id, username, display_name, role
+      FROM users WHERE username=? AND role='user'`).get(profile.username) as AuthenticatedUser | null
+    if (!user) {
+      // The random password is deliberately never exposed or stored outside
+      // its Argon2 hash. These accounts are entered through select-profile.
+      user = await createUser(db, {
+        username: profile.username,
+        displayName: profile.displayName,
+        password: randomBytes(32).toString('base64url'),
+      })
+    } else if (user.display_name !== profile.displayName) {
+      db.run(`UPDATE users SET display_name=?, updated_at=? WHERE id=?`, [
+        profile.displayName,
+        new Date().toISOString(),
+        user.id,
+      ])
+      user = { ...user, display_name: profile.displayName }
+    }
+    profiles.push(user)
+  }
+  return profiles
+}
+
+export function listSelectableProfiles(db: Database): SelectableProfile[] {
+  const rows = db.prepare(`SELECT id, username, display_name FROM users
+    WHERE role='user' AND username IN (${TRUSTED_LAN_PROFILES.map(() => '?').join(', ')})`)
+    .all(...TRUSTED_LAN_PROFILES.map(profile => profile.username)) as Array<SelectableProfile & { username: string }>
+  const byUsername = new Map(rows.map(row => [row.username, row]))
+  return TRUSTED_LAN_PROFILES.flatMap(profile => {
+    const user = byUsername.get(profile.username)
+    return user ? [{ id: user.id, display_name: user.display_name }] : []
+  })
+}
+
+export function selectableProfileById(db: Database, profileId: string): AuthenticatedUser | null {
+  if (!profileId) return null
+  const user = db.prepare(`SELECT id, tenant_id, username, display_name, role FROM users
+    WHERE id=? AND role='user' AND username IN (${TRUSTED_LAN_PROFILES.map(() => '?').join(', ')})`)
+    .get(profileId, ...TRUSTED_LAN_PROFILES.map(profile => profile.username)) as AuthenticatedUser | null
+  return user || null
+}
+
 export async function ensureLegacyAdminPassword(db: Database, password?: string): Promise<string | null> {
   const row = db.prepare(`SELECT password_hash FROM users WHERE id=?`).get(LEGACY_ADMIN_ID) as any
   if (!row || row.password_hash !== '!bootstrap-required!') return null
@@ -79,8 +135,9 @@ export function createSession(db: Database, userId: string, ttlMs = SESSION_TTL_
   return { token, expiresAt }
 }
 
-export function sessionCookie(token: string, secure: boolean): string {
-  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}${secure ? '; Secure' : ''}`
+export function sessionCookie(token: string, secure: boolean, remember = true): string {
+  const persistence = remember ? `; Max-Age=${SESSION_TTL_MS / 1000}` : ''
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax${persistence}${secure ? '; Secure' : ''}`
 }
 
 export function clearSessionCookie(secure: boolean): string {

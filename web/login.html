@@ -1,60 +1,101 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>AI Studio 登录</title>
+<title>AI Studio · 选择身份</title>
 <style>
   :root { color-scheme: light; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
   * { box-sizing: border-box; }
   body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5efe5; color: #24201b; }
-  main { width: min(420px, calc(100vw - 32px)); padding: 36px; border: 1px solid #dccfbe; border-radius: 22px; background: rgba(255,255,255,.84); box-shadow: 0 24px 70px rgba(72,50,28,.12); }
-  h1 { margin: 0 0 8px; font-size: 28px; }
-  p { margin: 0 0 26px; color: #7a6e60; }
-  label { display: block; margin: 14px 0 6px; font-size: 14px; color: #655a4e; }
-  input { width: 100%; border: 1px solid #d8c9b7; border-radius: 12px; padding: 12px 14px; font: inherit; background: #fffdf9; }
-  button { width: 100%; margin-top: 22px; border: 0; border-radius: 12px; padding: 13px; font: inherit; font-weight: 700; color: white; background: #df7c50; cursor: pointer; }
-  button:disabled { opacity: .55; cursor: wait; }
-  #error { min-height: 20px; margin-top: 12px; color: #b54236; font-size: 14px; }
+  main { width: min(460px, calc(100vw - 32px)); padding: 38px; border: 1px solid #dccfbe; border-radius: 24px; background: rgba(255,255,255,.86); box-shadow: 0 24px 70px rgba(72,50,28,.12); }
+  h1 { margin: 0 0 7px; font-size: 29px; letter-spacing: -.02em; }
+  .subtitle { margin: 0 0 24px; color: #7a6e60; }
+  #profiles { display: grid; gap: 11px; }
+  .profile { width: 100%; min-height: 68px; border: 1px solid #d8c9b7; border-radius: 15px; padding: 12px 15px; display: flex; align-items: center; gap: 14px; color: #24201b; background: #fffdf9; cursor: pointer; text-align: left; font: inherit; transition: border-color .15s, transform .15s, box-shadow .15s; }
+  .profile:hover { border-color: #df7c50; transform: translateY(-1px); box-shadow: 0 7px 20px rgba(72,50,28,.09); }
+  .profile:focus-visible { outline: 3px solid rgba(223,124,80,.24); border-color: #df7c50; }
+  .profile:disabled { opacity: .55; cursor: wait; transform: none; }
+  .initial { width: 42px; height: 42px; border-radius: 13px; display: grid; place-items: center; flex: none; background: #f2dfd2; color: #a75031; font-weight: 750; }
+  .name { font-size: 16px; font-weight: 700; }
+  .arrow { margin-left: auto; color: #a69786; font-size: 21px; }
+  .remember { margin-top: 18px; display: flex; align-items: center; gap: 9px; color: #655a4e; font-size: 14px; cursor: pointer; user-select: none; }
+  .remember input { width: 17px; height: 17px; accent-color: #df7c50; }
+  #status { min-height: 21px; margin-top: 13px; color: #b54236; font-size: 13px; }
+  .notice { margin: 18px 0 0; padding-top: 15px; border-top: 1px solid #eee4d7; color: #9a8d7d; font-size: 11.5px; line-height: 1.55; }
 </style>
 </head>
 <body>
-<main>
-  <h1>AI Studio</h1>
-  <p>使用你的公司账号登录</p>
-  <form id="loginForm">
-    <label for="username">用户名</label>
-    <input id="username" name="username" autocomplete="username" required autofocus />
-    <label for="password">密码</label>
-    <input id="password" name="password" type="password" autocomplete="current-password" required />
-    <button id="submit" type="submit">登录</button>
-    <div id="error" role="alert"></div>
-  </form>
+<main aria-labelledby="title">
+  <h1 id="title">AI Studio</h1>
+  <p class="subtitle">请选择身份</p>
+  <div id="profiles" aria-live="polite"></div>
+  <label class="remember"><input id="remember" type="checkbox" />记住此设备（30 天）</label>
+  <div id="status" role="alert"></div>
+  <p class="notice">Trusted LAN MVP：仅适用于可信局域网。能访问此页面的人可以选择任一身份，数据访问仍由服务端 Session 隔离。</p>
 </main>
 <script>
-const form = document.getElementById('loginForm')
-form.addEventListener('submit', async (event) => {
-  event.preventDefault()
-  const submit = document.getElementById('submit')
-  const error = document.getElementById('error')
-  submit.disabled = true
-  error.textContent = ''
+const profilesEl = document.getElementById('profiles')
+const statusEl = document.getElementById('status')
+const rememberEl = document.getElementById('remember')
+
+function destination() {
+  const next = new URLSearchParams(location.search).get('next')
+  return next && next.startsWith('/') && !next.startsWith('//')
+    ? next
+    : '/web/workgroup-v2/index.html'
+}
+
+function escapeHtml(value) {
+  return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')
+}
+
+async function enter(profileId) {
+  const buttons = [...profilesEl.querySelectorAll('button')]
+  buttons.forEach(button => { button.disabled = true })
+  statusEl.textContent = ''
   try {
-    const response = await fetch('/api/auth/login', {
+    const response = await fetch('/api/auth/select-profile', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: form.username.value, password: form.password.value }),
+      body: JSON.stringify({ profile_id: profileId, remember: rememberEl.checked }),
     })
     const data = await response.json()
-    if (!response.ok) throw new Error(data.error || '登录失败')
-    const next = new URLSearchParams(location.search).get('next')
-    location.replace(next && next.startsWith('/') && !next.startsWith('//') ? next : '/web/workgroup-v2/index.html')
+    if (!response.ok) throw new Error(data.error || '无法进入该用户空间')
+    location.replace(destination())
   } catch (cause) {
-    error.textContent = cause instanceof Error ? cause.message : '登录失败'
-  } finally {
-    submit.disabled = false
+    statusEl.textContent = cause instanceof Error ? cause.message : '无法进入该用户空间'
+    buttons.forEach(button => { button.disabled = false })
   }
+}
+
+async function boot() {
+  try {
+    const current = await fetch('/api/auth/me', { cache: 'no-store' })
+    if (current.ok) {
+      location.replace(destination())
+      return
+    }
+    const response = await fetch('/api/auth/profiles', { cache: 'no-store' })
+    const profiles = await response.json()
+    if (!response.ok || !Array.isArray(profiles)) throw new Error('身份列表加载失败')
+    profilesEl.innerHTML = profiles.map(profile => `
+      <button class="profile" type="button" data-profile-id="${escapeHtml(profile.id)}">
+        <span class="initial">${escapeHtml(String(profile.display_name).trim().slice(0, 1))}</span>
+        <span class="name">${escapeHtml(profile.display_name)}</span>
+        <span class="arrow" aria-hidden="true">›</span>
+      </button>`).join('')
+    if (!profiles.length) statusEl.textContent = '暂无可选择的身份'
+  } catch (cause) {
+    statusEl.textContent = cause instanceof Error ? cause.message : '身份列表加载失败'
+  }
+}
+
+profilesEl.addEventListener('click', event => {
+  const button = event.target.closest('[data-profile-id]')
+  if (button) enter(button.dataset.profileId)
 })
+boot()
 </script>
 </body>
 </html>

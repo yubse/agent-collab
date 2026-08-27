@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { runMigrations } from '../db/migrations.ts'
-import { createSession, createUser, authenticatedUser } from '../auth/user-auth.ts'
+import {
+  authenticatedUser,
+  createSession,
+  createUser,
+  ensureDefaultProfiles,
+  listSelectableProfiles,
+} from '../auth/user-auth.ts'
 import { UserRepository } from './user-repository.ts'
 
 let db: Database
@@ -30,6 +36,13 @@ async function users() {
 }
 
 describe('user ownership isolation', () => {
+  test('default profile seeding is idempotent and keeps stable ids', async () => {
+    const first = await ensureDefaultProfiles(db)
+    const second = await ensureDefaultProfiles(db)
+    expect(second.map(user => user.id)).toEqual(first.map(user => user.id))
+    expect(listSelectableProfiles(db)).toEqual(first.map(user => ({ id: user.id, display_name: user.display_name })))
+  })
+
   test('test_user_cannot_read_other_conversation', async () => {
     const { a, b } = await users()
     db.run(`INSERT INTO group_conversations (id,name,created_at,created_by,is_default,user_id) VALUES ('conv-a','A','2026-01-01','admin',0,?)`, [a.id])
@@ -59,4 +72,3 @@ describe('user ownership isolation', () => {
     expect(authenticatedUser(db, req)?.id).toBe(a.id)
   })
 })
-

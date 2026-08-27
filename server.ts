@@ -58,8 +58,11 @@ import {
   clearSessionCookie,
   createSession,
   createUser,
+  ensureDefaultProfiles,
   ensureLegacyAdminPassword,
+  listSelectableProfiles,
   revokeSession,
+  selectableProfileById,
   sessionCookie,
   type AuthenticatedUser,
 } from './src/auth/user-auth.ts'
@@ -391,6 +394,7 @@ db.run(`CREATE TABLE IF NOT EXISTS actor_theme_styles (
 // Versioned, idempotent multi-user migration. It runs only after every legacy
 // table exists so old databases can be upgraded in-place without data loss.
 runMigrations(db)
+await ensureDefaultProfiles(db)
 const userRepo = new UserRepository(db)
 const connectorRegistry = new ConnectorRegistry()
 const connectorDispatcher = new ConnectorDispatcher(connectorRegistry)
@@ -2613,7 +2617,8 @@ Bun.serve<ConnectorSocketData>({
     const currentUser = authenticatedUser(db, req)
     const isSecureRequest = url.protocol === 'https:' || req.headers.get('x-forwarded-proto') === 'https'
     const publicPath = url.pathname === '/web/login.html'
-      || (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login' || url.pathname === '/api/auth/bootstrap'))
+      || (req.method === 'GET' && url.pathname === '/api/auth/profiles')
+      || (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login' || url.pathname === '/api/auth/bootstrap' || url.pathname === '/api/auth/select-profile' || url.pathname === '/api/auth/logout'))
       || (req.method === 'POST' && url.pathname === '/api/connectors/pair')
       || (req.method === 'POST' && url.pathname === '/api/agent-statusline' && isLocalRequestHost(url.hostname))
 
@@ -2644,6 +2649,32 @@ Bun.serve<ConnectorSocketData>({
       } catch {
         return Response.json({ ok: false, error: 'bad request' }, { status: 400 })
       }
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/auth/profiles') {
+      return Response.json(listSelectableProfiles(db))
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/auth/select-profile') {
+      try {
+        const body = await req.json() as any
+        const user = selectableProfileById(db, String(body.profile_id || ''))
+        if (!user) return Response.json({ ok: false, error: 'profile not allowed' }, { status: 403 })
+        const session = createSession(db, user.id)
+        return Response.json({
+          ok: true,
+          user: { id: user.id, display_name: user.display_name },
+        }, {
+          headers: { 'Set-Cookie': sessionCookie(session.token, isSecureRequest, body.remember === true) },
+        })
+      } catch {
+        return Response.json({ ok: false, error: 'bad request' }, { status: 400 })
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
+      revokeSession(db, req)
+      return Response.json({ ok: true }, { headers: { 'Set-Cookie': clearSessionCookie(isSecureRequest) } })
     }
 
     if (req.method === 'POST' && url.pathname === '/api/connectors/pair') {
@@ -2706,11 +2737,7 @@ Bun.serve<ConnectorSocketData>({
     }
 
     if (req.method === 'GET' && url.pathname === '/api/auth/me' && currentUser) {
-      return Response.json({ ok: true, user: currentUser })
-    }
-    if (req.method === 'POST' && url.pathname === '/api/auth/logout' && currentUser) {
-      revokeSession(db, req)
-      return Response.json({ ok: true }, { headers: { 'Set-Cookie': clearSessionCookie(isSecureRequest) } })
+      return Response.json({ ok: true, user: { id: currentUser.id, display_name: currentUser.display_name } })
     }
 
     // /, /web, /web/ 全 redirect 到 workgroup-v2 主入口（防外网书签 404）
