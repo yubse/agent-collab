@@ -6,6 +6,7 @@
   "license": "MIT",
   "author": "agent-collab contributors",
   "scripts": {
+    "dev": "bun --watch server.ts",
     "start": "bun server.ts",
     "test": "bun test",
     "test:integration": "bun test src/connector/server-closure.integration.test.ts",

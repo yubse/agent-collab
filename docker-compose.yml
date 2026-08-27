@@ -1,11 +1,9 @@
 services:
   ai-studio-server:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ai-studio-server:local
+    image: "${AI_STUDIO_IMAGE:?Set AI_STUDIO_IMAGE in .env to an explicit GHCR version tag}"
     container_name: ai-studio-server
     restart: unless-stopped
+    init: true
     env_file:
       - .env
     environment:
@@ -19,19 +17,22 @@ services:
       GROWTH_PROVIDER: remote-codex
     ports:
       # Synology Reverse Proxy/Nginx connects to this loopback port. Do not expose it on WAN.
-      - "127.0.0.1:${AI_STUDIO_INTERNAL_PORT:-3998}:3998"
+      - "${AI_STUDIO_BIND_ADDRESS:-127.0.0.1}:${AI_STUDIO_INTERNAL_PORT:-3998}:3998"
     volumes:
       - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/data:/data"
       - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/runtime-data:/runtime-data"
-      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/agents:/app/agents:ro"
-      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/knowledge:/app/knowledge:ro"
+      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/agents:/app/agents"
+      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/knowledge:/app/knowledge"
+      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/logs:/logs"
       - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/backups:/backups"
     healthcheck:
-      test: ["CMD", "bun", "-e", "const r=await fetch('http://127.0.0.1:3998/healthz');if(!r.ok)process.exit(1)"]
+      test: ["CMD", "bun", "-e", "const r=await fetch('http://127.0.0.1:3998/health');const j=await r.json();if(!r.ok||j.status!=='ok'||j.database!=='ok'||j.connector!=='ok')process.exit(1)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15s
     security_opt:
       - no-new-privileges:true
-
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s

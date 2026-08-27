@@ -2,16 +2,15 @@ FROM oven/bun:1.4.0-slim
 
 WORKDIR /app
 
-COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
+COPY --chown=bun:bun package.json bun.lock ./
+RUN bun install --production --frozen-lockfile
 
-COPY server.ts TECHNICAL.md README.md ./
-COPY src ./src
-COPY web ./web
-COPY agents ./agents
+COPY --chown=bun:bun server.ts ./
+COPY --chown=bun:bun src ./src
+COPY --chown=bun:bun web ./web
 
-RUN mkdir -p /data /runtime-data /app/knowledge /backups \
-  && chown -R bun:bun /app /data /runtime-data /backups
+RUN mkdir -p /data /runtime-data /app/agents /app/knowledge /app/images /logs /backups \
+  && chown -R bun:bun /app /data /runtime-data /logs /backups
 
 USER bun
 

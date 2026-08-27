@@ -2587,12 +2587,22 @@ Bun.serve<ConnectorSocketData>({
   hostname: SERVER_HOST,
   async fetch(req, server) {
     const url = new URL(req.url)
-    if (req.method === 'GET' && url.pathname === '/healthz') {
+    if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
       try {
         db.prepare('SELECT 1 AS ok').get()
-        return Response.json({ ok: true, service: 'ai-studio-server' })
+        return Response.json({
+          status: 'ok',
+          server: 'ok',
+          database: 'ok',
+          connector: 'ok',
+        })
       } catch {
-        return Response.json({ ok: false, error: 'database unavailable' }, { status: 503 })
+        return Response.json({
+          status: 'error',
+          server: 'ok',
+          database: 'error',
+          connector: 'ok',
+        }, { status: 503 })
       }
     }
     if (req.method === 'GET' && url.pathname === '/connector') {

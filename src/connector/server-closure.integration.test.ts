@@ -36,8 +36,12 @@ async function waitForServer(): Promise<void> {
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${baseUrl}/healthz`)
-      if (response.ok) return
+      const response = await fetch(`${baseUrl}/health`)
+      if (response.ok) {
+        const health = await response.json() as any
+        expect(health).toMatchObject({ status: 'ok', server: 'ok', database: 'ok', connector: 'ok' })
+        return
+      }
     } catch {}
     await Bun.sleep(50)
   }

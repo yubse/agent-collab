@@ -80,10 +80,11 @@ Claude Code 和 Codex CLI 都走 stream-json。tmux provider 是给已经有 tmu
 Server 需要 [Bun](https://bun.sh) 1.0+。Remote Connector 模式下，Server 不需要安装或登录 Codex；Codex CLI 只安装在每位用户自己的电脑。
 
 ```bash
-git clone https://github.com/20Totodile/agent-collab.git
+git clone https://github.com/yubse/agent-collab.git
 cd agent-collab
+bun install
 export AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD='至少十位的初始密码'
-bun server.ts
+bun run dev
 ```
 
 打开 `http://localhost:3998/`，使用 `admin` 和初始密码登录。首次迁移后应移除 `AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD`；数据库只保存 Argon2id hash。
@@ -100,7 +101,7 @@ bun run start
 
 在 Web 的“设置 → Codex Connector → 添加设备”生成一次性配对码。Connector 只把完整执行结果返回 Server，不上传 Codex `auth.json`、access token 或 refresh token。
 
-群晖 NAS 的 Docker 配置见 [deploy/nas/README.md](deploy/nas/README.md)。NAS 只运行 Server，默认只把容器端口绑定到宿主机 `127.0.0.1:3998`，由群晖反向代理提供局域网 HTTP/HTTPS 与 WebSocket 入口。
+群晖 NAS 的 GHCR 拉取部署见 [docs/NAS_DEPLOYMENT.md](docs/NAS_DEPLOYMENT.md)。正式镜像由 GitHub Actions 在 tests、typecheck、Server build 全部通过后构建并推送；NAS 的 Compose 没有 `build:`，只拉取固定版本镜像并运行。
 
 验证：
 
@@ -109,6 +110,14 @@ bun run check
 bun test
 bun run test:integration
 ```
+
+日常本机流程是 `bun install` → `bun run dev` → `bun test` → commit → push，不要求本机 Docker。只有排查 Dockerfile 或 CI 构建问题时才运行：
+
+```bash
+docker build -t ai-studio:test .
+```
+
+push 到 `main` 会发布 GHCR 的 `latest` 与完整 commit SHA tag；push `v*` tag 会发布对应正式版本。NAS 应使用 `ghcr.io/<owner>/<repo>:vX.Y.Z`，不要永久追踪 `latest`。
 
 ## 架构
 
