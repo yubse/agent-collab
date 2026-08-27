@@ -175,6 +175,9 @@ export class CodexProvider implements AgentProvider {
       const spawnOpts: any = {
         cmd: [codexBin, ...args],
         stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+        // Keep the Connector user's network/auth/runtime environment intact.
+        // In particular, never replace proxy, PATH, HOME, or CODEX_HOME here.
+        env: { ...process.env },
       }
       if (this.cfg.cwd) spawnOpts.cwd = this.cfg.cwd
 

@@ -11,7 +11,8 @@
     "test:integration": "bun test src/connector/server-closure.integration.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun build server.ts --target=bun --outdir /tmp/agent-collab-server-check && bun build connector/src/index.ts --target=bun --outdir /tmp/agent-collab-connector-check",
-    "connector": "bun connector/src/index.ts"
+    "connector": "bun connector/src/index.ts",
+    "doctor": "bun connector/src/doctor.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.4.0",

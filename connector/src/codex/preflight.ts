@@ -9,7 +9,11 @@ export class CodexPreflightError extends Error {
 
 type SpawnSyncLike = (command: string[]) => { exitCode: number; stdout: Uint8Array; stderr: Uint8Array }
 
-const defaultSpawn: SpawnSyncLike = (command) => Bun.spawnSync(command, { stdout: 'pipe', stderr: 'pipe' }) as any
+const defaultSpawn: SpawnSyncLike = (command) => Bun.spawnSync(command, {
+  stdout: 'pipe',
+  stderr: 'pipe',
+  env: { ...process.env },
+}) as any
 
 export type CodexPreflightResult = { version: string; login: 'ready' }
 

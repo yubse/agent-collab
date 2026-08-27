@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "bun src/index.ts",
+    "doctor": "bun src/doctor.ts",
     "check": "bun build src/index.ts --target=bun --outdir /tmp/ai-studio-connector-check"
   }
 }
-
