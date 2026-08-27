@@ -8,6 +8,9 @@ import { randomBytes } from 'crypto'
 // 2026-06-27. Fork now defaults to 3998 (the LAN dev port it already used).
 // Override with AICOLLAB_PORT if you actually want to mirror upstream.
 export const IMG_PORT = Number(process.env.AICOLLAB_PORT || 3998)
+export const SERVER_HOST = process.env.AICOLLAB_HOST || '127.0.0.1'
+export const AI_STUDIO_PUBLIC_URL = (process.env.AI_STUDIO_PUBLIC_URL || '').replace(/\/$/, '')
+export const CONNECTOR_WS_URL = process.env.CONNECTOR_WS_URL || ''
 export const SOURCE = 'ai-collab'
 // AUTH_TOKEN resolution order (open-source onboarding without manual setup):
 //   1. AICOLLAB_AUTH_TOKEN env (≥ 16 chars) — explicit, recommended for LAN / tunnel deployments
@@ -17,7 +20,8 @@ export const SOURCE = 'ai-collab'
 export const AUTH_TOKEN = (() => {
   // config.ts lives at <plugin>/src/config.ts → parent of import.meta.dir is the plugin root.
   const pluginRoot = path.dirname(import.meta.dir)
-  const tokenFile = path.join(pluginRoot, 'runtime-data', 'state', 'token.txt')
+  const runtimeRoot = process.env.AICOLLAB_DATA_DIR || path.join(pluginRoot, 'runtime-data')
+  const tokenFile = path.join(runtimeRoot, 'state', 'token.txt')
   const fromEnv = process.env.AICOLLAB_AUTH_TOKEN
 
   // Helper: ensure tokenFile contains `t` (idempotent so env-mode and file-mode end up
@@ -64,10 +68,10 @@ export const AGENT2_PROJECT_DIR = process.env.AGENT2_PROJECT_DIR || ''
 //   'tmux'   — tmux capture-pane / send-keys (opt-in; capture output is raw terminal bytes,
 //              capture-pane sanitizer strips obvious secrets — see src/providers/tmux.ts)
 // New providers added in future just extend the union — see src/providers/*.ts.
-export type AgentProviderKind = 'claude' | 'codex' | 'tmux'
+export type AgentProviderKind = 'claude' | 'codex' | 'tmux' | 'remote-codex'
 function parseProvider(raw: string | undefined, fallback: AgentProviderKind): AgentProviderKind {
   const v = (raw || '').toLowerCase()
-  if (v === 'claude' || v === 'codex' || v === 'tmux') return v
+  if (v === 'claude' || v === 'codex' || v === 'tmux' || v === 'remote-codex') return v
   return fallback
 }
 export const AGENT1_PROVIDER: AgentProviderKind = parseProvider(process.env.AGENT1_PROVIDER, 'claude')
@@ -131,6 +135,27 @@ function parseFilterModeEnv(raw: string | undefined): 'strict' | 'loose' | 'off'
 }
 export const AGENT1_TMUX_FILTER_MODE = parseFilterModeEnv(process.env.AGENT1_TMUX_FILTER_MODE)
 export const AGENT2_TMUX_FILTER_MODE = parseFilterModeEnv(process.env.AGENT2_TMUX_FILTER_MODE)
+
+// Role-named runtimes used by the brand/marketing workgroup. Keeping this loader
+// generic makes the roster extensible without adding another block of exported
+// constants every time a specialist is introduced.
+export function loadAgentRuntimeEnv(prefix: string, fallbackProvider: AgentProviderKind = 'remote-codex') {
+  const key = prefix.toUpperCase().replace(/[^A-Z0-9]+/g, '_')
+  return {
+    provider: parseProvider(process.env[`${key}_PROVIDER`], fallbackProvider),
+    binaryPath: process.env[`${key}_BINARY_PATH`] || '',
+    cwd: process.env[`${key}_CWD`] || '',
+    extraArgs: parseExtraArgs(process.env[`${key}_EXTRA_ARGS`]),
+    tmuxSession: process.env[`${key}_TMUX_SESSION`] || defaultTmuxSession(),
+    tmuxSocket: process.env[`${key}_TMUX_SOCKET`] || '',
+    tmuxCaptureIntervalMs: parseIntervalMs(process.env[`${key}_TMUX_CAPTURE_INTERVAL_MS`], 5000),
+    tmuxFilterMode: parseFilterModeEnv(process.env[`${key}_TMUX_FILTER_MODE`]),
+    tmuxQuietMs: parseIntervalMs(process.env[`${key}_TMUX_QUIET_MS`], 30_000),
+    heartbeatPath: process.env[`${key}_HEARTBEAT_PATH`] || '',
+    projectDir: process.env[`${key}_PROJECT_DIR`] || '',
+    promptPath: process.env[`${key}_PROMPT_PATH`] || '',
+  }
+}
 // Optional agent startup script.
 export const AGENT1_CLOCK_IN_SCRIPT = process.env.AGENT1_CLOCK_IN_SCRIPT || ''
 export const SERVER_STARTED_AT = new Date().toISOString()
@@ -144,7 +169,7 @@ export function agentRoot(pluginDir: string) {
 }
 
 export function runtimeDataRoot(pluginDir: string) {
-  return path.join(pluginDir, 'runtime-data')
+  return process.env.AICOLLAB_DATA_DIR || path.join(pluginDir, 'runtime-data')
 }
 
 export function runtimeStateDir(pluginDir: string) {
@@ -164,7 +189,7 @@ export function legacyImageDir(pluginDir: string) {
 }
 
 export function chatDbPath(pluginDir: string) {
-  return path.join(runtimeStateDir(pluginDir), 'chat.db')
+  return process.env.AICOLLAB_DATABASE_PATH || path.join(runtimeStateDir(pluginDir), 'chat.db')
 }
 
 export function legacyChatDbPath(pluginDir: string) {

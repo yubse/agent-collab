@@ -1,6 +1,6 @@
 # Agent-collab
 
-让多个 AI agent 在一个平台上按流程协作。目前支持 Claude Code 和 Codex CLI。
+公司内部多用户 AI Studio：共享多 Agent 定义，同时隔离每个用户的对话、消息、任务、Memory 和 Codex Connector。保留本地 Claude Code / Codex Provider 作为开发兼容模式。
 
 ## 为什么做这个
 
@@ -77,39 +77,66 @@ Claude Code 和 Codex CLI 都走 stream-json。tmux provider 是给已经有 tmu
 
 ## 快速开始
 
-需要 [Bun](https://bun.sh) 1.0+ 和至少一个 CLI agent（[Claude Code](https://claude.com/claude-code) 或 [Codex CLI](https://github.com/openai/codex)）。
+Server 需要 [Bun](https://bun.sh) 1.0+。Remote Connector 模式下，Server 不需要安装或登录 Codex；Codex CLI 只安装在每位用户自己的电脑。
 
 ```bash
-git clone https://github.com/20Totodile/agent-collab.git
+git clone https://github.com/yubse/agent-collab.git
 cd agent-collab
 bun install
-
-# 指定 agent 的工作目录
-export AGENT1_CWD="/path/to/agent1/workspace"
-export AGENT2_CWD="/path/to/agent2/workspace"
-
-bun server.ts
+export AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD='至少十位的初始密码'
+bun run dev
 ```
 
-打开 `http://localhost:3009/web/workgroup-v2/index.html`，浏览器会自动登录。
+打开 `http://localhost:3998/`，使用 `admin` 和初始密码登录。首次迁移后应移除 `AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD`；数据库只保存 Argon2id hash。
+
+默认四个 Agent 使用 `remote-codex`。共享人设保存在 Server，可用 `PRODUCT_PROMPT_PATH`、`CREATIVE_PROMPT_PATH`、`SOCIAL_PROMPT_PATH`、`GROWTH_PROMPT_PATH` 指向对应 `AGENTS.md`。开发时仍可显式使用 `PRODUCT_PROVIDER=codex` 或 `claude`。
+
+用户电脑安装 Bun 和 Codex CLI、完成 `codex login` 后：
+
+```bash
+cd connector
+export AI_STUDIO_SERVER_URL="https://studio.example.com"
+bun run start
+```
+
+在 Web 的“设置 → Codex Connector → 添加设备”生成一次性配对码。Connector 只把完整执行结果返回 Server，不上传 Codex `auth.json`、access token 或 refresh token。
+
+群晖 NAS 的 GHCR 拉取部署见 [docs/NAS_DEPLOYMENT.md](docs/NAS_DEPLOYMENT.md)。正式镜像由 GitHub Actions 在 tests、typecheck、Server build 全部通过后构建并推送；NAS 的 Compose 没有 `build:`，只拉取固定版本镜像并运行。
+
+验证：
+
+```bash
+bun run check
+bun test
+bun run test:integration
+```
+
+日常本机流程是 `bun install` → `bun run dev` → `bun test` → commit → push，不要求本机 Docker。只有排查 Dockerfile 或 CI 构建问题时才运行：
+
+```bash
+docker build -t ai-studio:test .
+```
+
+push 到 `main` 会发布 GHCR 的 `latest` 与完整 commit SHA tag；push `v*` tag 会发布对应正式版本。NAS 应使用 `ghcr.io/<owner>/<repo>:vX.Y.Z`，不要永久追踪 `latest`。
 
 ## 架构
 
 ```
 ┌─────────────┐      ┌────────────────────────┐      ┌──────────────────┐
-│   Web UI    │◀────▶│  Bun Server            │◀────▶│  Agent stream    │
-│  (browser)  │ HTTP │  (port 3009)           │stdio │  subprocesses    │
-└─────────────┘      │  + SQLite              │      │  - claude        │
-                     │  + AgentProvider layer │      │  - codex         │
-                     │  + HTTP polling        │      │  - …             │
-                     └────────────────────────┘      └──────────────────┘
+│ Web UI      │◀────▶│ AI Studio Server       │◀────▶│ User Connector   │
+│ user session│ HTTP │ users + SQLite         │ WSS  │ local Codex     │
+└─────────────┘      │ shared agents          │      │ local auth only │
+                     │ private conversations  │      └─────────────────┘
+                     └────────────────────────┘
 ```
 
-每个 agent 是一个长寿命的 CLI 子进程，跨多次对话复用同一个 session。Server 通过 `AgentProvider` 接口管理子进程生命周期。想接其他 CLI 的话，实现这个接口即可，详见 `src/providers/provider.ts`。
+Remote 模式下，Agent 的定义、Memory、Conversation 和 Workflow 全在 Server；Connector 只是用户隔离的 Codex Execution Node。Server 通过 `RemoteCodexProvider` 和经过 device token 认证的 WebSocket 派发任务。本地 Provider 仍实现同一 `AgentProvider` 接口。
 
-## 添加更多 agent
+## 当前 Agent
 
-仓库自带两个 placeholder agent（agent1 / agent2）。添加第三个 agent 需要在 `server.ts` 的几个常量里加一项，详见 [TECHNICAL.md](TECHNICAL.md)。
+本分支预置四个独立角色：产品企划（`product`）、创意设计（`creative`）、社媒运营（`social`）和营销增长（`growth`）。每个角色使用自己的工作目录与 `AGENTS.md`，可在工作群中 @ 指定角色，也可建立独立工作群或直接私聊。
+
+添加或调整 Agent 时，需要同步更新 `server.ts` 的 roster/runtime、前端身份映射和对应工作目录的人设文件，详见 [TECHNICAL.md](TECHNICAL.md)。
 
 ## 技术文档
 

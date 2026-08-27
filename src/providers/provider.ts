@@ -71,6 +71,8 @@ export type AgentProviderConfig = {
   onEvent?: (ev: AgentEvent) => void | Promise<void>
   /** Error callback (overrides `provider.onError()` registration). */
   onError?: (err: AgentError) => void
+  /** Sanitized subprocess lifecycle diagnostics. Never includes raw prompts or JSON-RPC payloads. */
+  onDiagnostic?: (event: { stream: 'stderr' | 'process'; message: string; exitCode?: number | null }) => void
 }
 
 /**

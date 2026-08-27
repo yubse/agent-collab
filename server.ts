@@ -5,15 +5,16 @@ import { Database } from 'bun:sqlite'
 import path from 'path'
 import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync, statSync, renameSync } from 'fs'
 import { homedir } from 'os'
+import { randomBytes } from 'crypto'
 import { jsonOk, jsonError, readJsonBody } from './src/responses.ts'
 import { jsonParseSafe } from './src/formatters.ts'
 import {
   IMG_PORT,
+  SERVER_HOST,
+  AI_STUDIO_PUBLIC_URL,
+  CONNECTOR_WS_URL,
   SOURCE,
   AUTH_TOKEN,
-  AGENT1_TMUX_SESSION,
-  AGENT2_TMUX_SESSION,
-  AGENT1_CLOCK_IN_SCRIPT,
   SERVER_STARTED_AT,
   agentRoot,
   workspaceRoot,
@@ -27,26 +28,41 @@ import {
   heartbeatStatePath,
   ALLOW_QUERY_TOKEN_AUTH,
   ALLOW_REMOTE_CONTROL,
-  AGENT1_HEARTBEAT_PATH,
-  AGENT1_PROJECT_DIR,
-  AGENT2_PROJECT_DIR,
-  AGENT1_PROVIDER, AGENT2_PROVIDER,
-  AGENT1_BINARY_PATH, AGENT2_BINARY_PATH,
-  AGENT1_CWD, AGENT2_CWD,
-  AGENT1_EXTRA_ARGS, AGENT2_EXTRA_ARGS,
-  AGENT1_TMUX_SOCKET, AGENT2_TMUX_SOCKET,
-  AGENT1_TMUX_CAPTURE_INTERVAL_MS, AGENT2_TMUX_CAPTURE_INTERVAL_MS,
-  AGENT1_TMUX_FILTER_MODE, AGENT2_TMUX_FILTER_MODE,
-  AGENT1_TMUX_QUIET_MS, AGENT2_TMUX_QUIET_MS,
+  loadAgentRuntimeEnv,
   type AgentProviderKind,
 } from './src/config.ts'
 import type { AgentProvider, AgentEvent, AgentError, AgentProviderConfig } from './src/providers/provider.ts'
+import { AgentTurnRouteQueue, type AgentTurnRoute } from './src/agent-turn-routing.ts'
 import { ClaudeProvider } from './src/providers/claude.ts'
 import { CodexProvider } from './src/providers/codex.ts'
 import { TmuxProvider } from './src/providers/tmux.ts'
+import { RemoteCodexProvider } from './src/providers/remote-codex.ts'
+import { ConnectorRegistry } from './src/connector/registry.ts'
+import { ConnectorDispatcher } from './src/connector/dispatcher.ts'
+import { parseConnectorMessage } from './src/connector/protocol.ts'
+import {
+  authenticateDevice,
+  createPairingCode,
+  listDevices,
+  redeemPairingCode,
+  setDeviceStatus,
+} from './src/connector/pairing.ts'
 import { hasRequestAuth, isLocalRequestHost, requestAuthMode } from './src/auth.ts'
 // AIC-65: handleTodosRoutes import removed — iOS todo 跟 task 撞定位，整个 todo 模块退役
 import { dangerousEndpointFor, hasRemoteControlConfirm, logDangerousOperation } from './src/security.ts'
+import { runMigrations, LEGACY_ADMIN_ID } from './src/db/migrations.ts'
+import { UserRepository } from './src/data/user-repository.ts'
+import {
+  authenticatePassword,
+  authenticatedUser,
+  clearSessionCookie,
+  createSession,
+  createUser,
+  ensureLegacyAdminPassword,
+  revokeSession,
+  sessionCookie,
+  type AuthenticatedUser,
+} from './src/auth/user-auth.ts'
 
 const WORKSPACE_ROOT = workspaceRoot(import.meta.dir)
 const RUNTIME_DATA_ROOT = runtimeDataRoot(import.meta.dir)
@@ -54,6 +70,14 @@ const RUNTIME_STATE_DIR = runtimeStateDir(import.meta.dir)
 const RUNTIME_UPLOADS_DIR = runtimeUploadsDir(import.meta.dir)
 const GENERATED_ARTIFACTS_DIR = generatedArtifactsDir(import.meta.dir)
 const HEARTBEAT_PATH = heartbeatStatePath(import.meta.dir)
+
+const ROLE_AGENT_IDS = ['product', 'creative', 'social', 'growth'] as const
+const ROLE_AGENT_CONFIGS = {
+  product: loadAgentRuntimeEnv('PRODUCT'),
+  creative: loadAgentRuntimeEnv('CREATIVE'),
+  social: loadAgentRuntimeEnv('SOCIAL'),
+  growth: loadAgentRuntimeEnv('GROWTH'),
+}
 
 function migrateLegacyFile(legacyPath: string, nextPath: string) {
   if (legacyPath === nextPath) return
@@ -93,6 +117,7 @@ function resolveStoredMediaPath(filename: string) {
 
 // SQLite for chat history
 const DB_PATH = chatDbPath(import.meta.dir)
+mkdirSync(path.dirname(DB_PATH), { recursive: true })
 const db = new Database(DB_PATH)
 // SQLite defaults to FK off; v2 schemas rely on ON DELETE CASCADE for task_events / phase_role_checks / seen_marks.
 // Without this, DELETE FROM tasks_v2 leaves orphan event rows.
@@ -118,6 +143,48 @@ db.run(`CREATE TABLE IF NOT EXISTS group_messages (
 )`)
 try { db.run(`ALTER TABLE group_messages ADD COLUMN images TEXT NOT NULL DEFAULT '[]'`) } catch {}
 try { db.run(`ALTER TABLE group_messages ADD COLUMN files TEXT NOT NULL DEFAULT '[]'`) } catch {}
+
+// Multi-workgroup metadata. Messages already carry conversation_id, so rooms and
+// membership can evolve independently without migrating chat history.
+db.run(`CREATE TABLE IF NOT EXISTS group_conversations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT 'admin',
+  is_default INTEGER NOT NULL DEFAULT 0
+)`)
+db.run(`CREATE TABLE IF NOT EXISTS group_conversation_members (
+  conversation_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  added_at TEXT NOT NULL,
+  PRIMARY KEY (conversation_id, member_id),
+  FOREIGN KEY (conversation_id) REFERENCES group_conversations(id) ON DELETE CASCADE
+)`)
+const defaultGroupCreatedAt = new Date().toISOString()
+db.run(`INSERT OR IGNORE INTO group_conversations (id, name, created_at, created_by, is_default)
+  VALUES ('workgroup', '工作群', ?, 'admin', 1)`, [defaultGroupCreatedAt])
+for (const memberId of ['admin', ...ROLE_AGENT_IDS]) {
+  db.run(`INSERT OR IGNORE INTO group_conversation_members (conversation_id, member_id, added_at)
+    VALUES ('workgroup', ?, ?)`, [memberId, defaultGroupCreatedAt])
+}
+// One-time/idempotent migration from the original two placeholder agents.
+// Custom groups keep their intent: agent1 expands into product/creative, while
+// agent2 expands into social/growth. The default group always contains all four.
+for (const [legacyId, replacements] of Object.entries({
+  agent1: ['product', 'creative'],
+  agent2: ['social', 'growth'],
+})) {
+  const groups = db.prepare(`SELECT conversation_id FROM group_conversation_members WHERE member_id=?`).all(legacyId) as any[]
+  for (const group of groups) {
+    for (const replacement of replacements) {
+      db.run(`INSERT OR IGNORE INTO group_conversation_members (conversation_id, member_id, added_at)
+        VALUES (?, ?, ?)`, [group.conversation_id, replacement, defaultGroupCreatedAt])
+    }
+  }
+  db.run(`DELETE FROM group_conversation_members WHERE member_id=?`, [legacyId])
+}
+db.run(`CREATE INDEX IF NOT EXISTS idx_group_conversation_members_member
+  ON group_conversation_members(member_id, conversation_id)`)
 
 db.run(`CREATE TABLE IF NOT EXISTS group_agent_state (
   agent_id TEXT PRIMARY KEY,
@@ -270,8 +337,11 @@ try {
   // phase_templates.required_roles + workflow_templates.phases JSON strings — string-replace
   // the role ids inside the serialized JSON. Round-trip-safe because the new ids are unique
   // tokens that don't appear elsewhere in those columns.
-  db.run(`UPDATE phase_templates    SET required_roles = REPLACE(required_roles, '"otto"', '"implementer"') WHERE required_roles LIKE '%"otto"%'`)
-  db.run(`UPDATE phase_templates    SET required_roles = REPLACE(required_roles, '"lio"',  '"reviewer"')    WHERE required_roles LIKE '%"lio"%'`)
+  const phaseTemplatesExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='phase_templates'`).get()
+  if (phaseTemplatesExists) {
+    db.run(`UPDATE phase_templates SET required_roles = REPLACE(required_roles, '"otto"', '"implementer"') WHERE required_roles LIKE '%"otto"%'`)
+    db.run(`UPDATE phase_templates SET required_roles = REPLACE(required_roles, '"lio"',  '"reviewer"')    WHERE required_roles LIKE '%"lio"%'`)
+  }
   db.run(`UPDATE workflow_templates SET phases         = REPLACE(phases,         '"otto"', '"implementer"') WHERE phases         LIKE '%"otto"%'`)
   db.run(`UPDATE workflow_templates SET phases         = REPLACE(phases,         '"lio"',  '"reviewer"')    WHERE phases         LIKE '%"lio"%'`)
 } catch (e) { console.error('role-key migration failed:', e) }
@@ -317,10 +387,21 @@ db.run(`CREATE TABLE IF NOT EXISTS actor_theme_styles (
   updated_at   TEXT NOT NULL,
   PRIMARY KEY (actor_id, theme_id)
 )`)
+
+// Versioned, idempotent multi-user migration. It runs only after every legacy
+// table exists so old databases can be upgraded in-place without data loss.
+runMigrations(db)
+const userRepo = new UserRepository(db)
+const connectorRegistry = new ConnectorRegistry()
+const connectorDispatcher = new ConnectorDispatcher(connectorRegistry)
+db.run(`UPDATE connector_devices SET status='offline' WHERE status!='offline'`)
+if (process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD) {
+  await ensureLegacyAdminPassword(db, process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD)
+}
 // Initialize AIC sequence — start above v1 task count to avoid id collision (cosmetic)
 try {
   const v1Count = (db.prepare(`SELECT COUNT(*) AS n FROM group_tasks`).get() as any).n || 0
-  db.run(`INSERT OR IGNORE INTO task_id_seq (prefix, next) VALUES ('AIC', ?)`, Math.max(1, v1Count + 1))
+  db.run(`INSERT OR IGNORE INTO task_id_seq (prefix, next) VALUES ('AIC', ?)`, [Math.max(1, v1Count + 1)])
 } catch {}
 
 type GroupMember = {
@@ -337,6 +418,7 @@ type GroupMember = {
 
 type GroupRecord = {
   id: string
+  user_id: string
   ts: string
   conversation_id: string
   sender_id: string
@@ -374,28 +456,45 @@ const GROUP_ROSTER: GroupMember[] = [
     tmux: null,
     can_reply: false,
   },
-  // Two placeholder agents below. Rename / re-skin / replace them when wiring your own
-  // setup. Each agent's id (`agent1` / `agent2`) is what the rest of the codebase routes by;
-  // keep them or update everywhere they're referenced (see README "怎么加 agent").
   {
-    id: 'agent2',
-    display_name: 'agent2',
+    id: 'product',
+    display_name: '产品企划',
     kind: 'agent',
-    avatar: '🤖',
-    color: 'green',
-    model: '',
-    tmux: AGENT2_PROVIDER,
+    avatar: '🧭',
+    color: 'blue',
+    model: 'Product Manager',
+    tmux: ROLE_AGENT_CONFIGS.product.provider,
     can_reply: true,
     default_responder: true,
   },
   {
-    id: 'agent1',
-    display_name: 'agent1',
+    id: 'creative',
+    display_name: '创意设计',
     kind: 'agent',
-    avatar: '🤖',
-    color: 'blue',
-    model: '',
-    tmux: AGENT1_PROVIDER,
+    avatar: '🎬',
+    color: 'purple',
+    model: 'Visual Storyteller',
+    tmux: ROLE_AGENT_CONFIGS.creative.provider,
+    can_reply: true,
+  },
+  {
+    id: 'social',
+    display_name: '社媒运营',
+    kind: 'agent',
+    avatar: '📣',
+    color: 'green',
+    model: 'Social Media Strategist',
+    tmux: ROLE_AGENT_CONFIGS.social.provider,
+    can_reply: true,
+  },
+  {
+    id: 'growth',
+    display_name: '营销增长',
+    kind: 'agent',
+    avatar: '🚀',
+    color: 'orange',
+    model: 'Growth Hacker',
+    tmux: ROLE_AGENT_CONFIGS.growth.provider,
     can_reply: true,
   },
 ]
@@ -424,52 +523,29 @@ type AgentRuntimeConfig = {
   tmuxCaptureIntervalMs: number
   tmuxFilterMode: 'strict' | 'loose' | 'off'
   tmuxQuietMs: number
+  promptPath?: string
 }
 const AGENT_RUNTIMES: Record<string, AgentRuntimeConfig> = {
-  agent1: {
-    provider: AGENT1_PROVIDER,
-    binaryPath: AGENT1_BINARY_PATH,
-    cwd: AGENT1_CWD,
-    extraArgs: AGENT1_EXTRA_ARGS,
-    tmuxSession: AGENT1_TMUX_SESSION,
-    tmuxSocket: AGENT1_TMUX_SOCKET,
-    tmuxCaptureIntervalMs: AGENT1_TMUX_CAPTURE_INTERVAL_MS,
-    tmuxFilterMode: AGENT1_TMUX_FILTER_MODE,
-    tmuxQuietMs: AGENT1_TMUX_QUIET_MS,
-  },
-  agent2: {
-    provider: AGENT2_PROVIDER,
-    binaryPath: AGENT2_BINARY_PATH,
-    cwd: AGENT2_CWD,
-    extraArgs: AGENT2_EXTRA_ARGS,
-    tmuxSession: AGENT2_TMUX_SESSION,
-    tmuxSocket: AGENT2_TMUX_SOCKET,
-    tmuxCaptureIntervalMs: AGENT2_TMUX_CAPTURE_INTERVAL_MS,
-    tmuxFilterMode: AGENT2_TMUX_FILTER_MODE,
-    tmuxQuietMs: AGENT2_TMUX_QUIET_MS,
-  },
+  product: ROLE_AGENT_CONFIGS.product,
+  creative: ROLE_AGENT_CONFIGS.creative,
+  social: ROLE_AGENT_CONFIGS.social,
+  growth: ROLE_AGENT_CONFIGS.growth,
 }
 const AGENT_PROVIDERS = new Map<string, AgentProvider>()
-// AIC-116: track the conversation each agent was last dispatched into, so
-// `handleProviderEvent` can route the assistant reply back to the right channel. Provider
-// events have no channel context of their own — the agent runtime doesn't know which
-// channel the user typed in, only the message text.
-const _agentLastDispatchChannel = new Map<string, string>()
-// AIC-132: per-agent flag tracking whether the current turn was dispatched as
-// observe-only. `handleProviderEvent` drops the assistant text when this is true —
-// agents that want to reply to an observe message must self-curl /group/send with
-// an explicit conversation_id (workgroup or dm-<id>). Reset on the next `result`
-// event so the following turn starts clean.
-const _agentIsObserveTurn = new Map<string, boolean>()
+// Provider events do not carry the workgroup conversation/observe intent that caused
+// the turn. Multiple turns can be accepted before an earlier one completes, so routing
+// context must be FIFO per agent; one global boolean/channel lets a later observe turn
+// overwrite an in-flight visible response (the Product/Creative discussion race).
+const _agentTurnRoutes = new AgentTurnRouteQueue()
 // Dedup last-appended assistant text per agent to prevent double-emit when the runtime
 // also self-curls /group/send (legacy claude CLAUDE.md convention). Hash a sliding window
 // of recent appends (TTL 60s) — same hash within window is dropped silently.
 const _agentReplyDedup = new Map<string, Map<string, number>>()
-function _dedupAgentReply(agentId: string, text: string): boolean {
+function _dedupAgentReply(providerKey: string, text: string): boolean {
   // returns true when this text was just appended (caller should skip)
   const now = Date.now()
-  let inner = _agentReplyDedup.get(agentId)
-  if (!inner) { inner = new Map(); _agentReplyDedup.set(agentId, inner) }
+  let inner = _agentReplyDedup.get(providerKey)
+  if (!inner) { inner = new Map(); _agentReplyDedup.set(providerKey, inner) }
   // expire entries > 60s
   for (const [k, ts] of inner) if (now - ts > 60_000) inner.delete(k)
   const key = text.length > 200 ? text.slice(0, 200) + '|' + text.length : text
@@ -478,8 +554,13 @@ function _dedupAgentReply(agentId: string, text: string): boolean {
   return false
 }
 
-function agentStateFilePath(agentId: string): string {
-  return path.join(RUNTIME_STATE_DIR, `agent_${agentId}.json`)
+function runtimeProviderKey(userId: string, conversationId: string, agentId: string): string {
+  return `${userId}:${conversationId}:${agentId}`
+}
+
+function agentStateFilePath(userId: string, conversationId: string, agentId: string): string {
+  const safe = (value: string) => value.replace(/[^A-Za-z0-9_.-]/g, '_')
+  return path.join(RUNTIME_STATE_DIR, 'users', safe(userId), safe(conversationId), `agent_${safe(agentId)}.json`)
 }
 
 // AIC-124 fork sync: per-provider chat_supervisor runtime dir. agent1 / agent2 each get
@@ -502,22 +583,28 @@ function agentSupervisorDir(agentId: string): string {
 // can be moved without breaking the path.
 const CHAT_SUPERVISOR_ENTRYPOINT = path.join(import.meta.dir, 'src', 'providers', 'chat', 'chat_supervisor.ts')
 
-function instantiateProvider(agentId: string): AgentProvider | null {
+function instantiateProvider(userId: string, conversationId: string, agentId: string): AgentProvider | null {
   const cfg = AGENT_RUNTIMES[agentId]
   if (!cfg) return null
   // tmux provider doesn't spawn a subprocess (operator-owned session) so the cwd guard
   // below doesn't apply to it. claude/codex still need cwd for settings/hooks discovery.
   if (cfg.provider !== 'tmux' && !cfg.cwd) {
-    process.stderr.write(`ai-collab: WARN agent ${agentId} has empty cwd (set AGENT${agentId === 'agent1' ? '1' : '2'}_CWD); provider will spawn with server cwd and likely miss .claude/settings.json\n`)
+    process.stderr.write(`ai-collab: WARN agent ${agentId} has empty cwd (set ${agentId.toUpperCase()}_CWD); provider will spawn with server cwd and likely miss AGENTS.md\n`)
   }
   const providerCfg: AgentProviderConfig = {
     label: agentId,
     cwd: cfg.cwd || undefined,
-    stateFilePath: agentStateFilePath(agentId),
+    stateFilePath: agentStateFilePath(userId, conversationId, agentId),
     binaryPath: cfg.binaryPath || undefined,
     extraArgs: cfg.extraArgs.length ? cfg.extraArgs : undefined,
-    onEvent: (ev: AgentEvent) => handleProviderEvent(agentId, ev),
-    onError: (err: AgentError) => handleProviderError(agentId, err),
+    onEvent: (ev: AgentEvent) => handleProviderEvent(userId, conversationId, agentId, ev),
+    onError: (err: AgentError) => handleProviderError(userId, conversationId, agentId, err),
+  }
+  if (cfg.provider === 'remote-codex') {
+    const remote = new RemoteCodexProvider(connectorDispatcher, connectorRegistry, { userId, conversationId, agentId })
+    remote.onEvent(providerCfg.onEvent!)
+    remote.onError(providerCfg.onError!)
+    return remote
   }
   if (cfg.provider === 'codex') return new CodexProvider(providerCfg)
   if (cfg.provider === 'tmux') {
@@ -538,11 +625,12 @@ function instantiateProvider(agentId: string): AgentProvider | null {
   })
 }
 
-function ensureProvider(agentId: string): AgentProvider | null {
-  const existing = AGENT_PROVIDERS.get(agentId)
+function ensureProvider(userId: string, conversationId: string, agentId: string): AgentProvider | null {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const existing = AGENT_PROVIDERS.get(key)
   if (existing) return existing
-  const p = instantiateProvider(agentId)
-  if (p) AGENT_PROVIDERS.set(agentId, p)
+  const p = instantiateProvider(userId, conversationId, agentId)
+  if (p) AGENT_PROVIDERS.set(key, p)
   return p
 }
 
@@ -554,31 +642,53 @@ function ensureProvider(agentId: string): AgentProvider | null {
 // (legacy claude CLAUDE.md convention) — recent identical text within 60s is dropped.
 // New ai-collab CLAUDE.md / AGENTS.md templates should NOT self-curl reply; the server
 // forwards stdout automatically.
-function handleProviderEvent(agentId: string, ev: AgentEvent): void {
-  if (ev.type === 'system_init' || ev.type === 'assistant') {
-    if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId)
+function handleProviderEvent(userId: string, conversationId: string, agentId: string, ev: AgentEvent): void {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const activeRoute = _agentTurnRoutes.current(key)
+  if ((ev.type === 'system_init' || ev.type === 'assistant') && activeRoute && !activeRoute.observeOnly) {
+    if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId, { dispatch_id: activeRoute.dispatchId })
   } else if (ev.type === 'result') {
-    if (isAgentWorkingInDb(agentId)) markAgentIdle(agentId)
-    // AIC-132: clear observe flag so the next turn starts clean.
-    _agentIsObserveTurn.delete(agentId)
+    _agentTurnRoutes.complete(key)
+    // A completed response must not make the workstation look idle when another
+    // visible response is already queued behind it. Observe-only turns stay silent.
+    if (_agentTurnRoutes.hasResponseTurn(key)) {
+      const nextRoute = _agentTurnRoutes.current(key)
+      if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId, { dispatch_id: nextRoute?.dispatchId })
+    } else if (isAgentWorkingInDb(agentId)) {
+      markAgentIdle(agentId)
+    }
+    startNextAgentTurn(userId, conversationId, agentId)
   }
 
   if (ev.type === 'assistant' && typeof ev.text === 'string' && ev.text.trim()) {
-    // AIC-132: observe-only turn — drop the auto-route. The agent saw the message for
-    // context sync, not for response; if it actually wants to reply it must self-curl
-    // /group/send with an explicit conversation_id. Without this gate the agent's
-    // text leaks into the last-dispatched (or default 'workgroup') channel — that
-    // surfaces as the agent's DM-style reply tone showing up in the workgroup.
-    if (_agentIsObserveTurn.get(agentId) === true) {
+    // Each assistant event belongs to the oldest unfinished provider turn. A later
+    // observe dispatch therefore cannot suppress an earlier visible response.
+    if (!activeRoute) {
+      process.stderr.write(`provider[${agentId}] drop assistant text without a pending turn route\n`)
+      return
+    }
+    if (activeRoute.observeOnly) {
       const preview = ev.text.trim().slice(0, 60).replace(/\n/g, ' ')
       process.stderr.write(`provider[${agentId}] observe-turn drop assistant text (${ev.text.length} chars, first="${preview}…")\n`)
       return
     }
-    const conversationId = _agentLastDispatchChannel.get(agentId) || 'workgroup'
+    const conversationId = activeRoute.conversationId
     const text = ev.text.trim()
-    if (_dedupAgentReply(agentId, text)) return
+    if (_dedupAgentReply(key, text)) return
     try {
       const dispatchId = groupId('dsp')
+      // Agent-authored @mentions are real response targets, not passive observers.
+      // This is what lets Creative explicitly hand a question to Product and receive
+      // Product's follow-up in the same group.
+      const mentions = normalizeGroupMentions([], text)
+      const responseTargets = groupTargetsFor(agentId, mentions, activeRoute.hopCount, conversationId, activeRoute.userId)
+      const delivery = {
+        mode: mentions.length ? 'mention' : 'broadcast',
+        targets: responseTargets,
+        dispatch_id: dispatchId,
+        delivered: [],
+        failed: [],
+      }
       const record = appendGroupRecord(
         {
           sender_id: agentId,
@@ -587,17 +697,27 @@ function handleProviderEvent(agentId: string, ev: AgentEvent): void {
           message_type: 'chat',
           source: 'provider_reply',
         },
-        [],
-        { mode: 'broadcast', targets: [], dispatch_id: dispatchId, delivered: [], failed: [] },
+        mentions,
+        delivery,
+        activeRoute.userId,
       )
-      // Fan out to other agents in the same conversation (so they see each other's
-      // replies just like a human would). Skip the sender itself.
-      if (conversationId === 'workgroup') {
-        const fanOut = GROUP_ROSTER
-          .filter((m) => m.kind === 'agent' && m.id !== agentId && groupAgentAutoReply(m.id))
-          .map((m) => m.id)
-        if (fanOut.length) {
-          dispatchGroupRecord(record, fanOut, 1, /* observeOnly */ true)
+      const executionRequestId = typeof ev.raw?.request_id === 'string'
+        ? ev.raw.request_id.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
+        : ''
+      if (executionRequestId) {
+        const savedAt = new Date().toISOString()
+        const requestAt = Date.parse(String(ev.raw?.timings?.execution_request_at || ''))
+        const total = Number.isFinite(requestAt) ? Date.now() - requestAt : null
+        console.log(`[execution] request=${executionRequestId} state=message_saved at=${savedAt}${total === null ? '' : ` total_duration_ms=${total}`}`)
+      }
+      if (responseTargets.length) {
+        dispatchGroupRecord(record, responseTargets, activeRoute.hopCount)
+      }
+      // Non-mentioned agents still receive the message as silent context.
+      if (!dmAgentFor(conversationId)) {
+        const observers = groupObserverTargetsFor(agentId, responseTargets, conversationId, activeRoute.userId)
+        if (observers.length) {
+          dispatchGroupRecord(record, observers, activeRoute.hopCount, /* observeOnly */ true)
         }
       }
     } catch (e) {
@@ -606,39 +726,42 @@ function handleProviderEvent(agentId: string, ev: AgentEvent): void {
   }
 }
 
-function handleProviderError(agentId: string, err: AgentError): void {
+function handleProviderError(userId: string, conversationId: string, agentId: string, err: AgentError): void {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
   console.error(`provider[${agentId}] error: kind=${err.kind} msg=${err.message}`)
   if (err.kind === 'process_exited' || err.kind === 'spawn_failed') {
     if (isAgentWorkingInDb(agentId)) markAgentIdle(agentId)
     // AIC-116 cycle 2: drop the dead provider instance so the next dispatch
     // re-instantiates and re-spawns. Without this, AGENT_PROVIDERS.has() stays true →
     // groupStatusSnapshot reports `online` for a zombie that won't actually accept input.
-    AGENT_PROVIDERS.delete(agentId)
-    // AIC-132: provider died mid-turn; observe flag would never see its `result`
-    // event so wouldn't auto-clear. Clear here so the next provider instance starts
-    // with a clean slate.
-    _agentIsObserveTurn.delete(agentId)
+    AGENT_PROVIDERS.delete(key)
+    // A dead provider cannot emit result events for its accepted routes. Clear them so
+    // a fresh instance starts with an unambiguous routing queue.
+    const abandonedRoutes = _agentTurnRoutes.clear(key)
+    for (const route of abandonedRoutes) demoteAgentTurnDelivery(agentId, route)
   }
 }
 
 // 上班: ensure a provider instance exists. Subprocess spawn is deferred to first send() —
 // no work needed here beyond instantiation. Returns `already=true` when a provider was
 // already alive (PM sees agent online), `already=false` for a fresh instantiation.
-function agentClockIn(agentId: string) {
-  const existing = AGENT_PROVIDERS.get(agentId)
+function agentClockIn(userId: string, conversationId: string, agentId: string) {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const existing = AGENT_PROVIDERS.get(key)
   const wasAlive = !!existing?.isAlive
-  const p = ensureProvider(agentId)
+  const p = ensureProvider(userId, conversationId, agentId)
   if (!p) return { ok: false, error: `no provider runtime configured for ${agentId}` }
   markAgentIdle(agentId)
   return { ok: true, already: wasAlive }
 }
 
 // Close the agent's provider (graceful shutdown — provider.close() ends stdin and waits exit).
-async function killAgentSession(agentId: string) {
-  const p = AGENT_PROVIDERS.get(agentId)
+async function killAgentSession(userId: string, conversationId: string, agentId: string) {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const p = AGENT_PROVIDERS.get(key)
   if (!p) return { ok: true, alreadyOff: true }
   try { await p.close() } catch {}
-  AGENT_PROVIDERS.delete(agentId)
+  AGENT_PROVIDERS.delete(key)
   updateGroupAgentState(agentId, { last_seen: groupNowIso(), is_typing: 0, typing_since: null, status_text: 'clocked out' })
   return { ok: true }
 }
@@ -648,11 +771,12 @@ async function killAgentSession(agentId: string) {
 // shutdown sequence (memory consolidation etc), that should happen via a dedicated
 // per-agent `clockOutPrompt` send() before close() rather than being smuggled through
 // a legacy key-press path. Not in AIC-116 scope; future improvement.
-async function agentClockOut(agentId: string) {
-  const p = AGENT_PROVIDERS.get(agentId)
+async function agentClockOut(userId: string, conversationId: string, agentId: string) {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const p = AGENT_PROVIDERS.get(key)
   if (!p) return { ok: true, alreadyOff: true }
   try { await p.close() } catch {}
-  AGENT_PROVIDERS.delete(agentId)
+  AGENT_PROVIDERS.delete(key)
   updateGroupAgentState(agentId, { last_seen: groupNowIso(), is_typing: 0, typing_since: null, status_text: 'clocked out' })
   return { ok: true }
 }
@@ -660,12 +784,86 @@ const GROUP_REPLY_AGENT_IDS = GROUP_ROSTER.filter((m) => m.can_reply).map((m) =>
 const GROUP_ALIASES = new Map<string, string>([
   ['all', GROUP_ALL_TOKEN],
   ['everyone', GROUP_ALL_TOKEN],
+  ['全员', GROUP_ALL_TOKEN],
   ['admin', 'admin'],
-  ['agent1', 'agent1'],
-  ['agent2', 'agent2'],
-  ['agent-a', 'agent1'],
-  ['agent-b', 'agent2'],
+  ['product', 'product'],
+  ['产品', 'product'],
+  ['产品企划', 'product'],
+  ['creative', 'creative'],
+  ['创意', 'creative'],
+  ['创意设计', 'creative'],
+  ['social', 'social'],
+  ['社媒', 'social'],
+  ['社媒运营', 'social'],
+  ['growth', 'growth'],
+  ['增长', 'growth'],
+  ['营销增长', 'growth'],
 ])
+
+type GroupConversationSummary = {
+  id: string
+  name: string
+  created_at: string
+  created_by: string
+  is_default: boolean
+  member_ids: string[]
+}
+
+function ensureUserDefaultConversation(user: AuthenticatedUser): GroupConversationSummary {
+  const existing = db.prepare(`SELECT id FROM group_conversations WHERE user_id=? AND is_default=1 LIMIT 1`).get(user.id) as any
+  if (existing) return groupConversationById(String(existing.id), user.id)!
+  const id = user.id === LEGACY_ADMIN_ID ? 'workgroup' : `workgroup-${user.id.slice(4, 16)}`
+  const now = groupNowIso()
+  db.run(`INSERT INTO group_conversations (id, name, created_at, created_by, is_default, user_id)
+    VALUES (?, '工作群', ?, ?, 1, ?)`, [id, now, user.id, user.id])
+  saveConversationMembers(id, ['admin', ...ROLE_AGENT_IDS])
+  return groupConversationById(id, user.id)!
+}
+
+function groupConversationById(id: string, userId: string): GroupConversationSummary | null {
+  const row = db.prepare(`SELECT id, name, created_at, created_by, is_default FROM group_conversations WHERE id=? AND user_id=?`).get(id, userId) as any
+  if (!row) return null
+  const members = db.prepare(`SELECT member_id FROM group_conversation_members WHERE conversation_id=? ORDER BY member_id`).all(id) as any[]
+  return {
+    id: row.id,
+    name: row.name,
+    created_at: row.created_at,
+    created_by: row.created_by,
+    is_default: !!row.is_default,
+    member_ids: members.map((m) => String(m.member_id)),
+  }
+}
+
+function listGroupConversations(userId: string): GroupConversationSummary[] {
+  const rows = db.prepare(`SELECT id FROM group_conversations WHERE user_id=? ORDER BY is_default DESC, created_at ASC`).all(userId) as any[]
+  return rows.map((row) => groupConversationById(String(row.id), userId)).filter(Boolean) as GroupConversationSummary[]
+}
+
+function groupMemberIds(conversationId: string, userId: string): string[] {
+  return (db.prepare(`SELECT m.member_id FROM group_conversation_members m
+    JOIN group_conversations c ON c.id=m.conversation_id
+    WHERE m.conversation_id=? AND c.user_id=?`).all(conversationId, userId) as any[])
+    .map((row) => String(row.member_id))
+}
+
+function groupAgentIds(conversationId: string, userId: string): string[] {
+  const memberSet = new Set(groupMemberIds(conversationId, userId))
+  return GROUP_REPLY_AGENT_IDS.filter((id) => memberSet.has(id))
+}
+
+function normalizeConversationMembers(raw: any): string[] {
+  const requested = Array.isArray(raw) ? raw.map((id) => String(id).trim()) : []
+  const allowed = new Set(GROUP_ROSTER.map((member) => member.id))
+  return [...new Set(['admin', ...requested.filter((id) => allowed.has(id) && id !== 'admin')])]
+}
+
+function saveConversationMembers(conversationId: string, memberIds: string[]) {
+  const now = groupNowIso()
+  db.run(`DELETE FROM group_conversation_members WHERE conversation_id=?`, [conversationId])
+  for (const memberId of memberIds) {
+    db.run(`INSERT INTO group_conversation_members (conversation_id, member_id, added_at) VALUES (?, ?, ?)`, [conversationId, memberId, now])
+  }
+}
 
 function groupNowIso() {
   return new Date().toISOString()
@@ -871,8 +1069,10 @@ type ActorStyleRow = {
 }
 const DEFAULT_ACTOR_STYLES: ActorStyleRow[] = [
   { actor_id: 'admin',  avatar_kind: 'emoji', avatar_value: '👾', bubble_bg: '#dccfe8' },
-  { actor_id: 'agent1', avatar_kind: 'emoji', avatar_value: '🤖', bubble_bg: '#cdddec' },
-  { actor_id: 'agent2', avatar_kind: 'emoji', avatar_value: '🤖', bubble_bg: '#f4d990' },
+  { actor_id: 'product', avatar_kind: 'emoji', avatar_value: '🧭', bubble_bg: '#cdddec' },
+  { actor_id: 'creative', avatar_kind: 'emoji', avatar_value: '🎬', bubble_bg: '#dccfe8' },
+  { actor_id: 'social', avatar_kind: 'emoji', avatar_value: '📣', bubble_bg: '#cee0c5' },
+  { actor_id: 'growth', avatar_kind: 'emoji', avatar_value: '🚀', bubble_bg: '#f4d990' },
   { actor_id: 'system', avatar_kind: 'emoji', avatar_value: '⚙', bubble_bg: '#d4d0c8' },
 ]
 const PRESET_BG_COLORS = [
@@ -1044,15 +1244,17 @@ seedActorStylesIfMissing()
 
 const ROLE_TO_ACTORS: Record<string, string[]> = {
   pm:          ['admin'],
-  implementer: ['agent1'],
-  reviewer:    ['agent2'],
+  implementer: ['product'],
+  reviewer:    ['creative'],
   system:      ['system'],
 }
 
 const ACTOR_DISPLAY_NAMES: Record<string, string> = {
   admin:  'admin',
-  agent1: 'agent1',
-  agent2: 'agent2',
+  product: '产品企划',
+  creative: '创意设计',
+  social: '社媒运营',
+  growth: '营销增长',
   system: 'System',
 }
 
@@ -1181,14 +1383,15 @@ function notifyActorViaDM(actor_id: string, task: any, event: any) {
   const delivery = { mode: 'dm', targets: [actor_id], dispatch_id: dispatchId, delivered: [], failed: [] }
   const meta = { task_id: task.id, event_id: event.id, event_type: event.meta?.event_type }
   db.run(
-    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [recordId, ts, `dm-${actor_id}`, 'system', null, text, '[]', '[]', '[]', null, null, 'task_notify', JSON.stringify(delivery), JSON.stringify(meta), 'system_notification', task.id, null, actor_id],
+    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [recordId, ts, `dm-${actor_id}`, 'system', null, text, '[]', '[]', '[]', null, null, 'task_notify', JSON.stringify(delivery), JSON.stringify(meta), 'system_notification', task.id, null, actor_id, task.user_id],
   )
   // Tmux injection for agents only (admin is human, no agent session for DM)
   if (actor_id !== 'admin') {
     const record: GroupRecord = {
       id: recordId, ts,
+      user_id: task.user_id,
       conversation_id: `dm-${actor_id}`,
       sender_id: 'system', sender_model: null,
       text, images: [], files: [], mentions: [],
@@ -1337,13 +1540,14 @@ function previousNonAutoPhase(type: string, current: string): string | null {
 }
 
 // Refresh task row from DB
-function loadTask(task_id: string): any | null {
+function loadTask(task_id: string, userId?: string): any | null {
+  if (userId) return db.prepare(`SELECT * FROM tasks_v2 WHERE id = ? AND user_id=?`).get(task_id, userId) || null
   return db.prepare(`SELECT * FROM tasks_v2 WHERE id = ?`).get(task_id) || null
 }
 
 // Long poll waiters: events (per task) and summary (all open tasks)
 type TaskEventWaiter = { taskId: string; sinceEventId: string; resolve: (r: Response) => void; timer: ReturnType<typeof setTimeout> }
-type TaskSummaryWaiter = { sinceCursor: string; resolve: (r: Response) => void; timer: ReturnType<typeof setTimeout> }
+type TaskSummaryWaiter = { userId: string; sinceCursor: string; resolve: (r: Response) => void; timer: ReturnType<typeof setTimeout> }
 const taskEventWaiters = new Set<TaskEventWaiter>()
 const taskSummaryWaiters = new Set<TaskSummaryWaiter>()
 
@@ -1371,7 +1575,7 @@ function wakeTaskWaiters(taskId: string, opts: { deleted?: boolean } = {}) {
     clearTimeout(w.timer)
     taskSummaryWaiters.delete(w)
     // Build a fresh snapshot inline (logic duplicated from the summary handler; kept simple intentionally)
-    const rows = db.prepare(`SELECT * FROM tasks_v2 WHERE status='open' ORDER BY updated_at DESC`).all() as any[]
+    const rows = db.prepare(`SELECT * FROM tasks_v2 WHERE user_id=? AND status='open' ORDER BY updated_at DESC`).all(w.userId) as any[]
     for (const row of rows) {
       attachPendingFields(row)
       const latest = db.prepare(`SELECT id, ts, kind, actor_id, meta, body FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1`).get(row.id) as any
@@ -1385,7 +1589,7 @@ function wakeTaskWaiters(taskId: string, opts: { deleted?: boolean } = {}) {
       if (latest?.meta) { try { const m = JSON.parse(latest.meta); if (Array.isArray(m?.mentions)) latestEventMentions = m.mentions } catch {} }
       row.latest_event_mentions = latestEventMentions
       const unread: Record<string, number> = {}
-      for (const actor of ['admin', 'agent1', 'agent2']) {
+      for (const actor of ['admin', ...ROLE_AGENT_IDS]) {
         const mark = db.prepare(`SELECT last_seen_event_id FROM task_seen_marks WHERE task_id=? AND actor_id=?`).get(row.id, actor) as any
         const lastId = mark?.last_seen_event_id || ''
         const n = (db.prepare(`SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND id > ?`).get(row.id, lastId) as any).n
@@ -1462,9 +1666,9 @@ function defaultGroupResponder() {
   return defaultOn || GROUP_REPLY_AGENT_IDS.find((id) => groupAgentAutoReply(id)) || null
 }
 
-function groupTargetsFor(senderId: string, mentions: string[], hopCount = 0) {
+function groupTargetsFor(senderId: string, mentions: string[], hopCount: number, conversationId: string, userId: string) {
   const sender = GROUP_ROSTER_BY_ID.get(senderId)
-  const replyable = GROUP_REPLY_AGENT_IDS.filter((id) => groupAgentAutoReply(id))
+  const replyable = groupAgentIds(conversationId, userId).filter((id) => groupAgentAutoReply(id))
   if (!sender?.can_reply) {
     const effective = mentions.length ? mentions : replyable
     if (effective.includes(GROUP_ALL_TOKEN)) return replyable
@@ -1474,11 +1678,15 @@ function groupTargetsFor(senderId: string, mentions: string[], hopCount = 0) {
   return mentions.filter((id) => replyable.includes(id) && id !== senderId)
 }
 
-function groupObserverTargetsFor(senderId: string, responseTargets: string[]) {
+function groupObserverTargetsFor(senderId: string, responseTargets: string[], conversationId: string, userId: string) {
   const sender = GROUP_ROSTER_BY_ID.get(senderId)
   const responseSet = new Set(responseTargets)
-  return GROUP_REPLY_AGENT_IDS.filter((id) => {
+  return groupAgentIds(conversationId, userId).filter((id) => {
     if (id === senderId || responseSet.has(id)) return false
+    // Remote Connector mode keeps conversation context on Server and injects it
+    // when an agent is actually addressed. Do not spend one Codex turn per silent
+    // observer just to synchronize context.
+    if (AGENT_RUNTIMES[id]?.provider === 'remote-codex') return false
     return groupAgentAutoReply(id)
   })
 }
@@ -1497,7 +1705,10 @@ function groupObserverTargetsFor(senderId: string, responseTargets: string[]) {
 // AIC-60: per-agent session context tokens — mirrors Hub iOS CTX card.
 // Each agent writes its own heartbeat from a Stop/SessionStart hook (or equivalent).
 const AGENT_HEARTBEAT_PATHS: Record<string, string> = {
-  agent1: AGENT1_HEARTBEAT_PATH,
+  product: ROLE_AGENT_CONFIGS.product.heartbeatPath,
+  creative: ROLE_AGENT_CONFIGS.creative.heartbeatPath,
+  social: ROLE_AGENT_CONFIGS.social.heartbeatPath,
+  growth: ROLE_AGENT_CONFIGS.growth.heartbeatPath,
 }
 function readAgentContext(agentId: string): { tokens: number | null; percent: number | null; detail: string | null } {
   const path = AGENT_HEARTBEAT_PATHS[agentId]
@@ -1540,16 +1751,14 @@ function findProjectDirContainingSid(sid: string): string | null {
 }
 
 function agentProjectDirOverride(agentId: string): string {
-  if (agentId === 'agent1') return AGENT1_PROJECT_DIR
-  if (agentId === 'agent2') return AGENT2_PROJECT_DIR
-  return ''
+  return ROLE_AGENT_CONFIGS[agentId as keyof typeof ROLE_AGENT_CONFIGS]?.projectDir || ''
 }
 
 // Map agentId → { transcript jsonl path, sid }. Drives /api/transcript + /api/agent-billing.
 // Returns null when: agent has no live provider / provider isn't claude / provider hasn't yet
 // captured a session_id (no assistant event yet) / file missing on disk.
-function resolveTranscriptPath(agentId: string): { path: string; sid: string } | null {
-  const provider = AGENT_PROVIDERS.get(agentId)
+function resolveTranscriptPath(userId: string, conversationId: string, agentId: string): { path: string; sid: string } | null {
+  const provider = AGENT_PROVIDERS.get(runtimeProviderKey(userId, conversationId, agentId))
   if (!provider || provider.capabilities().providerName !== 'claude') return null
   const sid = provider.sessionId
   if (!sid) return null
@@ -1595,14 +1804,14 @@ function calcOpusTurnCostUsd(input: number, output: number, cacheRead: number, c
 // `message.usage`. Tail-read 1MB cap, not full file — at 1.5s poll cadence a
 // 16MB+ jsonl would double IO; the latest assistant event is always near the
 // tail. Mirrors main repo readAgentLastTurnUsage (AIC-113).
-function readAgentLastTurnUsage(agentId: string): {
+function readAgentLastTurnUsage(userId: string, conversationId: string, agentId: string): {
   input_tokens: number
   output_tokens: number
   cache_read_input_tokens: number
   cache_creation_input_tokens: number
   cost_usd: number
 } | null {
-  const resolved = resolveTranscriptPath(agentId)
+  const resolved = resolveTranscriptPath(userId, conversationId, agentId)
   if (!resolved) return null
   try {
     const TAIL_CAP = 1_000_000
@@ -1649,15 +1858,19 @@ function readAgentLastTurnUsage(agentId: string): {
   return null
 }
 
-function groupStatusSnapshot() {
+function groupStatusSnapshot(userId?: string) {
   const agents: Record<string, any> = {}
   for (const member of GROUP_ROSTER.filter((m) => m.kind === 'agent')) {
     const row = db.prepare(`SELECT * FROM group_agent_state WHERE agent_id = ?`).get(member.id) as any
     // AIC-116: online iff a long-lived provider instance is registered for this agent. Even if
     // the underlying subprocess is between sends (process spawns on first send, exits on close),
     // "online" tracks operator intent — the agent slot is configured + provisioned.
-    const provider = AGENT_PROVIDERS.get(member.id)
-    const online = !!provider
+    const localPrefix = userId ? `${userId}:` : ''
+    const localSuffix = `:${member.id}`
+    const hasLocalProvider = userId ? [...AGENT_PROVIDERS.keys()].some((key) => key.startsWith(localPrefix) && key.endsWith(localSuffix)) : false
+    const online = AGENT_RUNTIMES[member.id]?.provider === 'remote-codex'
+      ? Boolean(userId && connectorRegistry.isUserOnline(userId))
+      : hasLocalProvider
     const ctx = readAgentContext(member.id)
     agents[member.id] = {
       state: online ? 'online' : 'offline',
@@ -1683,8 +1896,8 @@ function groupStatusSnapshot() {
   return { agents }
 }
 
-function groupMembersPayload() {
-  const status = groupStatusSnapshot().agents
+function groupMembersPayload(userId?: string) {
+  const status = groupStatusSnapshot(userId).agents
   return GROUP_ROSTER.map((member) => ({
     ...member,
     name: member.display_name,
@@ -1696,6 +1909,7 @@ function groupMembersPayload() {
 function groupRowToRecord(row: any): GroupRecord {
   return {
     id: row.id,
+    user_id: row.user_id,
     ts: row.ts,
     conversation_id: row.conversation_id || 'workgroup',
     sender_id: row.sender_id,
@@ -1716,24 +1930,24 @@ function groupRowToRecord(row: any): GroupRecord {
   }
 }
 
-function readGroupRecords(since: string | null, limit: number, conversationId?: string, beforeId?: string | null) {
+function readGroupRecords(userId: string, since: string | null, limit: number, conversationId?: string, beforeId?: string | null) {
   const safeLimit = Math.min(Math.max(limit || 120, 1), 500)
   let rows: any[]
   // AIC-90: before_id 历史分页 — 取 ts < anchor.ts (按 ts DESC) limit 条 + reverse 让最早在头
   if (beforeId) {
-    const anchor = db.prepare(`SELECT ts FROM group_messages WHERE id = ?`).get(beforeId) as any
+    const anchor = db.prepare(`SELECT ts FROM group_messages WHERE id = ? AND user_id=?`).get(beforeId, userId) as any
     if (!anchor) return []
     rows = conversationId
-      ? (db.prepare(`SELECT * FROM group_messages WHERE conversation_id = ? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(conversationId, anchor.ts, safeLimit) as any[]).reverse()
-      : (db.prepare(`SELECT * FROM group_messages WHERE ts < ? ORDER BY ts DESC LIMIT ?`).all(anchor.ts, safeLimit) as any[]).reverse()
+      ? (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id = ? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(userId, conversationId, anchor.ts, safeLimit) as any[]).reverse()
+      : (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(userId, anchor.ts, safeLimit) as any[]).reverse()
   } else if (conversationId) {
     rows = since
-      ? db.prepare(`SELECT * FROM group_messages WHERE conversation_id = ? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(conversationId, since, safeLimit) as any[]
-      : (db.prepare(`SELECT * FROM group_messages WHERE conversation_id = ? ORDER BY ts DESC LIMIT ?`).all(conversationId, safeLimit) as any[]).reverse()
+      ? db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id = ? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(userId, conversationId, since, safeLimit) as any[]
+      : (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id = ? ORDER BY ts DESC LIMIT ?`).all(userId, conversationId, safeLimit) as any[]).reverse()
   } else {
     rows = since
-      ? db.prepare(`SELECT * FROM group_messages WHERE ts > ? ORDER BY ts ASC LIMIT ?`).all(since, safeLimit) as any[]
-      : (db.prepare(`SELECT * FROM group_messages ORDER BY ts DESC LIMIT ?`).all(safeLimit) as any[]).reverse()
+      ? db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(userId, since, safeLimit) as any[]
+      : (db.prepare(`SELECT * FROM group_messages WHERE user_id=? ORDER BY ts DESC LIMIT ?`).all(userId, safeLimit) as any[]).reverse()
   }
   return rows.map(groupRowToRecord)
 }
@@ -1761,8 +1975,10 @@ function updateGroupAgentState(agentId: string, patch: Record<string, any>) {
 // "working" status text shown on each agent's worker card. Per-agent phrase pools — pick
 // something playful or just leave the generic defaults. Customize per agent personality.
 const WORKING_PHRASES: Record<string, string[]> = {
-  agent1: ['正在思考...', '处理中...', '写代码中...', 'Thinking...', 'Working...'],
-  agent2: ['正在思考...', '处理中...', '审查中...', 'Reviewing...', 'Working...'],
+  product: ['梳理需求中...', '规划系列中...', '拆解 SKU 中...', '校准上市节奏...'],
+  creative: ['构思画面中...', '搭建视觉叙事...', '打磨提示词中...', '整理 KV 方向...'],
+  social: ['规划内容中...', '适配平台语境...', '排内容日历中...', '分析互动机会...'],
+  growth: ['设计增长实验...', '优化转化漏斗...', '寻找增长杠杆...', '核算活动回报...'],
 }
 function pickWorkingPhrase(agentId: string): string {
   const pool = WORKING_PHRASES[agentId]
@@ -1805,7 +2021,7 @@ function markAgentIdle(agentId: string) {
 // AIC-119: per-agent statusline cache. agent runtime's statusline.sh fire-and-forget POST 整 stdin
 // JSON 进来 → web 终端面板底部 row 5s poll cached + age_ms 自己判 stale. server 重启 cache 丢失无害.
 const AGENT_STATUSLINE_CACHE = new Map<string, { data: any; ts: number }>()
-const AGENT_STATUSLINE_IDS = new Set(['agent1', 'agent2'])
+const AGENT_STATUSLINE_IDS = new Set<string>(ROLE_AGENT_IDS)
 
 function isAgentWorkingInDb(agentId: string): boolean {
   const row = db.prepare(`SELECT status_text, is_typing FROM group_agent_state WHERE agent_id = ?`).get(agentId) as any
@@ -1816,7 +2032,7 @@ function isAgentWorkingInDb(agentId: string): boolean {
 function groupAgentAutoReply(agentId: string) {
   const row = db.prepare(`SELECT auto_reply FROM group_agent_settings WHERE agent_id = ?`).get(agentId) as any
   if (row) return Boolean(row.auto_reply)
-  return agentId === 'agent1' || agentId === 'agent2'
+  return ROLE_AGENT_IDS.includes(agentId as typeof ROLE_AGENT_IDS[number])
 }
 
 function setGroupAgentAutoReply(agentId: string, enabled: boolean) {
@@ -1831,7 +2047,7 @@ function setGroupAgentAutoReply(agentId: string, enabled: boolean) {
   )
 }
 
-function appendGroupRecord(input: any, mentions: string[], delivery: any) {
+function appendGroupRecord(input: any, mentions: string[], delivery: any, userId: string) {
   const senderId = String(input.sender_id || 'admin').trim()
   const member = GROUP_ROSTER_BY_ID.get(senderId)
   if (!member) throw new Error(`unknown sender_id: ${senderId}`)
@@ -1846,6 +2062,7 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any) {
   const ts = groupNowIso()
   const record: GroupRecord = {
     id: groupId('grp'),
+    user_id: userId,
     ts,
     conversation_id: String(input.conversation_id || 'workgroup'),
     sender_id: senderId,
@@ -1865,8 +2082,8 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any) {
     owner: String(input.owner || '').trim() || (delivery.targets?.[0] || null),
   }
   db.run(
-    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       record.id,
       record.ts,
@@ -1886,6 +2103,7 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any) {
       record.task_id,
       record.parent_task_id,
       record.owner,
+      record.user_id,
     ],
   )
   // AIC-51: previously agent post → markAgentIdle as a "round done" heuristic.
@@ -1899,8 +2117,8 @@ function saveGroupDelivery(recordId: string, delivery: any) {
   db.run(`UPDATE group_messages SET delivery = ? WHERE id = ?`, [JSON.stringify(delivery), recordId])
 }
 
-function groupContextLines(limit = 16) {
-  return readGroupRecords(null, limit, 'workgroup').map((rec) => {
+function groupContextLines(userId: string, conversationId: string, limit = 16) {
+  return readGroupRecords(userId, null, limit, conversationId).map((rec) => {
     const member = GROUP_ROSTER_BY_ID.get(rec.sender_id)
     const name = member?.display_name || rec.sender_id
     const text = rec.text.replace(/\s+/g, ' ').slice(0, 180)
@@ -1959,25 +2177,7 @@ function buildTaskInjection(record: GroupRecord, recipientActor: string): string
   return result
 }
 
-function buildAgent2Injection(record: GroupRecord, hopCount: number, observeOnly = false) {
-  // v2 task system_notification → [task / ...] envelope
-  const taskEnv = buildTaskInjection(record, 'agent2')
-  if (taskEnv) return taskEnv
-  const sender = GROUP_ROSTER_BY_ID.get(record.sender_id)?.display_name || record.sender_id
-  const isDm = !!dmAgentFor(record.conversation_id)
-  const head = isDm
-    ? `[私聊 / ${sender} · 请 curl 回复到 dm-agent2]`
-    : `[workgroup${observeOnly ? ' observe' : ''} / ${sender}]`
-  const meta = [
-    `message_id=${record.id}`,
-    record.task_id ? `task_id=${record.task_id}` : '',
-    `hop_count=${hopCount}`,
-  ].filter(Boolean).join('\n')
-  const footer = observeOnly && !isDm ? OBSERVE_FOOTER : ''
-  return `${head}\n${meta}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
-}
-
-// Direct-message conversation id like 'dm-agent1' → the agent id ('agent1'),
+// Direct-message conversation id like 'dm-product' → the agent id ('product'),
 // or null if it isn't a DM to a known replyable agent.
 function dmAgentFor(conversationId: string | null | undefined): string | null {
   if (!conversationId || !conversationId.startsWith('dm-')) return null
@@ -1986,20 +2186,25 @@ function dmAgentFor(conversationId: string | null | undefined): string | null {
   return member && member.kind === 'agent' && member.can_reply ? agent : null
 }
 
-function allowedGroupConversationsForSender(senderId: string): Set<string> {
+function allowedGroupConversationsForSender(senderId: string, userId: string): Set<string> {
   if (senderId === 'admin') {
-    return new Set(['workgroup', ...GROUP_REPLY_AGENT_IDS.map((id) => `dm-${id}`)])
+    return new Set([...listGroupConversations(userId).map((group) => group.id), ...GROUP_REPLY_AGENT_IDS.map((id) => `dm-${id}`)])
   }
   const member = GROUP_ROSTER_BY_ID.get(senderId)
   if (member?.kind === 'agent' && member.can_reply) {
-    return new Set(['workgroup', `dm-${senderId}`])
+    const groupIds = (db.prepare(`SELECT m.conversation_id FROM group_conversation_members m
+      JOIN group_conversations c ON c.id=m.conversation_id
+      WHERE m.member_id=? AND c.user_id=?`).all(senderId, userId) as any[])
+      .map((row) => String(row.conversation_id))
+    return new Set([...groupIds, `dm-${senderId}`])
   }
   return new Set(['workgroup'])
 }
 
-function assertGroupConversationAllowed(senderId: string, conversationId: string | null | undefined) {
-  const normalizedConversationId = String(conversationId || 'workgroup').trim() || 'workgroup'
-  const allowed = allowedGroupConversationsForSender(senderId)
+function assertGroupConversationAllowed(senderId: string, conversationId: string | null | undefined, userId: string) {
+  const normalizedConversationId = String(conversationId || '').trim()
+  if (!normalizedConversationId) throw new Error('conversation_id required')
+  const allowed = allowedGroupConversationsForSender(senderId, userId)
   if (!allowed.has(normalizedConversationId)) {
     throw new Error(`sender ${senderId} cannot post to ${normalizedConversationId}`)
   }
@@ -2023,19 +2228,93 @@ function groupAttachmentsBlock(record: GroupRecord): string {
 // must be an explicit self-curl with a chosen conversation_id.
 const OBSERVE_FOOTER = `\n\n（旁听消息，用来同步工作群上下文。默认不回；server 这一 turn 不会 auto-route 你的 assistant text 到任何频道。真想说话必须自己 curl /group/send，由你显式指定 conversation_id（"workgroup" 公开回 / "dm-<your-id>" 私聊回）。）`
 
-function buildPlainBridgePrompt(record: GroupRecord, observeOnly = false) {
-  // v2 task system_notification → [task / ...] envelope (recipient = agent1 when injecting via this path)
-  const taskEnv = buildTaskInjection(record, 'agent1')
+function buildBridgePrompt(record: GroupRecord, recipient: string, hopCount: number, observeOnly = false) {
+  const taskEnv = buildTaskInjection(record, recipient)
   if (taskEnv) return taskEnv
   const sender = GROUP_ROSTER_BY_ID.get(record.sender_id)?.display_name || record.sender_id
-  const head = dmAgentFor(record.conversation_id)
-    ? `[私聊 / ${sender} · 请 curl 回复到 dm-agent1]`
+  const isDm = !!dmAgentFor(record.conversation_id)
+  const head = isDm
+    ? `[私聊 / ${sender} / ${recipient}]`
     : `[workgroup${observeOnly ? ' observe' : ''} / ${sender}]`
-  const footer = observeOnly && !dmAgentFor(record.conversation_id) ? OBSERVE_FOOTER : ''
-  return `${head}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
+  const meta = [
+    `message_id=${record.id}`,
+    record.task_id ? `task_id=${record.task_id}` : '',
+    `hop_count=${hopCount}`,
+  ].filter(Boolean).join('\n')
+  const footer = observeOnly && !isDm ? OBSERVE_FOOTER : ''
+  const runtime = AGENT_RUNTIMES[recipient]
+  const promptCandidates = [
+    runtime?.promptPath,
+    runtime?.cwd ? path.join(runtime.cwd, 'AGENTS.md') : '',
+    path.join(import.meta.dir, 'agents', recipient, 'AGENTS.md'),
+  ].filter(Boolean) as string[]
+  let sharedDefinition = ''
+  for (const candidate of promptCandidates) {
+    try {
+      if (existsSync(candidate)) { sharedDefinition = readFileSync(candidate, 'utf8').trim(); break }
+    } catch {}
+  }
+  const privateMemory = userRepo.memory(record.user_id, recipient)?.content?.trim() || ''
+  const recentContext = readGroupRecords(record.user_id, null, 12, record.conversation_id)
+    .filter((item) => item.id !== record.id)
+    .map((item) => {
+      const name = GROUP_ROSTER_BY_ID.get(item.sender_id)?.display_name || item.sender_id
+      return `${name}: ${item.text.replace(/\s+/g, ' ').slice(0, 500)}`
+    })
+    .join('\n')
+  const serverContext = [
+    sharedDefinition ? `[共享 Agent Definition]\n${sharedDefinition}` : '',
+    privateMemory ? `[当前用户私有 Memory]\n${privateMemory}` : '',
+    recentContext ? `[当前 Conversation 近期上下文]\n${recentContext}` : '',
+  ].filter(Boolean).join('\n\n')
+  const request = `${head}\n${meta}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
+  return serverContext ? `${serverContext}\n\n[本次请求]\n${request}` : request
 }
 
 // AIC-116: injectToTmux removed. Dispatch goes through `provider.send()` in dispatchGroupRecord.
+
+function demoteAgentTurnDelivery(agentId: string, route: AgentTurnRoute) {
+  try {
+    const row = db.prepare(`SELECT delivery FROM group_messages WHERE id=? AND user_id=?`).get(route.recordId, route.userId) as any
+    if (!row?.delivery) return
+    const delivery = JSON.parse(row.delivery)
+    const deliveredList = route.observeOnly ? delivery.observed : delivery.delivered
+    const failedList = route.observeOnly
+      ? (delivery.observe_failed = delivery.observe_failed || [])
+      : (delivery.failed = delivery.failed || [])
+    const index = Array.isArray(deliveredList) ? deliveredList.indexOf(agentId) : -1
+    if (index !== -1) deliveredList.splice(index, 1)
+    if (!failedList.includes(agentId)) failedList.push(agentId)
+    saveGroupDelivery(route.recordId, delivery)
+  } catch (saveErr) {
+    console.error(`dispatchGroupRecord: failed to demote ${agentId} in delivery record:`, saveErr)
+  }
+}
+
+/**
+ * Providers such as Codex may treat input sent during an active turn as steering
+ * for that same turn. Starting exactly one queued prompt at a time gives every
+ * dispatch one assistant/result lifecycle and therefore one stable route.
+ */
+function startNextAgentTurn(userId: string, conversationId: string, agentId: string) {
+  const key = runtimeProviderKey(userId, conversationId, agentId)
+  const route = _agentTurnRoutes.startNext(key)
+  if (!route) return
+  const provider = ensureProvider(userId, conversationId, agentId)
+  if (!provider) {
+    _agentTurnRoutes.remove(key, route.id)
+    demoteAgentTurnDelivery(agentId, route)
+    startNextAgentTurn(userId, conversationId, agentId)
+    return
+  }
+  provider.send(route.prompt).catch((e: any) => {
+    console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
+    _agentTurnRoutes.remove(key, route.id)
+    demoteAgentTurnDelivery(agentId, route)
+    if (isAgentWorkingInDb(agentId) && !_agentTurnRoutes.hasResponseTurn(key)) markAgentIdle(agentId)
+    startNextAgentTurn(userId, conversationId, agentId)
+  })
+}
 
 function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: number, observeOnly = false) {
   // AIC-116: legacy key injection → provider.send(). Provider auto-spawns its subprocess on
@@ -2048,57 +2327,44 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
   // Optimistically mark `delivered` then correct after-the-fact if send() rejects async.
   const delivered: string[] = []
   const failed: string[] = []
-  const correctableTargets: string[] = []  // targets we optimistically pushed but may need to demote
+  const errors: Record<string, string> = {}
   for (const target of targets) {
     const member = GROUP_ROSTER_BY_ID.get(target)
     if (!member || member.kind !== 'agent') {
       failed.push(target)
       continue
     }
-    const provider = ensureProvider(target)
+    if (AGENT_RUNTIMES[target]?.provider === 'remote-codex' && !connectorRegistry.isUserOnline(record.user_id)) {
+      failed.push(target)
+      errors[target] = 'CODEX_CONNECTOR_OFFLINE'
+      continue
+    }
+    const provider = ensureProvider(record.user_id, record.conversation_id, target)
     if (!provider) {
       console.error(`dispatchGroupRecord: no provider runtime configured for ${target}`)
       failed.push(target)
       continue
     }
-    const text = target === 'agent2'
-      ? buildAgent2Injection(record, hopCount + 1, observeOnly)
-      : buildPlainBridgePrompt(record, observeOnly)
+    const text = buildBridgePrompt(record, target, hopCount + 1, observeOnly)
     if (!observeOnly) markAgentWorking(target, { dispatch_id: record.delivery.dispatch_id })
-    // AIC-116: record which conversation this agent was dispatched into so
-    // handleProviderEvent can write its assistant reply back into the right channel.
-    if (!observeOnly) _agentLastDispatchChannel.set(target, record.conversation_id)
-    // AIC-132: tag this turn as observe-only so `handleProviderEvent` drops the
-    // assistant text instead of auto-appending it to a channel. Set BEFORE provider.send
-    // so the agent's first assistant event (which can arrive before send() resolves on
-    // long streams) already sees the flag.
-    _agentIsObserveTurn.set(target, observeOnly)
-    // Optimistic delivered; corrected via the .catch() below when send() rejects async.
-    delivered.push(target)
-    correctableTargets.push(target)
-    provider.send(text).catch((e: any) => {
-      // AIC-116 cycle 2: send() rejected → spawn / init / handshake failure.
-      // Agent never accepted the message. Demote from delivered → failed, re-persist delivery,
-      // and mark idle so the UI dot goes neutral instead of "working forever".
-      console.error(`dispatchGroupRecord: provider.send to ${target} rejected:`, e)
-      if (isAgentWorkingInDb(target)) markAgentIdle(target)
-      // Re-read the current delivery (other concurrent .catch() handlers may have updated
-      // it) and atomically demote this target.
-      try {
-        const row = db.prepare(`SELECT delivery FROM group_messages WHERE id=?`).get(record.id) as any
-        if (row?.delivery) {
-          const cur = JSON.parse(row.delivery)
-          const list = observeOnly ? cur.observed : cur.delivered
-          const failList = observeOnly ? (cur.observe_failed = cur.observe_failed || []) : (cur.failed = cur.failed || [])
-          const idx = Array.isArray(list) ? list.indexOf(target) : -1
-          if (idx !== -1) list.splice(idx, 1)
-          if (!failList.includes(target)) failList.push(target)
-          saveGroupDelivery(record.id, cur)
-        }
-      } catch (saveErr) {
-        console.error(`dispatchGroupRecord: failed to demote ${target} in delivery record:`, saveErr)
-      }
+    // Queue before starting the provider turn: streaming assistant events may arrive
+    // before send() resolves, while later prompts must wait for this turn's result.
+    const turnRouteId = groupId('turn')
+    const key = runtimeProviderKey(record.user_id, record.conversation_id, target)
+    _agentTurnRoutes.enqueue(key, {
+      id: turnRouteId,
+      userId: record.user_id,
+      conversationId: record.conversation_id,
+      observeOnly,
+      dispatchId: record.delivery.dispatch_id,
+      recordId: record.id,
+      prompt: text,
+      started: false,
+      hopCount: hopCount + 1,
     })
+    // Optimistic delivered; startNextAgentTurn corrects it if send() rejects.
+    delivered.push(target)
+    startNextAgentTurn(record.user_id, record.conversation_id, target)
   }
   if (observeOnly) {
     record.delivery.observed = delivered
@@ -2106,6 +2372,7 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
   } else {
     record.delivery.delivered = delivered
     record.delivery.failed = failed
+    if (Object.keys(errors).length) record.delivery.errors = errors
   }
   saveGroupDelivery(record.id, record.delivery)
   return { delivered, failed }
@@ -2291,38 +2558,111 @@ function fetchCodexUsageCached(): any {
 
 // AIC-116: startAgentLifecycleWatcher() removed — provider events drive working/idle status.
 
+type ConnectorSocketData = { deviceId: string | null; userId: string | null }
+
+function connectorWebsocketUrl(req: Request): string {
+  if (CONNECTOR_WS_URL) return CONNECTOR_WS_URL
+  if (AI_STUDIO_PUBLIC_URL) {
+    const configured = new URL(AI_STUDIO_PUBLIC_URL)
+    configured.protocol = configured.protocol === 'https:' ? 'wss:' : 'ws:'
+    configured.pathname = '/connector'
+    configured.search = ''
+    return configured.toString()
+  }
+  const incoming = new URL(req.url)
+  const forwardedProto = req.headers.get('x-forwarded-proto')?.split(',')[0]?.trim()
+  incoming.protocol = forwardedProto === 'https' || incoming.protocol === 'https:' ? 'wss:' : 'ws:'
+  incoming.pathname = '/connector'
+  incoming.search = ''
+  return incoming.toString()
+}
+
 // Image HTTP server for upload/download
-Bun.serve({
+Bun.serve<ConnectorSocketData>({
   port: IMG_PORT,
   // AIC-52: was '0.0.0.0' which exposed 3009 on every interface — anyone on the
   // same wifi could hit the API. cloudflared connects from this host, so the
   // public tunnel keeps working; LAN devices that previously skipped auth lose
   // their backdoor.
-  hostname: '127.0.0.1',
-  async fetch(req) {
+  hostname: SERVER_HOST,
+  async fetch(req, server) {
     const url = new URL(req.url)
+    if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
+      try {
+        db.prepare('SELECT 1 AS ok').get()
+        return Response.json({
+          status: 'ok',
+          server: 'ok',
+          database: 'ok',
+          connector: 'ok',
+        })
+      } catch {
+        return Response.json({
+          status: 'error',
+          server: 'ok',
+          database: 'error',
+          connector: 'ok',
+        }, { status: 503 })
+      }
+    }
+    if (req.method === 'GET' && url.pathname === '/connector') {
+      if (server.upgrade(req, { data: { deviceId: null, userId: null } })) return undefined
+      return Response.json({ ok: false, error: 'websocket upgrade required' }, { status: 426 })
+    }
     const dangerousEndpoint = dangerousEndpointFor(req.method, url.pathname)
-    const authMode = requestAuthMode(req, url, AUTH_TOKEN, {
-      
-      allowQueryToken: ALLOW_QUERY_TOKEN_AUTH,
-    })
+    const currentUser = authenticatedUser(db, req)
+    const isSecureRequest = url.protocol === 'https:' || req.headers.get('x-forwarded-proto') === 'https'
+    const publicPath = url.pathname === '/web/login.html'
+      || (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login' || url.pathname === '/api/auth/bootstrap'))
+      || (req.method === 'POST' && url.pathname === '/api/connectors/pair')
+      || (req.method === 'POST' && url.pathname === '/api/agent-statusline' && isLocalRequestHost(url.hostname))
 
-    // Global auth: all routes require auth or localhost origin
-    const hasAuth = authMode !== null
-    if (authMode === 'query') {
-      logDangerousOperation('deprecated_query_token_auth', {
-        method: req.method,
-        path: url.pathname,
-        host: url.hostname,
-      })
+    // One-time bootstrap. The existing operator token authorizes setting the
+    // first admin password, but never becomes a user session or user identity.
+    if (req.method === 'POST' && url.pathname === '/api/auth/bootstrap') {
+      if (req.headers.get('authorization') !== `Bearer ${AUTH_TOKEN}`) {
+        return Response.json({ ok: false, error: 'invalid bootstrap authorization' }, { status: 403 })
+      }
+      try {
+        const body = await req.json() as any
+        const changed = await ensureLegacyAdminPassword(db, String(body.password || ''))
+        if (!changed) return Response.json({ ok: false, error: 'admin already initialized' }, { status: 409 })
+        const session = createSession(db, LEGACY_ADMIN_ID)
+        return Response.json({ ok: true }, { headers: { 'Set-Cookie': sessionCookie(session.token, isSecureRequest) } })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'bootstrap failed' }, { status: 400 })
+      }
     }
 
-    // Login page & login POST: exempt from auth
-    // AIC-119: statusline POST 也 exempt (本机 fire-and-forget, 不带 token), 但限 localhost.
-    if (url.pathname === '/web/login.html' || (req.method === 'POST' && url.pathname === '/web/login')
-        || (req.method === 'POST' && url.pathname === '/api/agent-statusline' && isLocalRequestHost(url.hostname))) {
-      // fall through to handlers below
-    } else if (!hasAuth) {
+    if (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login')) {
+      try {
+        const body = await req.json() as any
+        const user = await authenticatePassword(db, String(body.username || ''), String(body.password || ''))
+        if (!user) return Response.json({ ok: false, error: '用户名或密码错误' }, { status: 401 })
+        const session = createSession(db, user.id)
+        return Response.json({ ok: true, user }, { headers: { 'Set-Cookie': sessionCookie(session.token, isSecureRequest) } })
+      } catch {
+        return Response.json({ ok: false, error: 'bad request' }, { status: 400 })
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/connectors/pair') {
+      try {
+        const body = await req.json() as any
+        const paired = redeemPairingCode(db, String(body.pairing_code || ''), String(body.device_name || ''))
+        return Response.json({
+          ok: true,
+          device: paired.device,
+          device_token: paired.deviceToken,
+          websocket_url: connectorWebsocketUrl(req),
+          protocol_version: 1,
+        }, { status: 201 })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'pairing failed' }, { status: 400 })
+      }
+    }
+
+    if (!currentUser && !publicPath) {
       if (dangerousEndpoint) {
         logDangerousOperation('unauthorized_dangerous_request', {
           method: req.method,
@@ -2332,26 +2672,12 @@ Bun.serve({
           host: url.hostname,
         })
       }
-      // For web page GETs (HTML entry points only — NOT static assets like .js/.css/.png),
-      // auto-set the aicollab_auth cookie and redirect to the original page. The browser will then
-      // include the cookie on subsequent XHR / asset fetches that DO require auth.
-      // Open-source onboarding: users don't type a token; the server-derived AUTH_TOKEN (from
-      // env or runtime-data/state/token.txt) is bound to the cookie on first GET. Anyone able
-      // to reach the server thus gets in — bind the server to 127.0.0.1 if you don't want that.
       const isHtmlEntry = url.pathname === '/' || url.pathname === '/web' || url.pathname === '/web/'
         || url.pathname.endsWith('.html')
         || url.pathname === '/web/workgroup-v2'
       if (req.method === 'GET' && isHtmlEntry) {
-        const target = url.pathname === '/' || url.pathname === '/web' || url.pathname === '/web/' || url.pathname === '/web/workgroup-v2'
-          ? '/web/workgroup-v2/index.html'
-          : url.pathname
-        return new Response(null, {
-          status: 302,
-          headers: {
-            'Location': target,
-            'Set-Cookie': `aicollab_auth=${AUTH_TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 3600}`,
-          },
-        })
+        const next = url.pathname === '/web/login.html' ? '/web/workgroup-v2/index.html' : `${url.pathname}${url.search}`
+        return new Response(null, { status: 302, headers: { Location: `/web/login.html?next=${encodeURIComponent(next)}` } })
       }
       return Response.json({ error: 'unauthorized' }, { status: 401 })
     }
@@ -2362,33 +2688,29 @@ Bun.serve({
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
       const data = await req.arrayBuffer()
       await Bun.write(path.join(UPLOADS_DIR, filename), data)
+      db.run(`INSERT INTO uploaded_assets (filename, user_id, original_name, byte_size, created_at) VALUES (?, ?, ?, ?, ?)`, [
+        filename, currentUser!.id, origName, data.byteLength, groupNowIso(),
+      ])
       return Response.json({ filename, original: origName, size: data.byteLength })
     }
 
     if (req.method === 'GET' && url.pathname.startsWith('/images/')) {
       const filename = decodeURIComponent(url.pathname.slice(8))
+      const owner = db.prepare(`SELECT user_id FROM uploaded_assets WHERE filename=?`).get(filename) as any
+      if (owner && owner.user_id !== currentUser!.id) return new Response('not found', { status: 404 })
+      if (!owner && currentUser!.id !== LEGACY_ADMIN_ID) return new Response('not found', { status: 404 })
       const filePath = resolveStoredMediaPath(filename)
       const file = Bun.file(filePath)
       if (await file.exists()) return new Response(file)
       return new Response('not found', { status: 404 })
     }
 
-    // Login POST handler
-    if (req.method === 'POST' && url.pathname === '/web/login') {
-      try {
-        const body = await req.json() as any
-        if (body.password === AUTH_TOKEN) {
-          return new Response(JSON.stringify({ ok: true }), {
-            headers: {
-              'Content-Type': 'application/json',
-              'Set-Cookie': `aicollab_auth=${AUTH_TOKEN}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${30 * 24 * 3600}`
-            }
-          })
-        }
-        return Response.json({ error: 'wrong password' }, { status: 401 })
-      } catch {
-        return Response.json({ error: 'bad request' }, { status: 400 })
-      }
+    if (req.method === 'GET' && url.pathname === '/api/auth/me' && currentUser) {
+      return Response.json({ ok: true, user: currentUser })
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auth/logout' && currentUser) {
+      revokeSession(db, req)
+      return Response.json({ ok: true }, { headers: { 'Set-Cookie': clearSessionCookie(isSecureRequest) } })
     }
 
     // /, /web, /web/ 全 redirect 到 workgroup-v2 主入口（防外网书签 404）
@@ -2429,18 +2751,77 @@ Bun.serve({
     }
 
     // === HTTP Polling API (auth required) ===
-    const isAuthed = hasRequestAuth(req, url, AUTH_TOKEN, {
-      
-      allowQueryToken: ALLOW_QUERY_TOKEN_AUTH,
-    })
+    const isAuthed = Boolean(currentUser)
+
+    if (req.method === 'GET' && url.pathname === '/api/users' && isAuthed) {
+      if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'admin required' }, { status: 403 })
+      const users = db.prepare(`SELECT id, tenant_id, username, display_name, role, created_at, updated_at
+        FROM users WHERE tenant_id=? ORDER BY created_at`).all(currentUser!.tenant_id)
+      return Response.json({ ok: true, users })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/users' && isAuthed) {
+      if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'admin required' }, { status: 403 })
+      try {
+        const body = await req.json() as any
+        const user = await createUser(db, {
+          username: String(body.username || ''),
+          displayName: String(body.display_name || body.username || ''),
+          password: String(body.password || ''),
+          role: body.role === 'admin' ? 'admin' : 'user',
+          tenantId: currentUser!.tenant_id,
+        })
+        return Response.json({ ok: true, user }, { status: 201 })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'unable to create user' }, { status: 400 })
+      }
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/connectors' && isAuthed) {
+      return Response.json({ ok: true, devices: listDevices(db, currentUser!.id) })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/connectors/pairing-code' && isAuthed) {
+      const pairing = createPairingCode(db, currentUser!.id)
+      return Response.json({ ok: true, pairing_code: pairing.code, expires_at: pairing.expiresAt }, { status: 201 })
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/conversations' && isAuthed) {
+      ensureUserDefaultConversation(currentUser!)
+      return Response.json({ ok: true, conversations: userRepo.listConversations(currentUser!.id) })
+    }
+
+    const conversationMessagesMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/)
+    if (req.method === 'GET' && conversationMessagesMatch && isAuthed) {
+      const conversationId = decodeURIComponent(conversationMessagesMatch[1])
+      if (!userRepo.getConversation(currentUser!.id, conversationId) && !dmAgentFor(conversationId)) {
+        return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
+      }
+      return Response.json({ ok: true, messages: userRepo.listMessages(currentUser!.id, conversationId) })
+    }
+
+    const agentMemoryMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/memory$/)
+    if (agentMemoryMatch && isAuthed) {
+      const agentId = decodeURIComponent(agentMemoryMatch[1])
+      if (!ROLE_AGENT_IDS.includes(agentId as typeof ROLE_AGENT_IDS[number])) {
+        return Response.json({ ok: false, error: 'unknown agent' }, { status: 404 })
+      }
+      if (req.method === 'GET') {
+        return Response.json({ ok: true, memory: userRepo.memory(currentUser!.id, agentId) })
+      }
+      if (req.method === 'PUT') {
+        const body = await req.json().catch(() => ({})) as any
+        return Response.json({ ok: true, memory: userRepo.saveMemory(currentUser!.id, agentId, String(body.content || '')) })
+      }
+    }
 
     // Workgroup roster: GET /group/roster
     if (req.method === 'GET' && url.pathname === '/group/roster' && isAuthed) {
       return Response.json({
         ok: true,
         roster: GROUP_ROSTER,
-        members: groupMembersPayload(),
-        status: groupStatusSnapshot(),
+        members: groupMembersPayload(currentUser!.id),
+        status: groupStatusSnapshot(currentUser!.id),
       })
     }
 
@@ -2461,11 +2842,9 @@ Bun.serve({
     if (req.method === 'PUT' && /^\/api\/actor-styles\/[^/]+$/.test(url.pathname) && isAuthed) {
       try {
         const body = await req.json().catch(() => ({})) as any
-        const authMode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
-        const isPm = authMode === 'cookie' || authMode === 'local' || (authMode === 'header' && body.sender_id === 'admin')
-        if (!isPm) return Response.json({ ok: false, error: 'only PM can edit actor styles' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can edit shared actor styles' }, { status: 403 })
         const actorId = decodeURIComponent(url.pathname.split('/')[3])
-        const VALID_ACTORS = new Set(['admin', 'agent1', 'agent2', 'system'])
+        const VALID_ACTORS = new Set(['admin', ...ROLE_AGENT_IDS, 'system'])
         if (!VALID_ACTORS.has(actorId)) return Response.json({ ok: false, error: `unknown actor_id '${actorId}'` }, { status: 400 })
         const patch: Record<string, string> = {}
         for (const field of ['avatar_kind', 'avatar_value', 'bubble_bg'] as const) {
@@ -2501,6 +2880,62 @@ Bun.serve({
       return Response.json({ ok: false, error: 'AIC-63 cycle 4: per-theme + avatar-broadcast endpoints removed. Use PUT /api/actor-styles/:actor_id instead.' }, { status: 410 })
     }
 
+    // Multi-workgroup management.
+    if (req.method === 'GET' && url.pathname === '/groups' && isAuthed) {
+      ensureUserDefaultConversation(currentUser!)
+      return Response.json({ ok: true, groups: listGroupConversations(currentUser!.id) })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/groups' && isAuthed) {
+      try {
+        const body = await req.json() as any
+        const name = String(body.name || '').trim().slice(0, 60)
+        if (!name) return Response.json({ ok: false, error: '群名称不能为空' }, { status: 400 })
+        const memberIds = normalizeConversationMembers(body.member_ids)
+        if (memberIds.length < 2) return Response.json({ ok: false, error: '请至少选择一个 agent' }, { status: 400 })
+        const id = `group-${randomBytes(6).toString('hex')}`
+        const now = groupNowIso()
+        db.run(`BEGIN IMMEDIATE`)
+        try {
+          db.run(`INSERT INTO group_conversations (id, name, created_at, created_by, is_default, user_id) VALUES (?, ?, ?, ?, 0, ?)`, [id, name, now, currentUser!.id, currentUser!.id])
+          saveConversationMembers(id, memberIds)
+          db.run(`COMMIT`)
+        } catch (e) {
+          try { db.run(`ROLLBACK`) } catch {}
+          throw e
+        }
+        return Response.json({ ok: true, group: groupConversationById(id, currentUser!.id) }, { status: 201 })
+      } catch (e: any) {
+        return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
+      }
+    }
+
+    const groupManageMatch = url.pathname.match(/^\/groups\/([^/]+)$/)
+    if (req.method === 'PUT' && groupManageMatch && isAuthed) {
+      try {
+        const groupIdValue = decodeURIComponent(groupManageMatch[1])
+        const existing = groupConversationById(groupIdValue, currentUser!.id)
+        if (!existing) return Response.json({ ok: false, error: '群不存在' }, { status: 404 })
+        const body = await req.json() as any
+        const name = String(body.name ?? existing.name).trim().slice(0, 60)
+        if (!name) return Response.json({ ok: false, error: '群名称不能为空' }, { status: 400 })
+        const memberIds = body.member_ids === undefined ? existing.member_ids : normalizeConversationMembers(body.member_ids)
+        if (memberIds.length < 2) return Response.json({ ok: false, error: '请至少选择一个 agent' }, { status: 400 })
+        db.run(`BEGIN IMMEDIATE`)
+        try {
+          db.run(`UPDATE group_conversations SET name=? WHERE id=?`, [name, groupIdValue])
+          saveConversationMembers(groupIdValue, memberIds)
+          db.run(`COMMIT`)
+        } catch (e) {
+          try { db.run(`ROLLBACK`) } catch {}
+          throw e
+        }
+        return Response.json({ ok: true, group: groupConversationById(groupIdValue, currentUser!.id) })
+      } catch (e: any) {
+        return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
+      }
+    }
+
     // Workgroup response gates: GET /group/settings
     if (req.method === 'GET' && url.pathname === '/group/settings' && isAuthed) {
       return Response.json({
@@ -2518,7 +2953,7 @@ Bun.serve({
         return Response.json({
           ok: true,
           auto_reply: Object.fromEntries(GROUP_REPLY_AGENT_IDS.map((id) => [id, groupAgentAutoReply(id)])),
-          status: groupStatusSnapshot(),
+          status: groupStatusSnapshot(currentUser!.id),
         })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -2530,8 +2965,12 @@ Bun.serve({
       const since = url.searchParams.get('since')
       const beforeId = url.searchParams.get('before_id')        // AIC-90: 历史分页
       const limit = parseInt(url.searchParams.get('limit') || '120')
-      const conversationId = url.searchParams.get('conversation_id') || 'workgroup'
-      const records = readGroupRecords(since, limit, conversationId, beforeId)
+      const defaultConversation = ensureUserDefaultConversation(currentUser!)
+      const conversationId = url.searchParams.get('conversation_id') || defaultConversation.id
+      if (!allowedGroupConversationsForSender('admin', currentUser!.id).has(conversationId)) {
+        return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
+      }
+      const records = readGroupRecords(currentUser!.id, since, limit, conversationId, beforeId)
       // AIC-90: 历史分页返 cursor (= 最早一条 id, client 下次传 before_id 用) + has_more
       // 兼容老 caller (不传 before_id 行为不变, cursor=null has_more=false)
       const isHistoryFetch = !!beforeId
@@ -2545,8 +2984,8 @@ Bun.serve({
         cursor,
         has_more: hasMore,
         roster: GROUP_ROSTER,
-        members: groupMembersPayload(),
-        status: groupStatusSnapshot(),
+        members: groupMembersPayload(currentUser!.id),
+        status: groupStatusSnapshot(currentUser!.id),
       })
     }
 
@@ -2555,13 +2994,14 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const text = String(body.text || '')
-        const senderId = String(body.sender_id || 'admin').trim()
+        // Browser clients cannot choose an identity. The authenticated user is
+        // represented as the human `admin` actor inside their private workspace.
+        const senderId = 'admin'
         // v2 system virtual identity: external clients cannot impersonate system.
         // notifyActorViaDM (server-internal) writes directly to group_messages without going through this endpoint.
-        if (senderId === 'system') return Response.json({ ok: false, error: 'sender_id=system is internal-only' }, { status: 403 })
         // Reject any message targeting dm-system (system has no DM channel to reply into).
         if (String(body.conversation_id || '') === 'dm-system') return Response.json({ ok: false, error: 'dm-system is not a valid conversation' }, { status: 400 })
-        assertGroupConversationAllowed(senderId, body.conversation_id)
+        assertGroupConversationAllowed(senderId, body.conversation_id, currentUser!.id)
         const hopCount = parseInt(String(body.hop_count || '0')) || 0
 
         // Direct message (1:1) conversation, e.g. conversation_id='dm-agent1'.
@@ -2570,20 +3010,20 @@ Bun.serve({
         // Channel restriction: only the DM owner (the agent) or PM can send here.
         const dmAgent = dmAgentFor(String(body.conversation_id || ''))
         if (dmAgent) {
-          const dmAuthMode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
-          const dmIsPm = dmAuthMode === 'cookie' || dmAuthMode === 'local' || (dmAuthMode === 'header' && senderId === 'admin')
+          const dmIsPm = senderId === 'admin'
           if (senderId !== dmAgent && !dmIsPm) {
             return Response.json({ ok: false, error: `only ${dmAgent} or PM can send to dm-${dmAgent}` }, { status: 403 })
           }
           const dmTargets = senderId === dmAgent ? [] : [dmAgent]
           const dmDelivery = { targets: dmTargets, mode: 'dm', dispatch_id: groupId('dsp'), delivered: [], failed: [] }
-          const dmRecord = appendGroupRecord({ ...body, sender_id: senderId }, [], dmDelivery)
+          const dmRecord = appendGroupRecord({ ...body, sender_id: senderId }, [], dmDelivery, currentUser!.id)
           if (dmTargets.length > 0) dispatchGroupRecord(dmRecord, dmTargets, hopCount)
           return Response.json({ ok: true, record: dmRecord, targets: dmTargets, observers: [] })
         }
 
         const mentions = normalizeGroupMentions(body.mentions, text)
-        const targets = groupTargetsFor(senderId, mentions, hopCount)
+        const conversationId = String(body.conversation_id || 'workgroup')
+        const targets = groupTargetsFor(senderId, mentions, hopCount, conversationId, currentUser!.id)
         const delivery = {
           targets,
           mode: mentions.includes(GROUP_ALL_TOKEN) ? 'all' : (mentions.length ? 'mention' : 'default'),
@@ -2591,9 +3031,9 @@ Bun.serve({
           delivered: [],
           failed: [],
         }
-        const record = appendGroupRecord({ ...body, sender_id: senderId }, mentions, delivery)
+        const record = appendGroupRecord({ ...body, sender_id: senderId }, mentions, delivery, currentUser!.id)
         if (targets.length > 0) dispatchGroupRecord(record, targets, hopCount)
-        const observers = groupObserverTargetsFor(senderId, targets)
+        const observers = groupObserverTargetsFor(senderId, targets, conversationId, currentUser!.id)
         if (observers.length > 0) dispatchGroupRecord(record, observers, hopCount, true)
         return Response.json({ ok: true, record, targets, observers })
       } catch (e: any) {
@@ -2617,7 +3057,7 @@ Bun.serve({
           dispatch_id: body.dispatch_id || null,
           status_text: body.status_text || null,
         })
-        return Response.json({ ok: true, status: groupStatusSnapshot() })
+        return Response.json({ ok: true, status: groupStatusSnapshot(currentUser!.id) })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
       }
@@ -2628,7 +3068,8 @@ Bun.serve({
     if (req.method === 'POST' && url.pathname === '/group/agent/clock-in' && isAuthed) {
       try {
         const body = await req.json() as any
-        const result = agentClockIn(String(body.agent_id || '').trim())
+        const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
+        const result = agentClockIn(currentUser!.id, conversationId, String(body.agent_id || '').trim())
         return Response.json(result, { status: result.ok ? 200 : 400 })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -2639,7 +3080,8 @@ Bun.serve({
     if (req.method === 'POST' && url.pathname === '/group/agent/clock-out' && isAuthed) {
       try {
         const body = await req.json() as any
-        const result = agentClockOut(String(body.agent_id || '').trim())
+        const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
+        const result = await agentClockOut(currentUser!.id, conversationId, String(body.agent_id || '').trim())
         return Response.json(result, { status: result.ok ? 200 : 400 })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -2650,7 +3092,8 @@ Bun.serve({
     if (req.method === 'POST' && url.pathname === '/group/agent/clock-out-ready' && isAuthed) {
       try {
         const body = await req.json() as any
-        const result = killAgentSession(String(body.agent_id || '').trim())
+        const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
+        const result = await killAgentSession(currentUser!.id, conversationId, String(body.agent_id || '').trim())
         return Response.json(result, { status: result.ok ? 200 : 400 })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
@@ -2693,23 +3136,17 @@ Bun.serve({
     if (req.method === 'POST' && url.pathname === '/seen' && isAuthed) {
       try {
         const body = await req.json() as any
-        const actorId = String(body.actor_id || '').trim()
+        const actorId = 'admin'
         const channel = String(body.channel || '').trim()
         const lastSeenId = String(body.last_seen_id || '').trim()
         if (!actorId || !channel || !lastSeenId) {
           return Response.json({ ok: false, error: 'actor_id, channel, last_seen_id required' }, { status: 400 })
         }
-        const mode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
-        const isSelf = mode === 'header' && body.sender_id === actorId
-        const isPm = mode === 'cookie' || mode === 'local' || (mode === 'header' && body.sender_id === 'admin')
-        if (!isSelf && !isPm) {
-          return Response.json({ ok: false, error: `actor ${actorId} must auth as self or PM proxy` }, { status: 403 })
-        }
         const now = groupNowIso()
         db.run(
-          `INSERT INTO actor_channel_seen (actor_id, channel, last_seen_id, updated_at) VALUES (?, ?, ?, ?)
-           ON CONFLICT(actor_id, channel) DO UPDATE SET last_seen_id = excluded.last_seen_id, updated_at = excluded.updated_at`,
-          [actorId, channel, lastSeenId, now],
+          `INSERT INTO actor_channel_seen (user_id, actor_id, channel, last_seen_id, updated_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, actor_id, channel) DO UPDATE SET last_seen_id = excluded.last_seen_id, updated_at = excluded.updated_at`,
+          [currentUser!.id, actorId, channel, lastSeenId, now],
         )
         return Response.json({ ok: true, updated_at: now })
       } catch (e: any) {
@@ -2718,9 +3155,8 @@ Bun.serve({
     }
 
     if (req.method === 'GET' && url.pathname === '/seen' && isAuthed) {
-      const actorId = (url.searchParams.get('actor_id') || '').trim()
-      if (!actorId) return Response.json({ ok: false, error: 'actor_id query param required' }, { status: 400 })
-      const rows = db.prepare(`SELECT channel, last_seen_id, updated_at FROM actor_channel_seen WHERE actor_id = ?`).all(actorId) as any[]
+      const actorId = 'admin'
+      const rows = db.prepare(`SELECT channel, last_seen_id, updated_at FROM actor_channel_seen WHERE user_id=? AND actor_id = ?`).all(currentUser!.id, actorId) as any[]
       const channels: Record<string, { last_seen_id: string; updated_at: string }> = {}
       for (const r of rows) channels[r.channel] = { last_seen_id: r.last_seen_id, updated_at: r.updated_at }
       return Response.json({ ok: true, actor_id: actorId, channels })
@@ -2739,7 +3175,7 @@ Bun.serve({
           typing_since: body.is_typing ? groupNowIso() : null,
           status_text: body.status_text || null,
         })
-        return Response.json({ ok: true, status: groupStatusSnapshot() })
+        return Response.json({ ok: true, status: groupStatusSnapshot(currentUser!.id) })
       } catch (e: any) {
         return Response.json({ ok: false, error: e.message || String(e) }, { status: 400 })
       }
@@ -2755,8 +3191,8 @@ Bun.serve({
     if (req.method === 'GET' && url.pathname === '/group/tasks' && isAuthed) {
       const status = url.searchParams.get('status') || ''
       const category = url.searchParams.get('category') || ''
-      const where: string[] = []
-      const params: any[] = []
+      const where: string[] = ['user_id = ?']
+      const params: any[] = [currentUser!.id]
       if (status === 'draft') {
         where.push(`status = 'active' AND phase = 'draft'`)
       } else if (status === 'active') {
@@ -2822,8 +3258,8 @@ Bun.serve({
       const body = await req.json() as any
       const name = String(body.name || '').trim()
       if (!name) return Response.json({ ok: false, error: 'name required' }, { status: 400 })
-      db.run(`DELETE FROM task_categories WHERE name = ?`, name)
-      db.run(`UPDATE group_tasks SET category = '' WHERE category = ?`, name)
+      db.run(`DELETE FROM task_categories WHERE name = ?`, [name])
+      db.run(`UPDATE group_tasks SET category = '' WHERE category = ?`, [name])
       return Response.json({ ok: true })
     }
 
@@ -2917,11 +3353,11 @@ Bun.serve({
         if (body.action === 'rollback_implement') {
           db.run(`UPDATE group_tasks SET phase = 'implement', implement_check = 0, pm_check_implement = 0, review_check = 0, pm_check_review = 0, implement_started_at = ?, implement_ended_at = NULL, review_started_at = NULL, review_ended_at = NULL, updated_at = ? WHERE id = ?`, [now, now, taskId])
           const updated = db.prepare(`SELECT * FROM group_tasks WHERE id = ?`).get(taskId)
-          const msg = `🔄 任务「${task.title}」打回到实施阶段 → @agent1 请重新实施${rollbackComment ? '\n💬 ' + rollbackComment : ''}`
+          const msg = `🔄 任务「${task.title}」打回到实施阶段 → @product 请重新实施${rollbackComment ? '\n💬 ' + rollbackComment : ''}`
           await fetch(`http://127.0.0.1:${IMG_PORT}/group/send`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
-            body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['agent1'], task_id: taskId })
+            body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['product'], task_id: taskId })
           })
           return Response.json({ ok: true, task: updated })
         }
@@ -2954,7 +3390,7 @@ Bun.serve({
           // Role guard: PM = cookie / local / app (Bearer + sender_id=admin); agent = Bearer + matching sender_id
           const authMode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
           const isPm = authMode === 'cookie' || authMode === 'local' || (authMode === 'header' && body.sender_id === 'admin')
-          const agentForCheck: Record<string, string> = { implement_check: 'agent1', review_check: 'agent2' }
+          const agentForCheck: Record<string, string> = { implement_check: 'product', review_check: 'creative' }
           if (checkField === currentPhaseChecks.agent) {
             const expectedAgent = agentForCheck[checkField]
             if (body.sender_id !== expectedAgent) {
@@ -2979,20 +3415,20 @@ Bun.serve({
 
           if (fresh.phase === 'evaluate' && fresh.evaluate_check && fresh.pm_check_evaluate) {
             db.run(`UPDATE group_tasks SET phase = 'implement', evaluate_ended_at = ?, implement_started_at = ?, implement_check = 0, pm_check_implement = 0, review_check = 0, pm_check_review = 0, updated_at = ? WHERE id = ?`, [now, now, now, taskId])
-            const msg = `✅ 任务「${task.title}」评估通过 → @agent1 请开始实施`
+            const msg = `✅ 任务「${task.title}」评估通过 → @product 请开始实施`
             await fetch(`http://127.0.0.1:${IMG_PORT}/group/send`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
-              body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['agent1'], task_id: taskId })
+              body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['product'], task_id: taskId })
             })
             advanced = true
           } else if (fresh.phase === 'implement' && fresh.implement_check && fresh.pm_check_implement) {
             db.run(`UPDATE group_tasks SET phase = 'review', implement_ended_at = ?, review_started_at = ?, review_check = 0, pm_check_review = 0, updated_at = ? WHERE id = ?`, [now, now, now, taskId])
-            const msg = `✅ 任务「${task.title}」实施完成 → @agent2 请 review`
+            const msg = `✅ 任务「${task.title}」实施完成 → @creative 请 review`
             await fetch(`http://127.0.0.1:${IMG_PORT}/group/send`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
-              body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['agent2'], task_id: taskId })
+              body: JSON.stringify({ sender_id: 'admin', text: msg, mentions: ['creative'], task_id: taskId })
             })
             advanced = true
           } else if (fresh.phase === 'review' && fresh.review_check && fresh.pm_check_review) {
@@ -3025,7 +3461,7 @@ Bun.serve({
       const taskId = decodeURIComponent(url.pathname.slice('/group/tasks/'.length))
       const task = db.prepare(`SELECT id FROM group_tasks WHERE id = ?`).get(taskId)
       if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
-      db.run(`DELETE FROM group_tasks WHERE id = ?`, taskId)
+      db.run(`DELETE FROM group_tasks WHERE id = ?`, [taskId])
       return Response.json({ ok: true, deleted: taskId })
     }
 
@@ -3035,11 +3471,11 @@ Bun.serve({
 
     // Helper: resolve PM auth (cookie / local / Bearer+sender_id=admin) and "actor as me" auth (Bearer + matching sender_id).
     const v2AuthInfo = () => {
-      const mode = requestAuthMode(req, url, AUTH_TOKEN, { allowQueryToken: ALLOW_QUERY_TOKEN_AUTH })
-      return { mode }
+      return { mode: currentUser ? 'session' : null }
     }
-    const v2IsPm = (info: { mode: string }, body: any) =>
-      info.mode === 'cookie' || info.mode === 'local' || (info.mode === 'header' && body?.sender_id === 'admin')
+    // Every authenticated user is the human/PM inside their own private workspace.
+    // The global admin role is reserved for tenant management, not task ownership.
+    const v2IsPm = (info: { mode: string | null }, _body: any) => info.mode === 'session'
 
     // AIC-87: v2 categories CRUD — 接替 v1 /group/tasks/categories (后者已 410)。
     // 数据共用 task_categories 表 (v1/v2 共享分类元数据,v2 tasks_v2.category 也读这张)。
@@ -3049,7 +3485,7 @@ Bun.serve({
     }
     if (req.method === 'POST' && url.pathname === '/tasks/categories' && isAuthed) {
       const body = await req.json().catch(() => ({})) as any
-      if (!v2IsPm(v2AuthInfo(), body)) return Response.json({ ok: false, error: 'only PM can manage categories' }, { status: 403 })
+      if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared categories' }, { status: 403 })
       const name = String(body.name || '').trim()
       if (!name) return Response.json({ ok: false, error: 'name required' }, { status: 400 })
       try { db.run(`INSERT INTO task_categories (name, created_at) VALUES (?, ?)`, [name, groupNowIso()]) } catch {}
@@ -3057,12 +3493,12 @@ Bun.serve({
     }
     if (req.method === 'DELETE' && url.pathname === '/tasks/categories' && isAuthed) {
       const body = await req.json().catch(() => ({})) as any
-      if (!v2IsPm(v2AuthInfo(), body)) return Response.json({ ok: false, error: 'only PM can manage categories' }, { status: 403 })
+      if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared categories' }, { status: 403 })
       const name = String(body.name || '').trim()
       if (!name) return Response.json({ ok: false, error: 'name required' }, { status: 400 })
-      db.run(`DELETE FROM task_categories WHERE name = ?`, name)
-      db.run(`UPDATE group_tasks SET category = '' WHERE category = ?`, name)
-      db.run(`UPDATE tasks_v2 SET category = '' WHERE category = ?`, name)
+      db.run(`DELETE FROM task_categories WHERE name = ?`, [name])
+      db.run(`UPDATE group_tasks SET category = '' WHERE category = ?`, [name])
+      db.run(`UPDATE tasks_v2 SET category = '' WHERE category = ?`, [name])
       return Response.json({ ok: true })
     }
 
@@ -3100,7 +3536,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const info = v2AuthInfo()
-        if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can manage phase templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared phase templates' }, { status: 403 })
         const id = body.id ? String(body.id).trim() : `p_${generateULID().slice(0, 10).toLowerCase()}`
         const normalized = {
           id,
@@ -3135,7 +3571,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const info = v2AuthInfo()
-        if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can manage phase templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared phase templates' }, { status: 403 })
         const id = decodeURIComponent(url.pathname.slice('/tasks/phase_templates/'.length))
         if (!PHASE_TEMPLATES[id]) return Response.json({ ok: false, error: 'phase template not found' }, { status: 404 })
         if (RESERVED_PHASE_IDS.has(id)) return Response.json({ ok: false, error: `phase template '${id}' is reserved (runtime hardcoded); not editable` }, { status: 409 })
@@ -3192,9 +3628,7 @@ Bun.serve({
     if (req.method === 'DELETE' && /^\/tasks\/phase_templates\/[^/]+$/.test(url.pathname) && isAuthed) {
       try {
         const info = v2AuthInfo()
-        if (info.mode !== 'cookie' && info.mode !== 'local') {
-          return Response.json({ ok: false, error: 'only PM (cookie/local) can delete phase templates' }, { status: 403 })
-        }
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can delete shared phase templates' }, { status: 403 })
         const id = decodeURIComponent(url.pathname.slice('/tasks/phase_templates/'.length))
         if (!PHASE_TEMPLATES[id]) return Response.json({ ok: false, error: 'phase template not found' }, { status: 404 })
         if (RESERVED_PHASE_IDS.has(id)) return Response.json({ ok: false, error: `phase template '${id}' is reserved (runtime hardcoded); not deletable` }, { status: 409 })
@@ -3202,7 +3636,7 @@ Bun.serve({
         if (refs.length > 0) {
           return Response.json({ ok: false, error: `cannot delete phase template '${id}': still referenced by ${refs.length} workflow(s): ${refs.map(r => r[0]).join(', ')}` }, { status: 409 })
         }
-        db.run(`DELETE FROM phase_templates WHERE id = ?`, id)
+        db.run(`DELETE FROM phase_templates WHERE id = ?`, [id])
         reloadPhaseTemplates()
         reloadWorkflowTemplates()
         return Response.json({ ok: true, deleted: id })
@@ -3217,7 +3651,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const info = v2AuthInfo()
-        if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can manage workflow templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared workflow templates' }, { status: 403 })
         const key = String(body.key || '').trim()
         const label = String(body.label || '').trim()
         if (!/^[a-z][a-z0-9_]{1,40}$/.test(key)) return Response.json({ ok: false, error: 'key must match ^[a-z][a-z0-9_]{1,40}$' }, { status: 400 })
@@ -3244,7 +3678,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const info = v2AuthInfo()
-        if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can manage workflow templates' }, { status: 403 })
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can manage shared workflow templates' }, { status: 403 })
         const key = decodeURIComponent(url.pathname.slice('/tasks/workflow_templates/'.length))
         if (!WORKFLOW_TEMPLATES[key]) return Response.json({ ok: false, error: 'template not found' }, { status: 404 })
         const sets: string[] = []
@@ -3277,16 +3711,14 @@ Bun.serve({
     if (req.method === 'DELETE' && /^\/tasks\/workflow_templates\/[^/]+$/.test(url.pathname) && isAuthed) {
       try {
         const info = v2AuthInfo()
-        if (info.mode !== 'cookie' && info.mode !== 'local') {
-          return Response.json({ ok: false, error: 'only PM (cookie/local) can delete workflow templates' }, { status: 403 })
-        }
+        if (currentUser!.role !== 'admin') return Response.json({ ok: false, error: 'only admin can delete shared workflow templates' }, { status: 403 })
         const key = decodeURIComponent(url.pathname.slice('/tasks/workflow_templates/'.length))
         if (!WORKFLOW_TEMPLATES[key]) return Response.json({ ok: false, error: 'template not found' }, { status: 404 })
         const openCount = (db.prepare(`SELECT COUNT(*) AS n FROM tasks_v2 WHERE type = ? AND status = 'open'`).get(key) as any).n
         if (openCount > 0) {
           return Response.json({ ok: false, error: `cannot delete type ${key}: ${openCount} open task(s) still using it` }, { status: 409 })
         }
-        db.run(`DELETE FROM workflow_templates WHERE key = ?`, key)
+        db.run(`DELETE FROM workflow_templates WHERE key = ?`, [key])
         reloadWorkflowTemplates()
         return Response.json({ ok: true, deleted: key })
       } catch (e: any) {
@@ -3301,8 +3733,8 @@ Bun.serve({
       const category = url.searchParams.get('category') || ''
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 200)
       const offset = parseInt(url.searchParams.get('offset') || '0')
-      const where: string[] = []
-      const params: any[] = []
+      const where: string[] = ['user_id = ?']
+      const params: any[] = [currentUser!.id]
       // 2026-06-20: mirror /group/tasks's 3-bucket semantics on v2. Previously this
       // only matched 'open' / 'closed'; passing status='draft' silently fell
       // through to no filter and returned every task in the table.
@@ -3317,7 +3749,7 @@ Bun.serve({
       }
       if (type) { where.push('type = ?'); params.push(type) }
       if (category) { where.push('category = ?'); params.push(category) }
-      const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+      const whereSql = `WHERE ${where.join(' AND ')}`
       const total = (db.prepare(`SELECT COUNT(*) AS n FROM tasks_v2 ${whereSql}`).get(...params) as any).n
       const rows = db.prepare(`SELECT * FROM tasks_v2 ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params, limit, offset) as any[]
       for (const row of rows) {
@@ -3343,7 +3775,7 @@ Bun.serve({
       if (!taskId || taskId.includes('/')) {
         // fall through; might be sub-resource path
       } else {
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         attachPendingFields(task)
         const events = (db.prepare(`SELECT * FROM task_events WHERE task_id=? ORDER BY id ASC`).all(taskId) as any[]).map(e => ({
@@ -3359,6 +3791,7 @@ Bun.serve({
     // 12.13 GET /tasks/:id/events — long poll for new events on a task
     if (req.method === 'GET' && url.pathname.startsWith('/tasks/') && url.pathname.endsWith('/events') && isAuthed) {
       const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/events'.length))
+      if (!loadTask(taskId, currentUser!.id)) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
       // AIC-117 cycle 2: accept `since` as alias for `since_event_id` (scope 字面写的是 `since=ULID`).
       const sinceEventId = url.searchParams.get('since_event_id') || url.searchParams.get('since') || ''
       // before_id 历史分页 (跟 /group/poll 同款, before_event_id 兼容老 caller)
@@ -3406,7 +3839,7 @@ Bun.serve({
       const sinceCursor = url.searchParams.get('since_cursor') || ''
       const timeout = Math.min(parseInt(url.searchParams.get('timeout') || '30'), 30) * 1000
       const buildSnapshot = () => {
-        const rows = db.prepare(`SELECT * FROM tasks_v2 WHERE status='open' ORDER BY updated_at DESC`).all() as any[]
+        const rows = db.prepare(`SELECT * FROM tasks_v2 WHERE user_id=? AND status='open' ORDER BY updated_at DESC`).all(currentUser!.id) as any[]
         for (const row of rows) {
           attachPendingFields(row)
           const latest = db.prepare(`SELECT id, ts, kind, actor_id, meta, body FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1`).get(row.id) as any
@@ -3421,7 +3854,7 @@ Bun.serve({
           row.latest_event_mentions = latestEventMentions
           // unread_count per actor
           const unread: Record<string, number> = {}
-          for (const actor of ['admin', 'agent1', 'agent2']) {
+          for (const actor of ['admin', ...ROLE_AGENT_IDS]) {
             const mark = db.prepare(`SELECT last_seen_event_id FROM task_seen_marks WHERE task_id=? AND actor_id=?`).get(row.id, actor) as any
             const lastId = mark?.last_seen_event_id || ''
             const n = (db.prepare(`SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND id > ?`).get(row.id, lastId) as any).n
@@ -3441,7 +3874,7 @@ Bun.serve({
           taskSummaryWaiters.delete(waiter)
           resolve(Response.json({ ok: true, ...buildSnapshot() }))
         }, timeout)
-        const waiter = { sinceCursor, resolve, timer }
+        const waiter = { userId: currentUser!.id, sinceCursor, resolve, timer }
         taskSummaryWaiters.add(waiter)
       })
     }
@@ -3454,11 +3887,11 @@ Bun.serve({
         // PM (admin) can always create; agent1 can create on its own (agent2 is
         // review-only). sender_id is trusted because Bearer + matching sender_id
         // is the agent's own auth mode, and PM cookie/local goes through v2IsPm.
-        const AGENT_CREATORS = new Set(['agent1'])
+        const AGENT_CREATORS = new Set(['product'])
         const isPm = v2IsPm(info, body)
         const isAuthedAgent = info.mode === 'header' && AGENT_CREATORS.has(body.sender_id)
         if (!isPm && !isAuthedAgent) {
-          return Response.json({ ok: false, error: 'creating tasks requires PM auth, or Bearer as agent1' }, { status: 403 })
+          return Response.json({ ok: false, error: 'creating tasks requires PM auth, or Bearer as product' }, { status: 403 })
         }
         const title = String(body.title || '').trim()
         const type = String(body.type || '').trim()
@@ -3471,15 +3904,15 @@ Bun.serve({
         const id = `AIC-${seq}`
         const now = groupNowIso()
         db.run(
-          `INSERT INTO tasks_v2 (id, title, description, type, category, current_phase, status, created_at, created_by, updated_at) VALUES (?, ?, ?, ?, ?, 'draft', 'open', ?, ?, ?)`,
-          [id, title, body.description || '', type, body.category || '', now, body.sender_id || 'admin', now],
+          `INSERT INTO tasks_v2 (id, title, description, type, category, current_phase, status, created_at, created_by, updated_at, user_id, conversation_id) VALUES (?, ?, ?, ?, ?, 'draft', 'open', ?, ?, ?, ?, ?)`,
+          [id, title, body.description || '', type, body.category || '', now, 'admin', now, currentUser!.id, body.conversation_id || null],
         )
         // Insert the draft phase's role checks (PM is the "owner" of draft, no actual check needed but row exists for cycle tracking)
         db.run(
           `INSERT INTO task_phase_role_checks (task_id, phase, cycle, role_id) VALUES (?, 'draft', 1, 'pm')`, [id],
         )
         insertTaskEvent(id, 'system_event', body.sender_id || 'admin', `${ACTOR_DISPLAY_NAMES[body.sender_id || 'admin']} 创建了任务`, { event_type: 'task_created' })
-        const task = attachPendingFields(loadTask(id))
+        const task = attachPendingFields(loadTask(id, currentUser!.id))
         wakeTaskWaiters(id)
         return Response.json({ ok: true, task })
       } catch (e: any) {
@@ -3494,7 +3927,7 @@ Bun.serve({
         const info = v2AuthInfo()
         if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can publish tasks' }, { status: 403 })
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/publish'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         if (task.current_phase !== 'draft') return Response.json({ ok: false, error: `task is in '${task.current_phase}', not draft` }, { status: 400 })
         const phases = WORKFLOW_TEMPLATES[task.type]?.phases || []
@@ -3502,7 +3935,7 @@ Bun.serve({
         const firstPhase = phases[draftIdx + 1]
         if (!firstPhase) return Response.json({ ok: false, error: 'no next phase defined' }, { status: 500 })
         enterPhase(task, firstPhase.key, 'draft', 'publish')
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated })
       } catch (e: any) {
@@ -3515,7 +3948,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/advance'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const phaseDef = findPhaseDef(task.type, task.current_phase)
         if (!phaseDef) return Response.json({ ok: false, error: `bad phase ${task.current_phase}` }, { status: 500 })
@@ -3556,7 +3989,7 @@ Bun.serve({
         )
         // Check whether phase fully checked → advance
         const advanced = maybeAdvancePhase(loadTask(taskId))
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated, advanced })
       } catch (e: any) {
@@ -3569,7 +4002,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/reject'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const phaseDef = findPhaseDef(task.type, task.current_phase)
         if (!phaseDef) return Response.json({ ok: false, error: `bad phase ${task.current_phase}` }, { status: 500 })
@@ -3595,7 +4028,7 @@ Bun.serve({
           event_type: 'phase_reject_action', from_phase: task.current_phase, from_phase_label: phaseDef.label, to_phase: prevPhase, to_phase_label: findPhaseDef(task.type, prevPhase)?.label, comment, rejected_by_actor: actorId,
         })
         enterPhase(task, prevPhase, task.current_phase, 'reject')
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated })
       } catch (e: any) {
@@ -3610,7 +4043,7 @@ Bun.serve({
         const info = v2AuthInfo()
         if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can rollback' }, { status: 403 })
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/rollback'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const toPhase = String(body.to_phase || '').trim()
         const phases = WORKFLOW_TEMPLATES[task.type]?.phases || []
@@ -3624,7 +4057,7 @@ Bun.serve({
           event_type: 'phase_rollback_action', from_phase: task.current_phase, from_phase_label: findPhaseDef(task.type, task.current_phase)?.label, to_phase: toPhase, to_phase_label: findPhaseDef(task.type, toPhase)?.label, comment,
         })
         enterPhase(task, toPhase, task.current_phase, 'rollback')
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated })
       } catch (e: any) {
@@ -3637,7 +4070,7 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/comments'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const actorId = String(body.actor_id || '').trim()
         if (!actorId) return Response.json({ ok: false, error: 'actor_id required' }, { status: 400 })
@@ -3677,7 +4110,7 @@ Bun.serve({
         const info = v2AuthInfo()
         if (!v2IsPm(info, body)) return Response.json({ ok: false, error: 'only PM can edit tasks' }, { status: 403 })
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length))
-        const task = loadTask(taskId)
+        const task = loadTask(taskId, currentUser!.id)
         if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
         const sets: string[] = []
         const vals: any[] = []
@@ -3688,7 +4121,7 @@ Bun.serve({
         sets.push('updated_at = ?'); vals.push(groupNowIso())
         vals.push(taskId)
         db.run(`UPDATE tasks_v2 SET ${sets.join(', ')} WHERE id = ?`, vals)
-        const updated = attachPendingFields(loadTask(taskId))
+        const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated })
       } catch (e: any) {
@@ -3699,14 +4132,11 @@ Bun.serve({
     // 12.10 DELETE /tasks/:id — delete task and cascade events/checks (PM only)
     if (req.method === 'DELETE' && /^\/tasks\/[^/]+$/.test(url.pathname) && isAuthed) {
       const info = v2AuthInfo()
-      if (info.mode !== 'cookie' && info.mode !== 'local') {
-        return Response.json({ ok: false, error: 'only PM (cookie/local) can delete tasks' }, { status: 403 })
-      }
       const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length))
-      const task = loadTask(taskId)
+      const task = loadTask(taskId, currentUser!.id)
       if (!task) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
       // Cascade delete (FK ON DELETE CASCADE handles events / checks / seen_marks)
-      db.run(`DELETE FROM tasks_v2 WHERE id = ?`, taskId)
+      db.run(`DELETE FROM tasks_v2 WHERE id = ?`, [taskId])
       // v0.7.2 Fix 6: events table is now empty for this task; pass deleted=true so detail waiters resolve 410
       wakeTaskWaiters(taskId, { deleted: true })
       return Response.json({ ok: true, deleted: taskId })
@@ -3717,7 +4147,8 @@ Bun.serve({
       try {
         const body = await req.json() as any
         const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/seen'.length))
-        const actorId = String(body.actor_id || '').trim()
+        if (!loadTask(taskId, currentUser!.id)) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
+        const actorId = 'admin'
         const eventId = String(body.last_seen_event_id || '').trim()
         if (!actorId || !eventId) return Response.json({ ok: false, error: 'actor_id + last_seen_event_id required' }, { status: 400 })
         const ts = groupNowIso()
@@ -3760,8 +4191,8 @@ Bun.serve({
         const groupChs = channels.filter(c => !c.startsWith('task:'))
         const includeGroup = channels.length === 0 || groupChs.length > 0
         if (includeGroup) {
-          const conds: string[] = [`text LIKE ? ESCAPE '\\'`, `(message_type IS NULL OR message_type != 'system_notification')`]
-          const params: any[] = [likePattern]
+          const conds: string[] = [`user_id=?`, `text LIKE ? ESCAPE '\\'`, `(message_type IS NULL OR message_type != 'system_notification')`]
+          const params: any[] = [currentUser!.id, likePattern]
           if (groupChs.length > 0) {
             conds.push(`conversation_id IN (${groupChs.map(() => '?').join(',')})`)
             params.push(...groupChs)
@@ -3790,19 +4221,20 @@ Bun.serve({
         const taskChs = channels.filter(c => c.startsWith('task:')).map(c => c.slice('task:'.length))
         const includeTask = channels.length === 0 || taskChs.length > 0 || channels.includes('task')
         if (includeTask) {
-          const conds: string[] = [`body LIKE ? ESCAPE '\\'`, `kind = 'user_comment'`]
-          const params: any[] = [likePattern]
+          const conds: string[] = [`t.user_id=?`, `e.body LIKE ? ESCAPE '\\'`, `e.kind = 'user_comment'`]
+          const params: any[] = [currentUser!.id, likePattern]
           if (taskChs.length > 0) {
-            conds.push(`task_id IN (${taskChs.map(() => '?').join(',')})`)
+            conds.push(`e.task_id IN (${taskChs.map(() => '?').join(',')})`)
             params.push(...taskChs)
           }
           if (senders.length > 0) {
-            conds.push(`actor_id IN (${senders.map(() => '?').join(',')})`)
+            conds.push(`e.actor_id IN (${senders.map(() => '?').join(',')})`)
             params.push(...senders)
           }
-          if (since) { conds.push(`ts >= ?`); params.push(since) }
-          if (before) { conds.push(`ts <= ?`); params.push(before) }
-          const rows = db.prepare(`SELECT id, task_id, actor_id, body, ts, kind FROM task_events WHERE ${conds.join(' AND ')} ORDER BY ts DESC LIMIT ?`).all(...params, limit) as any[]
+          if (since) { conds.push(`e.ts >= ?`); params.push(since) }
+          if (before) { conds.push(`e.ts <= ?`); params.push(before) }
+          const rows = db.prepare(`SELECT e.id, e.task_id, e.actor_id, e.body, e.ts, e.kind FROM task_events e
+            JOIN tasks_v2 t ON t.id=e.task_id WHERE ${conds.join(' AND ')} ORDER BY e.ts DESC LIMIT ?`).all(...params, limit) as any[]
           for (const r of rows) {
             all.push({
               channel: `task:${r.task_id}`,
@@ -3853,6 +4285,7 @@ Bun.serve({
         let result: { found: boolean; source_table?: 'group_messages' | 'task_events'; timestamp?: string; before_id?: string | null } = { found: false }
         if (channel.startsWith('task:')) {
           const taskId = channel.slice('task:'.length)
+          if (!loadTask(taskId, currentUser!.id)) return Response.json({ ok: true, channel, message_id: messageId, found: false })
           const row = db.prepare(`SELECT id, ts FROM task_events WHERE id=? AND task_id=?`).get(messageId, taskId) as any
           if (row) {
             const next = db.prepare(`SELECT id FROM task_events WHERE task_id=? AND ts > ? ORDER BY ts ASC LIMIT 1`).get(taskId, row.ts) as any
@@ -3860,9 +4293,9 @@ Bun.serve({
           }
         } else {
           // workgroup / dm-agent1 / dm-agent2 → group_messages
-          const grpRow = db.prepare(`SELECT id, ts FROM group_messages WHERE id=? AND conversation_id=?`).get(messageId, channel) as any
+          const grpRow = db.prepare(`SELECT id, ts FROM group_messages WHERE id=? AND conversation_id=? AND user_id=?`).get(messageId, channel, currentUser!.id) as any
           if (grpRow) {
-            const next = db.prepare(`SELECT id FROM group_messages WHERE conversation_id=? AND ts > ? ORDER BY ts ASC LIMIT 1`).get(channel, grpRow.ts) as any
+            const next = db.prepare(`SELECT id FROM group_messages WHERE conversation_id=? AND user_id=? AND ts > ? ORDER BY ts ASC LIMIT 1`).get(channel, currentUser!.id, grpRow.ts) as any
             result = { found: true, source_table: 'group_messages', timestamp: grpRow.ts, before_id: next?.id ?? null }
           }
         }
@@ -3997,7 +4430,8 @@ Bun.serve({
     if (req.method === 'GET' && /^\/usage\/[^/]+$/.test(url.pathname) && isAuthed) {
       if (!usageProbeEnabled) return usagePlaceholderResp()
       const agentId = decodeURIComponent(url.pathname.slice('/usage/'.length))
-      if (agentId === 'agent1') {
+      const runtime = AGENT_RUNTIMES[agentId]
+      if (runtime?.provider === 'claude') {
         const usage = await fetchClaudeUsageCached()
         if ('error' in usage) return Response.json({ available: false, reason: usage.error }, { status: 200 })
         const planLabel = usage.subscriptionType ? `Claude ${String(usage.subscriptionType).replace(/^./, c => c.toUpperCase())} ${(usage.rateLimitTier || '').replace(/^default_claude_max_/, '').replace(/^claude_/, '') || ''}`.trim() : 'Claude'
@@ -4011,7 +4445,7 @@ Bun.serve({
           weekly_resets_at: usage.seven_day?.resets_at || null,
         })
       }
-      if (agentId === 'agent2') {
+      if (runtime?.provider === 'codex') {
         // AIC-54: real Codex usage data from ~/.codex/logs_2.sqlite.
         const c = fetchCodexUsageCached()
         if ('error' in c) return Response.json({ available: false, reason: c.error })
@@ -4044,11 +4478,12 @@ Bun.serve({
     // file > 5MB, tail last 5MB and drop partial first line.
     if (req.method === 'GET' && url.pathname === '/api/transcript' && isAuthed) {
       try {
-        const agent = (url.searchParams.get('agent') || 'agent1').trim()
-        if (agent !== 'agent1' && agent !== 'agent2') {
+        const agent = (url.searchParams.get('agent') || 'product').trim()
+        if (!ROLE_AGENT_IDS.includes(agent as typeof ROLE_AGENT_IDS[number])) {
           return Response.json({ ok: false, error: `transcript not supported for agent: ${agent}`, agent }, { status: 410 })
         }
-        const resolved = resolveTranscriptPath(agent)
+        const conversationId = url.searchParams.get('conversation_id') || ensureUserDefaultConversation(currentUser!).id
+        const resolved = resolveTranscriptPath(currentUser!.id, conversationId, agent)
         if (!resolved) {
           return Response.json({ ok: false, error: `unable to resolve transcript for agent: ${agent} (session not running, sid missing, or not a claude binary?)`, agent })
         }
@@ -4122,10 +4557,11 @@ Bun.serve({
     // Other agent ids → 410.
     if (req.method === 'GET' && /^\/api\/agent-billing\/[^/]+$/.test(url.pathname) && isAuthed) {
       const agentId = decodeURIComponent(url.pathname.slice('/api/agent-billing/'.length))
-      if (agentId !== 'agent1' && agentId !== 'agent2') {
+      if (!ROLE_AGENT_IDS.includes(agentId as typeof ROLE_AGENT_IDS[number])) {
         return Response.json({ ok: false, error: `agent-billing not supported for agent: ${agentId}`, agentId }, { status: 410 })
       }
-      const usage = readAgentLastTurnUsage(agentId)
+      const conversationId = url.searchParams.get('conversation_id') || ensureUserDefaultConversation(currentUser!).id
+      const usage = readAgentLastTurnUsage(currentUser!.id, conversationId, agentId)
       if (!usage) {
         return Response.json({ ok: true, agentId, available: false, reason: 'no usage data (session not running / no assistant event yet)', turn_count: null })
       }
@@ -4163,8 +4599,68 @@ Bun.serve({
 
     return new Response('not found', { status: 404 })
   },
+  websocket: {
+    open() {
+      // Authentication happens in the mandatory first `hello` frame.
+    },
+    message(ws, message) {
+      try {
+        const parsed = parseConnectorMessage(typeof message === 'string' ? message : Buffer.from(message).toString('utf8'))
+        if (!ws.data.deviceId || !ws.data.userId) {
+          if (parsed.type !== 'hello') {
+            ws.close(4003, 'hello required')
+            return
+          }
+          const device = authenticateDevice(db, parsed.device_token)
+          if (!device) {
+            ws.send(JSON.stringify({ type: 'hello_ack', status: 'error', error: 'invalid device token' }))
+            ws.close(4003, 'authentication failed')
+            return
+          }
+          ws.data.deviceId = device.id
+          ws.data.userId = device.user_id
+          connectorRegistry.register({
+            deviceId: device.id,
+            userId: device.user_id,
+            deviceName: device.device_name,
+            socket: ws,
+          })
+          setDeviceStatus(db, device.id, 'online')
+          ws.send(JSON.stringify({
+            type: 'hello_ack',
+            status: 'ok',
+            user_id: device.user_id,
+            heartbeat_interval: 30,
+          }))
+          return
+        }
+        connectorRegistry.touch(ws.data.deviceId)
+        if (parsed.type === 'heartbeat') {
+          setDeviceStatus(db, ws.data.deviceId, 'online')
+          ws.send(JSON.stringify({ type: 'heartbeat_ack', received_at: new Date().toISOString() }))
+          return
+        }
+        if (parsed.type === 'execution_ack') {
+          connectorDispatcher.handleAck(ws.data.deviceId, ws.data.userId, parsed)
+          return
+        }
+        if (parsed.type === 'execution_result') {
+          connectorDispatcher.handleResult(ws.data.deviceId, ws.data.userId, parsed)
+          return
+        }
+        ws.close(4002, 'unexpected message')
+      } catch {
+        ws.close(4002, 'invalid connector message')
+      }
+    },
+    close(ws) {
+      if (!ws.data.deviceId) return
+      connectorRegistry.unregister(ws.data.deviceId, ws)
+      setDeviceStatus(db, ws.data.deviceId, 'offline')
+    },
+  },
 })
-process.stderr.write(`ai-collab: HTTP server on http://127.0.0.1:${IMG_PORT}\n`)
+process.stderr.write(`ai-collab: HTTP server on http://${SERVER_HOST}:${IMG_PORT}\n`)
 // AIC-129: warn when tmux provider is enabled — capture-pane reads raw terminal bytes,
 // strict sanitizer drops obvious secrets but cannot catch novel formats.
 for (const [agentId, cfg] of Object.entries(AGENT_RUNTIMES)) {
