@@ -2500,8 +2500,7 @@ button, textarea, input { font: inherit; }
         <!-- CONNECTOR DEVICES -->
         <div style="padding:0 20px 20px;">
           <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:9px;">
-            <span style="font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:0.14em; color:var(--ink-3); text-transform:uppercase;">Codex Connector</span>
-            <button data-action="connector-add" style="border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:5px 9px; color:var(--ink); cursor:pointer; font:inherit; font-size:11px;">＋ 添加设备</button>
+            <span style="font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:0.14em; color:var(--ink-3); text-transform:uppercase;">AI Studio Helper</span>
           </div>
           <div id="appSettingsDevicesBox" style="background:var(--surface-2); border-radius:11px; padding:11px 13px; font-size:11.5px; color:var(--ink-2);">加载中…</div>
         </div>
@@ -2966,7 +2965,10 @@ const SETTINGS_THEMES = [
 let appSettingsUsageActor = 'product';
 let currentProfile = null;
 let connectorDevices = [];
-let connectorPairing = null;
+let connectorPairingState = { status: 'idle', startingDeviceIds: [] };
+let localHelperStatus = { available: false, checking: true, data: null };
+let connectorDevicePollTimer = null;
+const LOCAL_HELPER_URL = 'http://127.0.0.1:39481';
 let _settingsSystemMQL = null;       // matchMedia handle for system theme
 // AIC-68 cycle 2: rename to openAppSettings/closeAppSettings to disambiguate
 // from the legacy task settings (workflow_templates manager) `openSettingsModal`.
@@ -2976,10 +2978,17 @@ function openAppSettings() {
   if (!currentProfile) loadCurrentProfile().then(renderAppSettings);
   fetchUsageFor(appSettingsUsageActor).then(renderAppSettings);
   loadConnectorDevices();
+  loadLocalHelperStatus();
+  if (!connectorDevicePollTimer) connectorDevicePollTimer = setInterval(() => {
+    loadConnectorDevices();
+    loadLocalHelperStatus();
+  }, 2000);
   hydrateActorStyles();   // ensure avatar stack + dirty count fresh
 }
 function closeAppSettings() {
   document.getElementById('appSettingsMask').classList.remove('open');
+  if (connectorDevicePollTimer) clearInterval(connectorDevicePollTimer);
+  connectorDevicePollTimer = null;
 }
 function _effectiveTheme() {
   if (state.theme === 'system') {
@@ -3010,6 +3019,13 @@ async function loadConnectorDevices() {
   try {
     const data = await apiJson('/api/connectors');
     connectorDevices = Array.isArray(data.devices) ? data.devices : [];
+    if (connectorPairingState.status !== 'idle') {
+      const previous = new Set(connectorPairingState.startingDeviceIds || []);
+      const connected = connectorDevices.find(device => !previous.has(device.id) || device.status === 'online');
+      if (connected) {
+        connectorPairingState = { status: 'connected', startingDeviceIds: [...previous], deviceId: connected.id };
+      }
+    }
   } catch (e) { console.error('loadConnectorDevices', e); }
   renderAppSettings();
 }
@@ -3020,12 +3036,45 @@ async function loadCurrentProfile() {
   } catch (e) { console.error('loadCurrentProfile', e); }
   return currentProfile;
 }
-async function createConnectorPairingCode() {
+async function loadLocalHelperStatus() {
   try {
-    const data = await apiJson('/api/connectors/pairing-code', { method: 'POST', body: '{}' });
-    connectorPairing = { code: data.pairing_code, expiresAt: data.expires_at };
+    const response = await fetch(`${LOCAL_HELPER_URL}/status`, { method: 'GET', cache: 'no-store' });
+    if (!response.ok) throw new Error('Helper status unavailable');
+    const data = await response.json();
+    localHelperStatus = { available: data?.helper === 'online', checking: false, data };
+  } catch {
+    localHelperStatus = { available: false, checking: false, data: null };
+  }
+  renderAppSettings();
+}
+async function connectThisComputer() {
+  if (connectorPairingState.status === 'creating') return;
+  if (!localHelperStatus.available) {
+    connectorPairingState = { status: 'not-installed', startingDeviceIds: connectorDevices.map(device => device.id) };
     renderAppSettings();
-  } catch (e) { alert('生成配对码失败：' + (e.message || e)); }
+    return;
+  }
+  connectorPairingState = { status: 'creating', startingDeviceIds: connectorDevices.map(device => device.id) };
+  renderAppSettings();
+  try {
+    const claim = await apiJson('/api/connectors/claim/start', { method: 'POST', body: '{}' });
+    if (!claim?.ok || !claim.claim_token) throw new Error(claim?.error || '无法创建连接请求');
+    const response = await fetch(`${LOCAL_HELPER_URL}/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claim_token: claim.claim_token }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result?.ok) throw new Error(result?.error || 'Helper 连接失败');
+    connectorPairingState = { status: 'connected', startingDeviceIds: connectorDevices.map(device => device.id) };
+    await Promise.all([loadConnectorDevices(), loadLocalHelperStatus()]);
+  } catch (e) {
+    connectorPairingState = { status: 'error', error: e.message || String(e), startingDeviceIds: connectorDevices.map(device => device.id) };
+    renderAppSettings();
+  }
+}
+function installLocalHelper() {
+  showWipToast('请使用 connector/scripts/install-helper.sh 完成一次性安装');
 }
 function renderAppSettings() {
   const mask = document.getElementById('appSettingsMask');
@@ -3098,17 +3147,37 @@ function renderAppSettings() {
   }
   const devicesBox = document.getElementById('appSettingsDevicesBox');
   if (devicesBox) {
-    const pairing = connectorPairing ? `<div style="padding:10px 12px; margin-bottom:9px; border:1px dashed var(--warn); border-radius:9px; background:var(--surface);">
-      <div style="font-size:10px; color:var(--ink-3); margin-bottom:4px;">在 Connector 中输入此一次性配对码</div>
-      <div style="font-family:'JetBrains Mono',monospace; font-size:24px; letter-spacing:.18em; color:var(--ink); font-weight:700;">${esc(connectorPairing.code)}</div>
-      <div style="font-size:10px; color:var(--ink-3); margin-top:4px;">10 分钟内有效，使用后立即失效</div>
-    </div>` : '';
+    const helper = localHelperStatus.data;
+    const codexReady = helper?.codex?.status === 'CODEX_READY';
     const rows = connectorDevices.length ? connectorDevices.map(device => `<div style="display:flex; align-items:center; gap:9px; padding:7px 0; border-top:1px solid var(--border-2);">
       <span style="width:8px;height:8px;border-radius:50%;background:${device.status === 'online' ? 'var(--good)' : 'var(--ink-3)'};"></span>
       <span style="flex:1;color:var(--ink);">${esc(device.device_name)}</span>
       <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--ink-3);">${device.status === 'online' ? '在线' : '离线'}</span>
-    </div>`).join('') : '<div style="padding:5px 0;">还没有已配对设备。Connector 必须在线，Agent 才能调用你本机的 Codex。</div>';
-    devicesBox.innerHTML = pairing + rows;
+    </div>`).join('') + `<div style="padding-top:8px;color:${codexReady ? 'var(--good)' : 'var(--warn)'};">Codex · ${codexReady ? 'Ready' : esc(helper?.codex?.status || '状态未知')}</div>`
+      : localHelperStatus.available
+        ? `<div style="padding:5px 0 3px;">
+            <div style="font-size:13px;color:var(--good);font-weight:600;">● 已运行</div>
+            <div style="margin-top:6px;">Codex<br><span style="color:${codexReady ? 'var(--good)' : 'var(--warn)'};font-weight:600;">● ${codexReady ? '已登录' : esc(helper?.codex?.status || '状态未知')}</span></div>
+            <button data-action="connector-connect" style="margin-top:12px;border:none;background:var(--ink);color:var(--surface);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">连接此电脑</button>
+          </div>`
+        : `<div style="padding:5px 0 3px;">
+            <div style="font-size:13px;color:var(--ink);font-weight:600;">AI Studio Helper</div>
+            <div style="margin-top:5px;">○ ${localHelperStatus.checking ? '正在检测…' : '未检测到'}</div>
+            <button data-action="helper-install" style="margin-top:12px;border:none;background:var(--ink);color:var(--surface);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">安装 Helper</button>
+          </div>`;
+    const stateMessage = connectorPairingState.status === 'creating'
+      ? '<div style="margin-top:9px;color:var(--ink-2);">正在创建安全连接请求…</div>'
+      : connectorPairingState.status === 'not-installed'
+          ? `<div style="margin-top:9px;padding:10px 11px;border-radius:8px;background:var(--surface);border:1px solid var(--border);">
+              <div style="color:var(--ink);font-weight:600;">未检测到 AI Studio Helper</div>
+              <div style="margin-top:4px;line-height:1.5;">请先安装并启动后台 Helper。</div>
+            </div>`
+          : connectorPairingState.status === 'connected'
+            ? '<div style="margin-top:9px;color:var(--good);font-weight:600;">连接成功，设备列表已自动更新。</div>'
+            : connectorPairingState.status === 'error'
+              ? `<div style="margin-top:9px;color:var(--bad);">${esc(connectorPairingState.error || '无法发起连接')}</div>`
+              : '';
+    devicesBox.innerHTML = rows + stateMessage;
   }
 }
 
@@ -8123,8 +8192,10 @@ document.getElementById('appSettingsMask').addEventListener('click', e => {
   } else if (act === 'app-settings-open-identity') {
     closeAppSettings();
     openIdentityModal();
-  } else if (act === 'connector-add') {
-    createConnectorPairingCode();
+  } else if (act === 'connector-connect') {
+    connectThisComputer();
+  } else if (act === 'helper-install') {
+    installLocalHelper();
   } else if (act === 'app-switch-profile') {
     apiJson('/api/auth/logout', { method: 'POST', body: '{}' }).finally(() => location.replace('/web/login.html'));
   } else if (act === 'app-settings-shortcuts') {

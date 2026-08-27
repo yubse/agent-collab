@@ -191,19 +191,17 @@ curl -fsS http://ai-studio-nas.local/health
 
 ## 9. Connector 连接 NAS
 
-用户电脑安装 Bun、Codex CLI 并完成 `codex login`。网页生成一次性配对码后，在用户电脑运行：
+用户电脑安装 Codex CLI 并完成 `codex login`。开发者构建 standalone Helper 后，通过 LaunchAgent 安装一次：
 
 ```bash
 cd /path/to/agent-collab
-export AI_STUDIO_SERVER_URL='http://ai-studio-nas.local'
-export CONNECTOR_WS_URL='ws://ai-studio-nas.local/connector'
-export CONNECT_TIMEOUT_MS=15000
-export REQUEST_ACK_TIMEOUT_MS=10000
-export EXECUTION_TIMEOUT_MS=300000
-bun run connector
+connector/scripts/build-standalone.sh
+AI_STUDIO_SERVER_URL='http://ai-studio-nas.local' \
+AI_STUDIO_WEB_ORIGIN='http://ai-studio-nas.local' \
+connector/scripts/install-helper.sh
 ```
 
-设备 token 只保存在用户电脑 `~/.ai-studio-connector/device.json`。启用 TLS 时改为 `https://` / `wss://`。不要把 Connector 加入 NAS Compose。
+Helper 只监听 `127.0.0.1:39481`，CORS 只允许 `AI_STUDIO_WEB_ORIGIN`，并处理 Chrome/Edge Private Network Access preflight。Web 使用 Session-bound 60 秒 claim 完成绑定，不显示 token；设备 credential 只保存在 `~/.ai-studio/connector.json`（0600）。当前 Profile Selector 属于 Trusted LAN MVP：能选择某个 Profile 的局域网用户也能为它发起绑定；Device-bound Passwordless Login 留待后续。启用 TLS 时改为 `https://` / `wss://`。不要把 Helper 加入 NAS Compose。
 
 ## 10. 更新固定版本
 

@@ -23,14 +23,16 @@ export function resolveWebsocketUrl(config: ConnectorConfig): string {
 
 export async function runConnector(
   config: ConnectorConfig,
-  deviceToken: string,
+  deviceToken: string | (() => string),
   runner: ExecutionRunner,
   state: ConnectorStateStore,
 ): Promise<never> {
   let delay = 1_000
   while (true) {
     try {
-      await connectOnce(config, deviceToken, runner, state)
+      const currentDeviceToken = typeof deviceToken === 'function' ? deviceToken() : deviceToken
+      if (!currentDeviceToken) throw new Error('CONNECTOR_NOT_BOUND')
+      await connectOnce(config, currentDeviceToken, runner, state)
       delay = 1_000
     } catch (error: any) {
       const message = error?.message || 'connection failed'

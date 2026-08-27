@@ -70,6 +70,7 @@ export class CodexProvider implements AgentProvider {
   private stdoutBuf = ''
   private stderrBuf = ''
   private spawning: Promise<void> | null = null
+  private initializing: Promise<void> | null = null
   private _initialized = false
   private _threadId: string | null = null
   // AIC-116: distinguish "this process already started/resumed its thread" from
@@ -109,6 +110,30 @@ export class CodexProvider implements AgentProvider {
   onError(cb: (err: AgentError) => void): void { this.errorCb = cb }
 
   /**
+   * Select a logical Codex thread while keeping the same app-server process.
+   * Callers must serialize turns across thread switches; Connector does this in
+   * LocalCodexExecutor so conversations remain isolated without spawning one
+   * app-server per conversation.
+   */
+  selectThread(threadId: string | null): void {
+    if (this._threadId === threadId && this._threadStartedInThisProcess) return
+    this._threadId = threadId
+    this._threadStartedInThisProcess = false
+  }
+
+  async warmup(): Promise<void> {
+    if (!this.isAlive) {
+      await this._spawn()
+      this._initialized = false
+      this._threadStartedInThisProcess = false
+    }
+    if (!this._initialized) {
+      if (!this.initializing) this.initializing = this._initialize().finally(() => { this.initializing = null })
+      await this.initializing
+    }
+  }
+
+  /**
    * Send a user message. On first call: spawns the codex app-server, runs the
    * initialize handshake, starts (or resumes) a thread, then issues `turn/start`.
    * Subsequent calls reuse the same process + threadId. Resolves once `turn/start`
@@ -120,12 +145,7 @@ export class CodexProvider implements AgentProvider {
     // resolves once the turn/start request is dispatched fire-and-forget. Mid-turn protocol
     // errors (turn/start ack failure, codex JSON-RPC errors during a turn) surface through
     // onError so callers can take corrective action without polluting send() rejection paths.
-    if (!this.isAlive) {
-      await this._spawn()  // throws on spawn fail → bubbles up to caller
-      this._initialized = false
-      this._threadStartedInThisProcess = false
-    }
-    if (!this._initialized) await this._initialize()  // throws on init fail
+    await this.warmup()  // throws on spawn/init failure → bubbles up to caller
     // AIC-116: first send in this process starts or resumes the thread;
     // subsequent sends reuse it directly (no extra thread/resume call).
     if (!this._threadStartedInThisProcess) {

@@ -74,6 +74,21 @@ async function defaultConversation(cookie: string): Promise<string> {
   return data.conversations.find((item: any) => item.is_default).id
 }
 
+function pairingToken(deepLink: string): string {
+  return new URL(deepLink).searchParams.get('token') || ''
+}
+
+function completionBody(deepLink: string, deviceId: string, deviceName: string, extra: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    claim_token: pairingToken(deepLink),
+    device_id: deviceId,
+    device_name: deviceName,
+    platform: 'darwin',
+    connector_version: '0.1.0',
+    ...extra,
+  })
+}
+
 beforeAll(async () => {
   server = spawnServer()
   await waitForServer()
@@ -142,14 +157,75 @@ describe('Trusted LAN profile authentication', () => {
     const liutingMemory = (await json(await api('/api/agents/social/memory', liutingCookie))).memory
     expect(liutingMemory?.content ?? null).not.toBe('TINA_PRIVATE_MEMORY')
 
-    const pairing = await json(await api('/api/connectors/pairing-code', tinaCookie, { method: 'POST', body: '{}' }))
-    await json(await api('/api/connectors/pair', '', {
-      method: 'POST', body: JSON.stringify({ pairing_code: pairing.pairing_code, device_name: 'Tina Test Device' }),
+    const pairing = await json(await api('/api/connectors/claim/start', tinaCookie, { method: 'POST', body: '{}' }))
+    expect(pairing.device_credential).toBeUndefined()
+    await json(await api('/api/connectors/claim/complete', '', {
+      method: 'POST', body: completionBody(`aistudio://pair?token=${pairing.claim_token}`, 'dev_tina-test-device', 'Tina Test Device'),
     }))
     const tinaDevices = (await json(await api('/api/connectors', tinaCookie))).devices
     const liutingDevices = (await json(await api('/api/connectors', liutingCookie))).devices
     expect(tinaDevices.some((device: any) => device.device_name === 'Tina Test Device')).toBe(true)
     expect(liutingDevices.some((device: any) => device.device_name === 'Tina Test Device')).toBe(false)
+  })
+
+  test('test_claim_requires_authenticated_session', async () => {
+    expect((await api('/api/connectors/claim/start', '', { method: 'POST', body: '{}' })).status).toBe(401)
+  })
+
+  test('test_claim_bound_to_session_user', async () => {
+    const pairing = await json(await api('/api/connectors/claim/start', tinaCookie, { method: 'POST', body: '{}' }))
+    await json(await api('/api/connectors/claim/complete', '', {
+      method: 'POST', body: completionBody(`aistudio://pair?token=${pairing.claim_token}`, 'dev_session-user', 'Session User Mac'),
+    }))
+    const tinaDevices = (await json(await api('/api/connectors', tinaCookie))).devices
+    const liutingDevices = (await json(await api('/api/connectors', liutingCookie))).devices
+    expect(tinaDevices.some((device: any) => device.id === 'dev_session-user')).toBe(true)
+    expect(liutingDevices.some((device: any) => device.id === 'dev_session-user')).toBe(false)
+  })
+
+  test('test_frontend_cannot_override_pairing_user', async () => {
+    const pairing = await json(await api('/api/connectors/claim/start', tinaCookie, {
+      method: 'POST', body: JSON.stringify({ user_id: liuting.id }),
+    }))
+    await json(await api('/api/connectors/claim/complete', '', {
+      method: 'POST', body: completionBody(`aistudio://pair?token=${pairing.claim_token}`, 'dev_frontend-override', 'Frontend Override Mac'),
+    }))
+    const tinaDevices = (await json(await api('/api/connectors', tinaCookie))).devices
+    const liutingDevices = (await json(await api('/api/connectors', liutingCookie))).devices
+    expect(tinaDevices.some((device: any) => device.id === 'dev_frontend-override')).toBe(true)
+    expect(liutingDevices.some((device: any) => device.id === 'dev_frontend-override')).toBe(false)
+  })
+
+  test('test_connector_cannot_choose_user', async () => {
+    const pairing = await json(await api('/api/connectors/claim/start', tinaCookie, { method: 'POST', body: '{}' }))
+    const response = await api('/api/connectors/claim/complete', '', {
+      method: 'POST',
+      body: completionBody(`aistudio://pair?token=${pairing.claim_token}`, 'dev_connector-identity', 'Connector Identity Mac', { user_id: liuting.id }),
+    })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ ok: false, error: 'connector user identity is not accepted' })
+  })
+
+  test('test_device_credential_only_sent_to_connector', async () => {
+    const pairing = await json(await api('/api/connectors/claim/start', tinaCookie, { method: 'POST', body: '{}' }))
+    expect(pairing.claim_token).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(pairing.device_credential).toBeUndefined()
+    expect(pairing.device_token).toBeUndefined()
+    const deepLink = `aistudio://pair?token=${pairing.claim_token}`
+    const browserCompletion = await api('/api/connectors/claim/complete', '', {
+      method: 'POST',
+      headers: { origin: baseUrl, 'sec-fetch-site': 'same-origin' },
+      body: completionBody(deepLink, 'dev_browser-must-not-receive', 'Browser Mac'),
+    })
+    expect(browserCompletion.status).toBe(403)
+    expect(await browserCompletion.json()).toMatchObject({
+      code: 'DEVICE_CREDENTIAL_NOT_AVAILABLE_TO_BROWSER',
+    })
+    const connectorCompletion = await json(await api('/api/connectors/claim/complete', '', {
+      method: 'POST',
+      body: completionBody(deepLink, 'dev_native-connector', 'Native Connector Mac'),
+    }))
+    expect(connectorCompletion.device_credential).toBeString()
   })
 
   test('test_switch_profile_clears_old_session', async () => {

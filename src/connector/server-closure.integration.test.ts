@@ -70,11 +70,17 @@ async function json(response: Response): Promise<any> {
 type TestConnector = { ws: WebSocket; requests: any[]; token: string; close(): Promise<void> }
 
 async function pairConnector(cookie: string, name: string, answer: string): Promise<TestConnector> {
-  const pairing = await json(await api('/api/connectors/pairing-code', cookie, { method: 'POST', body: '{}' }))
-  const paired = await json(await api('/api/connectors/pair', '', {
-    method: 'POST', body: JSON.stringify({ pairing_code: pairing.pairing_code, device_name: name }),
+  const pairing = await json(await api('/api/connectors/claim/start', cookie, { method: 'POST', body: '{}' }))
+  const paired = await json(await api('/api/connectors/claim/complete', '', {
+    method: 'POST', body: JSON.stringify({
+      claim_token: pairing.claim_token,
+      device_id: `dev_${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+      device_name: name,
+      platform: 'test',
+      connector_version: '0.1.0',
+    }),
   }))
-  return openConnector(paired.device_token, name, answer)
+  return openConnector(paired.device_credential, name, answer)
 }
 
 function openConnector(token: string, name: string, answer: string): Promise<TestConnector> {
@@ -151,7 +157,7 @@ afterAll(async () => {
 })
 
 describe('Server → Connector → Conversation closure', () => {
-  test('routes each user to their own Connector, persists replies, and survives reconnect', async () => {
+  test('test_existing_credential_reconnects and preserves per-user execution closure', async () => {
     const convA = await defaultConversation(userACookie)
     const convB = await defaultConversation(userBCookie)
     const connectorA = await pairConnector(userACookie, 'Connector A', 'CONNECTOR_OK_A')
