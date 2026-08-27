@@ -2449,6 +2449,16 @@ button, textarea, input { font: inherit; }
       </div>
 
       <div id="appSettingsBody" class="id-scroll" style="flex:1; overflow-y:auto; min-height:0;">
+        <!-- CURRENT PROFILE -->
+        <div style="padding:14px 20px 6px;">
+          <div style="font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:0.14em; color:var(--ink-3); text-transform:uppercase; margin-bottom:9px;">当前用户</div>
+          <div style="display:flex; align-items:center; gap:12px; padding:12px 13px; background:var(--surface-2); border-radius:11px;">
+            <div id="appSettingsProfileInitial" style="width:34px; height:34px; flex:none; display:grid; place-items:center; border-radius:10px; background:var(--actorA-soft); color:var(--ink); font-weight:700;">—</div>
+            <div id="appSettingsProfileName" style="flex:1; min-width:0; font-size:13.5px; color:var(--ink); font-weight:600;">加载中…</div>
+            <button data-action="app-switch-profile" style="border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:6px 10px; color:var(--ink); cursor:pointer; font:inherit; font-size:11px;">切换用户</button>
+          </div>
+        </div>
+
         <!-- THEME -->
         <div style="padding:14px 20px 6px;">
           <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:9px;">
@@ -2501,7 +2511,6 @@ button, textarea, input { font: inherit; }
       <div style="padding:10px 20px; border-top:1px solid var(--border-2); background:var(--surface-2); display:flex; align-items:center; gap:10px;">
         <span style="font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--ink-3); letter-spacing:0.04em;">AIWS v2</span>
         <span style="flex:1"></span>
-        <button data-action="app-logout" style="border:none; background:transparent; padding:5px 9px; font-family:'JetBrains Mono',monospace; font-size:10.5px; color:var(--bad); cursor:pointer;">退出登录</button>
         <button data-action="app-settings-shortcuts" style="border:none; background:transparent; padding:5px 9px; font-family:'JetBrains Mono',monospace; font-size:10.5px; color:var(--ink-3); cursor:pointer; letter-spacing:0.04em;">查看快捷键</button>
       </div>
     </div>
@@ -2955,6 +2964,7 @@ const SETTINGS_THEMES = [
   { id: 'system', label: '跟随系统', icon: '🌗' },
 ];
 let appSettingsUsageActor = 'product';
+let currentProfile = null;
 let connectorDevices = [];
 let connectorPairing = null;
 let _settingsSystemMQL = null;       // matchMedia handle for system theme
@@ -2963,6 +2973,7 @@ let _settingsSystemMQL = null;       // matchMedia handle for system theme
 function openAppSettings() {
   document.getElementById('appSettingsMask').classList.add('open');
   renderAppSettings();
+  if (!currentProfile) loadCurrentProfile().then(renderAppSettings);
   fetchUsageFor(appSettingsUsageActor).then(renderAppSettings);
   loadConnectorDevices();
   hydrateActorStyles();   // ensure avatar stack + dirty count fresh
@@ -3002,6 +3013,13 @@ async function loadConnectorDevices() {
   } catch (e) { console.error('loadConnectorDevices', e); }
   renderAppSettings();
 }
+async function loadCurrentProfile() {
+  try {
+    const data = await apiJson('/api/auth/me');
+    currentProfile = data?.user || null;
+  } catch (e) { console.error('loadCurrentProfile', e); }
+  return currentProfile;
+}
 async function createConnectorPairingCode() {
   try {
     const data = await apiJson('/api/connectors/pairing-code', { method: 'POST', body: '{}' });
@@ -3012,6 +3030,10 @@ async function createConnectorPairingCode() {
 function renderAppSettings() {
   const mask = document.getElementById('appSettingsMask');
   if (!mask || !mask.classList.contains('open')) return;
+  const profileName = document.getElementById('appSettingsProfileName');
+  const profileInitial = document.getElementById('appSettingsProfileInitial');
+  if (profileName) profileName.textContent = currentProfile?.display_name || '加载中…';
+  if (profileInitial) profileInitial.textContent = currentProfile?.display_name?.trim()?.slice(0, 1) || '—';
   // Theme segment
   const seg = document.getElementById('appSettingsThemeSeg');
   if (seg) {
@@ -8103,7 +8125,7 @@ document.getElementById('appSettingsMask').addEventListener('click', e => {
     openIdentityModal();
   } else if (act === 'connector-add') {
     createConnectorPairingCode();
-  } else if (act === 'app-logout') {
+  } else if (act === 'app-switch-profile') {
     apiJson('/api/auth/logout', { method: 'POST', body: '{}' }).finally(() => location.replace('/web/login.html'));
   } else if (act === 'app-settings-shortcuts') {
     showWipToast('快捷键面板 WIP');
@@ -9076,6 +9098,9 @@ if (state.view === 'dm') currentChannel = state.activeDm || 'dm-product';
 else if (state.view === 'group') currentChannel = state.activeGroup || 'workgroup';
 render();  // placeholder render so the page isn't blank during the prime fetch
 (async () => {
+  try {
+    await loadCurrentProfile();
+  } catch (e) { console.error('[init] loadCurrentProfile failed:', e); }
   try {
     await loadRoster();
   } catch (e) { console.error('[init] loadRoster failed:', e); }

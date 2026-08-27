@@ -87,7 +87,15 @@ export AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD='至少十位的初始密码'
 bun run dev
 ```
 
-打开 `http://localhost:3998/`，使用 `admin` 和初始密码登录。首次迁移后应移除 `AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD`；数据库只保存 Argon2id hash。
+打开 `http://localhost:3998/`。Server 首次启动会幂等创建文一、Tina、刘婷三个普通用户；选择身份后，Server 创建随机 Session，并通过 HttpOnly、SameSite=Lax Cookie 维持登录。勾选“记住此设备”时 Cookie 保留 30 天，否则随浏览器会话结束。已有有效 Session 的页面刷新会直接进入对应用户空间。
+
+### Trusted LAN 登录的安全边界
+
+当前 Profile Selector 是 **Trusted LAN MVP**，不是正式身份认证：任何能访问登录页面的人，理论上都能选择文一、Tina 或刘婷。Profile ID 只用于兑换服务端 Session；Conversation、Message、Task、Memory 与 Connector API 始终以 Session 中经过认证的 `user_id` 查询，不接受前端传入的 `user_id` 覆盖身份。
+
+因此该模式只应部署在可信局域网。下一阶段计划升级为 **Device-bound Passwordless Login**：首次选择身份并绑定设备，之后由设备自动识别，未绑定设备不能任意选择该用户。本阶段不包含设备身份锁定。
+
+管理员密码登录与一次性 bootstrap API 仍保留用于运维。首次迁移后应移除 `AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD`；数据库只保存 Argon2id hash。
 
 默认四个 Agent 使用 `remote-codex`。共享人设保存在 Server，可用 `PRODUCT_PROMPT_PATH`、`CREATIVE_PROMPT_PATH`、`SOCIAL_PROMPT_PATH`、`GROWTH_PROMPT_PATH` 指向对应 `AGENTS.md`。开发时仍可显式使用 `PRODUCT_PROVIDER=codex` 或 `claude`。
 
