@@ -1,12 +1,13 @@
 {
   "name": "@ai-studio/connector",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "bun src/index.ts",
     "doctor": "bun src/doctor.ts",
     "check": "bun build src/index.ts --target=bun --outdir /tmp/ai-studio-connector-check",
-    "build:standalone": "sh scripts/build-standalone.sh"
+    "build:standalone": "sh scripts/build-standalone.sh",
+    "build:pkg": "sh scripts/build-pkg.sh"
   }
 }

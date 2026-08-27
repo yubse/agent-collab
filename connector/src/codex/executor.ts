@@ -6,15 +6,19 @@ import type { ExecutionRequest } from '../protocol.ts'
 
 type DiagnosticLogger = (line: string) => void
 
+type SharedCodexProvider = Pick<CodexProvider,
+  'selectThread' | 'sessionId' | 'onEvent' | 'onError' | 'send' | 'warmup' | 'close' | 'interrupt'
+>
+
 export class LocalCodexExecutor {
-  private readonly provider: CodexProvider
+  private readonly provider: SharedCodexProvider
   private tail: Promise<unknown> = Promise.resolve()
   private sessions = new Map<string, string | null>()
 
   constructor(
     private config: { binary: string; cwd: string; stateDir: string; executionTimeoutMs: number },
     private log: DiagnosticLogger = (line) => console.error(line),
-    provider?: CodexProvider,
+    provider?: SharedCodexProvider,
   ) {
     mkdirSync(config.stateDir, { recursive: true, mode: 0o700 })
     this.provider = provider || new CodexProvider({
@@ -32,7 +36,7 @@ export class LocalCodexExecutor {
   }
 
   execute(request: ExecutionRequest): Promise<{ content: string; usage: any }> {
-    const key = `${request.conversation_id}:${request.agent_id}`
+    const key = `${request.user_id}:${request.conversation_id}:${request.agent_id}`
     const run = this.tail.catch(() => {}).then(async () => {
       this.provider.selectThread(this.sessionFor(key))
       const result = await this.runTurn(this.provider, request.prompt)
@@ -73,7 +77,7 @@ export class LocalCodexExecutor {
     return path.join(this.config.stateDir, `${safe}.json`)
   }
 
-  private runTurn(provider: CodexProvider, prompt: string): Promise<{ content: string; usage: any }> {
+  private runTurn(provider: SharedCodexProvider, prompt: string): Promise<{ content: string; usage: any }> {
     return new Promise((resolve, reject) => {
       const assistant: string[] = []
       let settled = false

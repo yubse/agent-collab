@@ -1,6 +1,6 @@
 import { loadConfig, saveDevice } from './config/index.ts'
-import { detectCodexStatus } from './codex/preflight.ts'
 import { LocalCodexExecutor } from './codex/executor.ts'
+import { CodexRuntimeManager } from './codex/runtime-manager.ts'
 import { ExecutionRunner } from './execution/runner.ts'
 import { runConnector } from './connection/client.ts'
 import { PairingService } from './pairing/service.ts'
@@ -11,15 +11,16 @@ export async function main(): Promise<never> {
   const config = loadConfig()
   const state = new ConnectorStateStore()
   let deviceToken = config.deviceToken
-  let codex = detectCodexStatus(config.codexBinary, state)
   let claimInFlight: Promise<{ bound: boolean; already_bound: boolean }> | null = null
 
+  const runtime = new CodexRuntimeManager(config, state)
+
   const executor = new LocalCodexExecutor({
-    binary: config.codexBinary,
+    binary: config.managedCodexPath,
     cwd: config.codexCwd,
     stateDir: config.stateDir,
     executionTimeoutMs: config.executionTimeoutMs,
-  })
+  }, undefined, runtime)
   const runner = new ExecutionRunner(executor, state)
   let connectorStarted = false
   const ensureConnector = () => {
@@ -56,44 +57,36 @@ export async function main(): Promise<never> {
     allowedOrigin: config.webOrigin,
     status: () => {
       const snapshot = state.snapshot()
+      const codex = runtime.snapshot()
       return {
         helper: 'online',
-        bound: Boolean(deviceToken),
-        server: snapshot.server === 'SERVER_CONNECTED' ? 'connected' : 'disconnected',
-        device_id: config.deviceId,
-        device_name: config.deviceName,
+        device: { bound: Boolean(deviceToken), device_name: config.deviceName },
+        server: { connected: snapshot.server === 'SERVER_CONNECTED' },
         platform: config.platform === 'darwin' ? 'macos' : config.platform,
         connector_version: config.connectorVersion,
         codex: {
-          installed: codex.installed,
+          runtime_installed: codex.runtimeInstalled,
+          runtime_version: codex.runtimeVersion,
           logged_in: codex.loggedIn,
           status: codex.status,
         },
       }
     },
     claim: completeClaim,
+    codexLogin: () => runtime.login(),
+    codexRestart: () => runtime.restart(),
   })
   helper.start()
   console.log(`[helper] status=online address=http://${helper.hostname}:${helper.port}`)
 
-  if (codex.status === 'CODEX_READY') {
-    void executor.warmup().catch(() => console.error('[codex] status=warmup_failed'))
-  }
+  void runtime.start().catch((error: any) => console.error(`[codex] status=prepare_failed code=${safeCodexCode(error?.message)}`))
   ensureConnector()
   if (config.pairingToken) {
     try { await completeClaim(config.pairingToken) }
     catch (error: any) { console.error(`[helper] claim=failed code=${safeClaimCode(error?.message)}`) }
   }
 
-  const codexTimer = setInterval(() => {
-    codex = detectCodexStatus(config.codexBinary, state)
-    if (codex.status === 'CODEX_READY') {
-      void executor.warmup().catch(() => console.error('[codex] status=warmup_failed'))
-    }
-  }, 30_000)
-
   const shutdown = async () => {
-    clearInterval(codexTimer)
     helper.stop()
     console.log('[connector] status=SERVER_DISCONNECTED reason=shutdown')
     await executor.close()
@@ -102,6 +95,12 @@ export async function main(): Promise<never> {
   process.once('SIGINT', shutdown)
   process.once('SIGTERM', shutdown)
   return new Promise<never>(() => {})
+}
+
+function safeCodexCode(message: string): string {
+  if (/NOT_INSTALLED|BUNDLED_RUNTIME/i.test(message)) return 'CODEX_RUNTIME_NOT_INSTALLED'
+  if (/NOT_LOGGED_IN/i.test(message)) return 'CODEX_NOT_LOGGED_IN'
+  return 'CODEX_RUNTIME_ERROR'
 }
 
 function safeClaimCode(message: string): string {

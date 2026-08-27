@@ -1,15 +1,20 @@
 export type HelperCodexStatus = {
-  installed: boolean
+  runtime_installed: boolean
+  runtime_version: string | null
   logged_in: boolean
-  status: 'CODEX_NOT_INSTALLED' | 'CODEX_NOT_LOGGED_IN' | 'CODEX_READY'
+  status:
+    | 'CODEX_RUNTIME_NOT_INSTALLED'
+    | 'CODEX_RUNTIME_INSTALLING'
+    | 'CODEX_RUNTIME_ERROR'
+    | 'CODEX_NOT_LOGGED_IN'
+    | 'CODEX_AUTHENTICATING'
+    | 'CODEX_READY'
 }
 
 export type LocalHelperStatus = {
   helper: 'online'
-  bound: boolean
-  server: 'connected' | 'disconnected'
-  device_id: string
-  device_name: string
+  device: { bound: boolean; device_name: string }
+  server: { connected: boolean }
   platform: string
   connector_version: string
   codex: HelperCodexStatus
@@ -21,6 +26,8 @@ export type LocalHelperServerOptions = {
   allowedOrigin: string
   status: () => LocalHelperStatus
   claim: (claimToken: string) => Promise<{ bound: boolean; already_bound: boolean }>
+  codexLogin: () => Promise<{ started: true; status: 'CODEX_AUTHENTICATING' }>
+  codexRestart?: () => Promise<void>
 }
 
 export class LocalHelperServer {
@@ -65,6 +72,10 @@ export class LocalHelperServer {
       return Response.json(this.options.status(), { headers: origin ? this.corsHeaders(false) : undefined })
     }
 
+    if (request.method === 'GET' && url.pathname === '/codex/status') {
+      return Response.json(this.options.status().codex, { headers: origin ? this.corsHeaders(false) : undefined })
+    }
+
     if (request.method === 'POST' && url.pathname === '/claim') {
       if (origin !== this.options.allowedOrigin) {
         return Response.json({ ok: false, error: 'ORIGIN_REQUIRED' }, { status: 403 })
@@ -83,6 +94,36 @@ export class LocalHelperServer {
         return Response.json({ ok: true, ...result }, { headers: this.corsHeaders(false) })
       } catch (error: any) {
         return Response.json({ ok: false, error: safeClaimError(error?.message) }, {
+          status: 400,
+          headers: this.corsHeaders(false),
+        })
+      }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/codex/login') {
+      if (origin !== this.options.allowedOrigin) {
+        return Response.json({ ok: false, error: 'ORIGIN_REQUIRED' }, { status: 403 })
+      }
+      try {
+        const result = await this.options.codexLogin()
+        return Response.json({ ok: true, ...result }, { headers: this.corsHeaders(false) })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: safeCodexError(error?.message) }, {
+          status: 400,
+          headers: this.corsHeaders(false),
+        })
+      }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/codex/restart' && this.options.codexRestart) {
+      if (origin !== this.options.allowedOrigin) {
+        return Response.json({ ok: false, error: 'ORIGIN_REQUIRED' }, { status: 403 })
+      }
+      try {
+        await this.options.codexRestart()
+        return Response.json({ ok: true }, { headers: this.corsHeaders(false) })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: safeCodexError(error?.message) }, {
           status: 400,
           headers: this.corsHeaders(false),
         })
@@ -110,4 +151,11 @@ function safeClaimError(message: string): string {
   if (message === 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER') return message
   if (/invalid|expired/i.test(message)) return 'CLAIM_TOKEN_INVALID_OR_EXPIRED'
   return 'CLAIM_FAILED'
+}
+
+function safeCodexError(message: string): string {
+  if (/NOT_LOGGED_IN/i.test(message)) return 'CODEX_NOT_LOGGED_IN'
+  if (/NOT_INSTALLED|BUNDLED_RUNTIME/i.test(message)) return 'CODEX_RUNTIME_NOT_INSTALLED'
+  if (/AUTHENTICAT|LOGIN/i.test(message)) return 'CODEX_AUTHENTICATION_ERROR'
+  return 'CODEX_RUNTIME_ERROR'
 }

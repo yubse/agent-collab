@@ -4,10 +4,10 @@ set -eu
 LABEL=com.aistudio.connector
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
-INSTALL_ROOT="$HOME/.ai-studio"
-BIN_DIR="$INSTALL_ROOT/bin"
+INSTALL_ROOT="$HOME/Library/Application Support/AIStudio"
+BIN_DIR="$INSTALL_ROOT/helper"
 LOG_DIR="$INSTALL_ROOT/logs"
-TARGET_BIN="$BIN_DIR/aistudio-connector"
+TARGET_BIN="$BIN_DIR/aistudio-helper"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SOURCE_BIN=${AISTUDIO_CONNECTOR_BINARY:-"$REPO_DIR/connector/dist/aistudio-connector"}
 
@@ -22,6 +22,8 @@ fi
 
 CODEX_BIN=${CODEX_BINARY_PATH:-$(command -v codex 2>/dev/null || true)}
 if [ -z "$CODEX_BIN" ]; then CODEX_BIN=codex; fi
+USE_SYSTEM=${USE_SYSTEM_CODEX:-1}
+CODEX_HOME_DIR=${AI_STUDIO_CODEX_HOME:-"$HOME/.codex"}
 WEB_ORIGIN=${AI_STUDIO_WEB_ORIGIN:-$AI_STUDIO_SERVER_URL}
 
 mkdir -p "$BIN_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
@@ -34,6 +36,9 @@ escape_xml() {
 SERVER_XML=$(escape_xml "$AI_STUDIO_SERVER_URL")
 ORIGIN_XML=$(escape_xml "$WEB_ORIGIN")
 CODEX_XML=$(escape_xml "$CODEX_BIN")
+CODEX_HOME_XML=$(escape_xml "$CODEX_HOME_DIR")
+APP_SUPPORT_XML=$(escape_xml "$INSTALL_ROOT")
+USE_SYSTEM_XML=$(escape_xml "$USE_SYSTEM")
 HOME_XML=$(escape_xml "$HOME")
 BIN_XML=$(escape_xml "$TARGET_BIN")
 OUT_XML=$(escape_xml "$LOG_DIR/helper.log")
@@ -47,11 +52,15 @@ umask 077
   echo '  <key>Label</key><string>'"$LABEL"'</string>'
   echo '  <key>ProgramArguments</key><array><string>'"$BIN_XML"'</string></array>'
   echo '  <key>RunAtLoad</key><true/>'
-  echo '  <key>KeepAlive</key><true/>'
+  echo '  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>'
+  echo '  <key>ThrottleInterval</key><integer>10</integer>'
   echo '  <key>EnvironmentVariables</key><dict>'
   echo '    <key>AI_STUDIO_SERVER_URL</key><string>'"$SERVER_XML"'</string>'
   echo '    <key>AI_STUDIO_WEB_ORIGIN</key><string>'"$ORIGIN_XML"'</string>'
   echo '    <key>CODEX_BINARY_PATH</key><string>'"$CODEX_XML"'</string>'
+  echo '    <key>AI_STUDIO_CODEX_HOME</key><string>'"$CODEX_HOME_XML"'</string>'
+  echo '    <key>AI_STUDIO_APP_SUPPORT_DIR</key><string>'"$APP_SUPPORT_XML"'</string>'
+  echo '    <key>USE_SYSTEM_CODEX</key><string>'"$USE_SYSTEM_XML"'</string>'
   echo '    <key>HOME</key><string>'"$HOME_XML"'</string>'
   echo '    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>'
   echo '  </dict>'

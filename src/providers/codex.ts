@@ -43,6 +43,17 @@ type PendingRequest = {
   timeoutHandle: ReturnType<typeof setTimeout>
 }
 
+export type CodexAccountSnapshot = {
+  account: null | { type?: string; email?: string | null; planType?: string | null }
+  requiresOpenaiAuth: boolean
+}
+
+export type CodexLoginStart = {
+  type: 'chatgpt'
+  loginId: string
+  authUrl: string
+}
+
 const REQUEST_ACK_TIMEOUT_MS = loadConnectorTimeouts().requestAckTimeoutMs
 const APPROVAL_ACCEPTING_METHODS = new Set([
   'item/commandExecution/requestApproval',
@@ -83,6 +94,7 @@ export class CodexProvider implements AgentProvider {
   private eventCb: ((ev: AgentEvent) => void | Promise<void>) | null = null
   private errorCb: ((err: AgentError) => void) | null = null
   private diagnosticCb: AgentProviderConfig['onDiagnostic'] = null
+  private accountEventCb: ((method: string, params: any) => void) | null = null
   private label: string
 
   constructor(cfg: AgentProviderConfig) {
@@ -108,6 +120,45 @@ export class CodexProvider implements AgentProvider {
   capabilities(): AgentCapabilities { return CAPABILITIES }
   onEvent(cb: (ev: AgentEvent) => void | Promise<void>): void { this.eventCb = cb }
   onError(cb: (err: AgentError) => void): void { this.errorCb = cb }
+  onAccountEvent(cb: (method: string, params: any) => void): void { this.accountEventCb = cb }
+
+  async readAccount(refreshToken = false): Promise<CodexAccountSnapshot> {
+    await this.warmup()
+    const result = await this._request('account/read', { refreshToken })
+    return {
+      account: result?.account || null,
+      requiresOpenaiAuth: result?.requiresOpenaiAuth !== false,
+    }
+  }
+
+  async startChatGPTLogin(): Promise<CodexLoginStart> {
+    await this.warmup()
+    const result = await this._request('account/login/start', {
+      type: 'chatgpt',
+      useHostedLoginSuccessPage: true,
+      appBrand: 'chatgpt',
+    })
+    if (result?.type !== 'chatgpt' || !result?.loginId || !result?.authUrl) {
+      throw new Error('CODEX_LOGIN_START_FAILED')
+    }
+    return { type: 'chatgpt', loginId: String(result.loginId), authUrl: String(result.authUrl) }
+  }
+
+  async restartProcess(): Promise<void> {
+    const proc = this.proc
+    if (proc && this.isAlive) {
+      try { proc.kill('SIGTERM') } catch {}
+      await Promise.race([proc.exited.catch(() => null), Bun.sleep(2_000)])
+      if (proc.exitCode === null) {
+        try { proc.kill('SIGKILL') } catch {}
+        try { await proc.exited } catch {}
+      }
+    }
+    this.proc = null
+    this._initialized = false
+    this._threadStartedInThisProcess = false
+    await this.warmup()
+  }
 
   /**
    * Select a logical Codex thread while keeping the same app-server process.
@@ -197,7 +248,7 @@ export class CodexProvider implements AgentProvider {
         stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
         // Keep the Connector user's network/auth/runtime environment intact.
         // In particular, never replace proxy, PATH, HOME, or CODEX_HOME here.
-        env: { ...process.env },
+        env: { ...process.env, ...(this.cfg.env || {}) },
       }
       if (this.cfg.cwd) spawnOpts.cwd = this.cfg.cwd
 
@@ -214,8 +265,9 @@ export class CodexProvider implements AgentProvider {
       this._pumpStdout()
       this._pumpStderr()
 
-      this.proc.exited.then((code) => {
-        const signal = (this.proc as any)?.signalCode ?? null
+      const spawnedProc = this.proc
+      spawnedProc.exited.then((code) => {
+        const signal = (spawnedProc as any)?.signalCode ?? null
         this.diagnosticCb?.({ stream: 'process', message: `exited signal=${signal ?? 'none'}`, exitCode: code })
         if ((code !== null && code !== 0) || signal) {
           this.errorCb?.({
@@ -449,6 +501,11 @@ export class CodexProvider implements AgentProvider {
     // Filter cross-thread noise. Some notifications (remoteControl/status, account/*) have
     // no threadId — let those through. Anything threadId-scoped must match ours.
     if (params.threadId && this._threadId && params.threadId !== this._threadId) {
+      return
+    }
+    if (method.startsWith('account/')) {
+      this.accountEventCb?.(method, params)
+      this.eventCb?.({ type: 'other', raw })
       return
     }
 

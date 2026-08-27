@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+PLIST="/Library/LaunchAgents/com.aistudio.connector.plist"
+CONFIG_ROOT="/Library/Application Support/AIStudio/config"
+CONSOLE_USER=$(/usr/bin/stat -f '%Su' /dev/console)
+
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+  exit 0
+fi
+
+CONSOLE_UID=$(/usr/bin/id -u "$CONSOLE_USER")
+/bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 || true
+/bin/launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST"
+/bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.connector"
+
+if [ -f "$CONFIG_ROOT/server-url.txt" ]; then
+  SERVER_URL=$(/usr/bin/head -n 1 "$CONFIG_ROOT/server-url.txt")
+  case "$SERVER_URL" in
+    http://*|https://*)
+      /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/open "$SERVER_URL" >/dev/null 2>&1 || true
+      ;;
+  esac
+fi
+
+exit 0

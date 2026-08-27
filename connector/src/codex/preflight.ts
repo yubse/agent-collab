@@ -31,7 +31,7 @@ export function detectCodexStatus(
   let versionResult
   try { versionResult = spawnSync([binary, '--version']) } catch { versionResult = null }
   if (!versionResult || versionResult.exitCode !== 0) {
-    state.setCodex('CODEX_NOT_FOUND', '未找到 Codex CLI，请先在本机安装 Codex。')
+    state.setCodex('CODEX_RUNTIME_NOT_INSTALLED', 'Codex 运行环境尚未准备。')
     return { installed: false, loggedIn: false, status: 'CODEX_NOT_INSTALLED', version: null }
   }
   const version = new TextDecoder().decode(versionResult.stdout).trim().split(/\r?\n/, 1)[0] || 'unknown'

@@ -4,20 +4,21 @@ import { LocalHelperServer, type LocalHelperStatus } from './server.ts'
 const origin = 'http://192.168.20.200:3998'
 const status: LocalHelperStatus = {
   helper: 'online',
-  bound: false,
-  server: 'disconnected',
-  device_id: 'dev_local-helper',
-  device_name: 'Tina MacBook Pro',
+  device: { bound: false, device_name: 'Tina MacBook Pro' },
+  server: { connected: false },
   platform: 'macos',
   connector_version: '0.1.0',
-  codex: { installed: true, logged_in: true, status: 'CODEX_READY' },
+  codex: { runtime_installed: true, runtime_version: 'codex-cli 1.2.3', logged_in: true, status: 'CODEX_READY' },
 }
 let helper: LocalHelperServer | null = null
 
 afterEach(() => { helper?.stop(); helper = null })
 
-function startHelper(claim: (claimToken: string) => Promise<{ bound: boolean; already_bound: boolean }> = async () => ({ bound: true, already_bound: false })) {
-  helper = new LocalHelperServer({ port: 0, allowedOrigin: origin, status: () => status, claim })
+function startHelper(
+  claim: (claimToken: string) => Promise<{ bound: boolean; already_bound: boolean }> = async () => ({ bound: true, already_bound: false }),
+  codexLogin: () => Promise<{ started: true; status: 'CODEX_AUTHENTICATING' }> = async () => ({ started: true, status: 'CODEX_AUTHENTICATING' }),
+) {
+  helper = new LocalHelperServer({ port: 0, allowedOrigin: origin, status: () => status, claim, codexLogin })
   helper.start()
   return `http://127.0.0.1:${helper.port}`
 }
@@ -49,11 +50,30 @@ test('test_local_helper_does_not_expose_credentials', async () => {
 
 test('test_local_api_only_binds_loopback', () => {
   expect(() => new LocalHelperServer({
-    hostname: '0.0.0.0' as any, port: 0, allowedOrigin: origin, status: () => status, claim: async () => ({ bound: true, already_bound: false }),
+    hostname: '0.0.0.0' as any, port: 0, allowedOrigin: origin, status: () => status,
+    claim: async () => ({ bound: true, already_bound: false }),
+    codexLogin: async () => ({ started: true, status: 'CODEX_AUTHENTICATING' }),
   }).start()).toThrow('LOCAL_HELPER_MUST_BIND_LOOPBACK')
   const base = startHelper()
   expect(helper!.hostname).toBe('127.0.0.1')
   expect(base).toStartWith('http://127.0.0.1:')
+})
+
+test('test_codex_login_does_not_expose_auth', async () => {
+  const base = startHelper()
+  const response = await fetch(`${base}/codex/login`, {
+    method: 'POST', headers: { origin, 'content-type': 'application/json' }, body: '{}',
+  })
+  expect(response.status).toBe(200)
+  const result = await response.json() as any
+  expect(result).toEqual({ ok: true, started: true, status: 'CODEX_AUTHENTICATING' })
+  expect(JSON.stringify(result)).not.toMatch(/authUrl|access_token|refresh_token|cookie|credential/i)
+})
+
+test('test_codex_status_ready', async () => {
+  const base = startHelper()
+  const response = await fetch(`${base}/codex/status`, { headers: { origin } })
+  expect(await response.json()).toEqual(status.codex)
 })
 
 test('test_cors_rejects_unknown_origin', async () => {

@@ -67,6 +67,8 @@ export type AgentProviderConfig = {
   binaryPath?: string
   /** Extra args appended to the spawn command line. */
   extraArgs?: string[]
+  /** Additional subprocess environment values merged over the current user environment. */
+  env?: Record<string, string | undefined>
   /** Event callback (overrides `provider.onEvent()` registration). */
   onEvent?: (ev: AgentEvent) => void | Promise<void>
   /** Error callback (overrides `provider.onError()` registration). */

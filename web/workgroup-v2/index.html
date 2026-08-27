@@ -3074,7 +3074,35 @@ async function connectThisComputer() {
   }
 }
 function installLocalHelper() {
-  showWipToast('请使用 connector/scripts/install-helper.sh 完成一次性安装');
+  showWipToast('请安装 AI-Studio-Helper.pkg；安装完成后本页会自动检测');
+}
+async function loginCodex() {
+  if (!localHelperStatus.available) return;
+  try {
+    if (localHelperStatus.data?.codex) localHelperStatus.data.codex.status = 'CODEX_AUTHENTICATING';
+    renderAppSettings();
+    const response = await fetch(`${LOCAL_HELPER_URL}/codex/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result?.ok) throw new Error(result?.error || '无法开始 Codex 登录');
+    showWipToast('已打开官方登录页面，完成后状态会自动更新');
+    await loadLocalHelperStatus();
+  } catch (e) {
+    showWipToast(e.message || '无法开始 Codex 登录');
+    await loadLocalHelperStatus();
+  }
+}
+async function restartCodexRuntime() {
+  if (!localHelperStatus.available) return;
+  try {
+    const response = await fetch(`${LOCAL_HELPER_URL}/codex/restart`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result?.ok) throw new Error(result?.error || '运行环境重启失败');
+    await loadLocalHelperStatus();
+  } catch (e) { showWipToast(e.message || '运行环境重启失败'); }
 }
 function renderAppSettings() {
   const mask = document.getElementById('appSettingsMask');
@@ -3149,22 +3177,46 @@ function renderAppSettings() {
   if (devicesBox) {
     const helper = localHelperStatus.data;
     const codexReady = helper?.codex?.status === 'CODEX_READY';
-    const rows = connectorDevices.length ? connectorDevices.map(device => `<div style="display:flex; align-items:center; gap:9px; padding:7px 0; border-top:1px solid var(--border-2);">
+    const onlineDevice = connectorDevices.find(device => device.status === 'online');
+    const deviceRows = connectorDevices.length ? connectorDevices.map(device => `<div style="display:flex; align-items:center; gap:9px; padding:7px 0; border-top:1px solid var(--border-2);">
       <span style="width:8px;height:8px;border-radius:50%;background:${device.status === 'online' ? 'var(--good)' : 'var(--ink-3)'};"></span>
       <span style="flex:1;color:var(--ink);">${esc(device.device_name)}</span>
       <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--ink-3);">${device.status === 'online' ? '在线' : '离线'}</span>
-    </div>`).join('') + `<div style="padding-top:8px;color:${codexReady ? 'var(--good)' : 'var(--warn)'};">Codex · ${codexReady ? 'Ready' : esc(helper?.codex?.status || '状态未知')}</div>`
-      : localHelperStatus.available
-        ? `<div style="padding:5px 0 3px;">
-            <div style="font-size:13px;color:var(--good);font-weight:600;">● 已运行</div>
-            <div style="margin-top:6px;">Codex<br><span style="color:${codexReady ? 'var(--good)' : 'var(--warn)'};font-weight:600;">● ${codexReady ? '已登录' : esc(helper?.codex?.status || '状态未知')}</span></div>
-            <button data-action="connector-connect" style="margin-top:12px;border:none;background:var(--ink);color:var(--surface);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">连接此电脑</button>
-          </div>`
-        : `<div style="padding:5px 0 3px;">
-            <div style="font-size:13px;color:var(--ink);font-weight:600;">AI Studio Helper</div>
-            <div style="margin-top:5px;">○ ${localHelperStatus.checking ? '正在检测…' : '未检测到'}</div>
-            <button data-action="helper-install" style="margin-top:12px;border:none;background:var(--ink);color:var(--surface);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">安装 Helper</button>
-          </div>`;
+    </div>`).join('') : '';
+    const helperLayer = localHelperStatus.available
+      ? `<div style="padding:5px 0 10px;">
+          <div style="font-size:10px;color:var(--ink-3);letter-spacing:.08em;">本机连接</div>
+          <div style="margin-top:6px;font-size:13px;color:var(--good);font-weight:600;">● AI Studio Helper 已运行</div>
+          ${onlineDevice ? `<div style="margin-top:7px;color:var(--ink);">● ${esc(onlineDevice.device_name)} · 在线</div>` : `
+            <div style="margin-top:6px;color:var(--ink-2);">尚未连接当前用户</div>
+            <button data-action="connector-connect" style="margin-top:10px;border:none;background:var(--ink);color:var(--surface);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">连接此电脑</button>`}
+          ${deviceRows}
+        </div>`
+      : `<div style="padding:5px 0 10px;">
+          <div style="font-size:10px;color:var(--ink-3);letter-spacing:.08em;">本机连接</div>
+          <div style="margin-top:6px;font-size:13px;color:var(--ink);font-weight:600;">○ AI Studio Helper ${localHelperStatus.checking ? '正在检测…' : '未检测到'}</div>
+          <button data-action="helper-install" style="margin-top:10px;border:none;background:var(--ink);color:var(--surface);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">安装 Helper</button>
+        </div>`;
+    const codexStatus = helper?.codex?.status || 'HELPER_OFFLINE';
+    const codexPresentation = {
+      CODEX_RUNTIME_NOT_INSTALLED: ['○', '尚未安装运行环境', 'var(--warn)'],
+      CODEX_RUNTIME_INSTALLING: ['◐', '正在准备运行环境', 'var(--warn)'],
+      CODEX_RUNTIME_ERROR: ['○', '运行环境异常', 'var(--bad)'],
+      CODEX_NOT_LOGGED_IN: ['○', '未登录', 'var(--warn)'],
+      CODEX_AUTHENTICATING: ['◐', '正在登录', 'var(--warn)'],
+      CODEX_READY: ['●', 'Ready', 'var(--good)'],
+      HELPER_OFFLINE: ['○', '等待 Helper', 'var(--ink-3)'],
+    }[codexStatus] || ['○', '状态异常', 'var(--bad)'];
+    const codexAction = codexStatus === 'CODEX_NOT_LOGGED_IN'
+      ? `<button data-action="codex-login" style="margin-top:10px;border:none;background:var(--ink);color:var(--surface);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">登录 Codex</button>`
+      : codexStatus === 'CODEX_RUNTIME_ERROR'
+        ? `<button data-action="codex-restart" style="margin-top:10px;border:1px solid var(--border);background:var(--surface);color:var(--ink);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">重新准备</button>`
+        : '';
+    const codexLayer = `<div style="padding:10px 0 3px;border-top:1px solid var(--border-2);">
+      <div style="font-size:10px;color:var(--ink-3);letter-spacing:.08em;">CODEX</div>
+      <div style="margin-top:6px;font-size:13px;color:${codexPresentation[2]};font-weight:600;">${codexPresentation[0]} ${codexPresentation[1]}</div>
+      ${codexAction}
+    </div>`;
     const stateMessage = connectorPairingState.status === 'creating'
       ? '<div style="margin-top:9px;color:var(--ink-2);">正在创建安全连接请求…</div>'
       : connectorPairingState.status === 'not-installed'
@@ -3177,7 +3229,7 @@ function renderAppSettings() {
             : connectorPairingState.status === 'error'
               ? `<div style="margin-top:9px;color:var(--bad);">${esc(connectorPairingState.error || '无法发起连接')}</div>`
               : '';
-    devicesBox.innerHTML = rows + stateMessage;
+    devicesBox.innerHTML = helperLayer + codexLayer + stateMessage;
   }
 }
 
@@ -8196,6 +8248,10 @@ document.getElementById('appSettingsMask').addEventListener('click', e => {
     connectThisComputer();
   } else if (act === 'helper-install') {
     installLocalHelper();
+  } else if (act === 'codex-login') {
+    loginCodex();
+  } else if (act === 'codex-restart') {
+    restartCodexRuntime();
   } else if (act === 'app-switch-profile') {
     apiJson('/api/auth/logout', { method: 'POST', body: '{}' }).finally(() => location.replace('/web/login.html'));
   } else if (act === 'app-settings-shortcuts') {

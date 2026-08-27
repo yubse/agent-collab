@@ -5,11 +5,7 @@ import { randomUUID } from 'crypto'
 import { loadConnectorTimeouts } from '../../../src/connector/timeouts.ts'
 import { pairingTokenFromLaunchArgs } from '../pairing/service.ts'
 
-const configDir = process.env.AI_STUDIO_CONNECTOR_HOME || path.join(homedir(), '.ai-studio')
-const configFile = path.join(configDir, 'connector.json')
-const legacyConfigFile = path.join(homedir(), '.ai-studio-connector', 'device.json')
-
-type SavedConfig = {
+type SavedDevice = {
   server_url?: string
   connector_ws_url?: string
   device_token?: string
@@ -17,12 +13,20 @@ type SavedConfig = {
   device_id?: string
 }
 
-function readSaved(): SavedConfig {
-  try {
-    if (existsSync(configFile)) return JSON.parse(readFileSync(configFile, 'utf8'))
-    if (existsSync(legacyConfigFile)) return JSON.parse(readFileSync(legacyConfigFile, 'utf8'))
-  } catch {}
-  return {}
+type InstalledHelperConfig = {
+  server_url?: string
+  web_origin?: string
+  bundled_codex_path?: string
+}
+
+function readJson<T>(filename: string): T | null {
+  try { return existsSync(filename) ? JSON.parse(readFileSync(filename, 'utf8')) as T : null }
+  catch { return null }
+}
+
+function defaultBundledRuntimePath(): string | null {
+  const candidate = path.resolve(path.dirname(process.execPath), '..', 'bundled-runtime', 'codex')
+  return existsSync(candidate) ? candidate : null
 }
 
 export type ConnectorConfig = {
@@ -39,51 +43,83 @@ export type ConnectorConfig = {
   pairingToken: string | null
   codexBinary: string
   codexCwd: string
+  codexHome: string
+  appSupportDir: string
+  managedCodexPath: string
+  bundledCodexPath: string | null
+  useSystemCodex: boolean
   stateDir: string
   connectTimeoutMs: number
   executionTimeoutMs: number
 }
 
 export function loadConfig(): ConnectorConfig {
-  const saved = readSaved()
+  const userHome = homedir()
+  const appSupportDir = process.env.AI_STUDIO_APP_SUPPORT_DIR
+    || path.join(userHome, 'Library', 'Application Support', 'AIStudio')
+  const credentialsDir = path.join(appSupportDir, 'credentials')
+  const deviceFile = path.join(credentialsDir, 'device.json')
+  const legacyFiles = [
+    path.join(userHome, '.ai-studio', 'connector.json'),
+    path.join(userHome, '.ai-studio-connector', 'device.json'),
+  ]
+  const saved = readJson<SavedDevice>(deviceFile)
+    || legacyFiles.map((filename) => readJson<SavedDevice>(filename)).find(Boolean)
+    || {}
+  const installed = readJson<InstalledHelperConfig>(
+    process.env.AI_STUDIO_HELPER_CONFIG || '/Library/Application Support/AIStudio/config/helper.json',
+  ) || {}
   const timeouts = loadConnectorTimeouts()
-  const serverUrl = (process.env.AI_STUDIO_SERVER_URL || saved.server_url || '').replace(/\/$/, '')
+  const serverUrl = (process.env.AI_STUDIO_SERVER_URL || installed.server_url || saved.server_url || '').replace(/\/$/, '')
   if (!serverUrl) throw new Error('AI_STUDIO_SERVER_URL is required, for example http://nas.local:3998')
-  const webOrigin = process.env.AI_STUDIO_WEB_ORIGIN || new URL(serverUrl).origin
+  const webOrigin = process.env.AI_STUDIO_WEB_ORIGIN || installed.web_origin || new URL(serverUrl).origin
   const deviceId = process.env.AI_STUDIO_DEVICE_ID || saved.device_id || `dev_${randomUUID()}`
-  if (!existsSync(configFile) || (!saved.device_id && !process.env.AI_STUDIO_DEVICE_ID)) {
-    mkdirSync(configDir, { recursive: true, mode: 0o700 })
-    writeFileSync(configFile, JSON.stringify({ ...saved, device_id: deviceId }, null, 2), { mode: 0o600 })
-    chmodSync(configFile, 0o600)
+  mkdirSync(credentialsDir, { recursive: true, mode: 0o700 })
+  if (!existsSync(deviceFile)) {
+    writeFileSync(deviceFile, JSON.stringify({ ...saved, device_id: deviceId }, null, 2), { mode: 0o600 })
+    chmodSync(deviceFile, 0o600)
   }
+  const runtimeDir = path.join(appSupportDir, 'runtime')
+  const bundledCodexPath = process.env.AI_STUDIO_BUNDLED_CODEX_PATH
+    || installed.bundled_codex_path
+    || defaultBundledRuntimePath()
+  const workspaceDir = process.env.AI_STUDIO_CODEX_CWD || path.join(appSupportDir, 'workspace')
+  mkdirSync(workspaceDir, { recursive: true, mode: 0o700 })
   return {
     serverUrl,
     connectorWsUrl: process.env.CONNECTOR_WS_URL || saved.connector_ws_url || null,
     deviceName: process.env.AI_STUDIO_DEVICE_NAME || saved.device_name || hostname(),
     deviceId,
     platform: process.platform,
-    connectorVersion: process.env.AI_STUDIO_CONNECTOR_VERSION || '0.1.0',
+    connectorVersion: process.env.AI_STUDIO_CONNECTOR_VERSION || '0.2.0',
     webOrigin,
     helperHost: '127.0.0.1',
     helperPort: Number(process.env.AI_STUDIO_HELPER_PORT || 39481),
     deviceToken: process.env.AI_STUDIO_DEVICE_TOKEN || saved.device_token || null,
     pairingToken: process.env.AI_STUDIO_PAIRING_TOKEN || pairingTokenFromLaunchArgs(process.argv.slice(2)),
     codexBinary: process.env.CODEX_BINARY_PATH || 'codex',
-    codexCwd: process.env.AI_STUDIO_CODEX_CWD || process.cwd(),
-    stateDir: path.join(configDir, 'state'),
+    codexCwd: workspaceDir,
+    codexHome: process.env.AI_STUDIO_CODEX_HOME || path.join(appSupportDir, 'codex-home'),
+    appSupportDir,
+    managedCodexPath: process.env.AI_STUDIO_MANAGED_CODEX_PATH || path.join(runtimeDir, 'codex'),
+    bundledCodexPath: bundledCodexPath || null,
+    useSystemCodex: process.env.USE_SYSTEM_CODEX === '1',
+    stateDir: path.join(appSupportDir, 'state'),
     connectTimeoutMs: timeouts.connectTimeoutMs,
     executionTimeoutMs: timeouts.executionTimeoutMs,
   }
 }
 
 export function saveDevice(config: ConnectorConfig, deviceToken: string, connectorWsUrl?: string | null): void {
-  mkdirSync(configDir, { recursive: true, mode: 0o700 })
-  writeFileSync(configFile, JSON.stringify({
+  const credentialsDir = path.join(config.appSupportDir, 'credentials')
+  const deviceFile = path.join(credentialsDir, 'device.json')
+  mkdirSync(credentialsDir, { recursive: true, mode: 0o700 })
+  writeFileSync(deviceFile, JSON.stringify({
     server_url: config.serverUrl,
     connector_ws_url: connectorWsUrl || config.connectorWsUrl || undefined,
     device_token: deviceToken,
     device_name: config.deviceName,
     device_id: config.deviceId,
   }, null, 2), { mode: 0o600 })
-  chmodSync(configFile, 0o600)
+  chmodSync(deviceFile, 0o600)
 }
