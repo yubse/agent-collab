@@ -1,51 +1,76 @@
 import path from 'path'
-import { mkdirSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { CodexProvider } from '../../../src/providers/codex.ts'
 import type { AgentEvent } from '../../../src/providers/provider.ts'
 import type { ExecutionRequest } from '../protocol.ts'
 
-type Runtime = { provider: CodexProvider; tail: Promise<unknown> }
 type DiagnosticLogger = (line: string) => void
 
 export class LocalCodexExecutor {
-  private runtimes = new Map<string, Runtime>()
+  private readonly provider: CodexProvider
+  private tail: Promise<unknown> = Promise.resolve()
+  private sessions = new Map<string, string | null>()
 
   constructor(
     private config: { binary: string; cwd: string; stateDir: string; executionTimeoutMs: number },
     private log: DiagnosticLogger = (line) => console.error(line),
+    provider?: CodexProvider,
   ) {
     mkdirSync(config.stateDir, { recursive: true, mode: 0o700 })
+    this.provider = provider || new CodexProvider({
+      label: 'connector:shared-app-server',
+      binaryPath: this.config.binary,
+      cwd: this.config.cwd,
+      onDiagnostic: (event) => {
+        if (event.stream === 'process') {
+          this.log(`[codex] status=exited code=${event.exitCode ?? 'unknown'} ${event.message}`)
+        } else {
+          this.log(`[codex] stream=stderr ${diagnosticSummary(event.message)}`)
+        }
+      },
+    })
   }
 
   execute(request: ExecutionRequest): Promise<{ content: string; usage: any }> {
     const key = `${request.conversation_id}:${request.agent_id}`
-    let runtime = this.runtimes.get(key)
-    if (!runtime) {
-      const safe = key.replace(/[^A-Za-z0-9_.-]/g, '_')
-      const provider = new CodexProvider({
-        label: `connector:${request.agent_id}`,
-        binaryPath: this.config.binary,
-        cwd: this.config.cwd,
-        stateFilePath: path.join(this.config.stateDir, `${safe}.json`),
-        onDiagnostic: (event) => {
-          if (event.stream === 'process') {
-            this.log(`[codex] status=exited code=${event.exitCode ?? 'unknown'} ${event.message}`)
-          } else {
-            this.log(`[codex] stream=stderr ${diagnosticSummary(event.message)}`)
-          }
-        },
-      })
-      runtime = { provider, tail: Promise.resolve() }
-      this.runtimes.set(key, runtime)
-    }
-    const run = runtime.tail.catch(() => {}).then(() => this.runTurn(runtime!.provider, request.prompt))
-    runtime.tail = run
+    const run = this.tail.catch(() => {}).then(async () => {
+      this.provider.selectThread(this.sessionFor(key))
+      const result = await this.runTurn(this.provider, request.prompt)
+      this.persistSession(key, this.provider.sessionId)
+      return result
+    })
+    this.tail = run
     return run
   }
 
+  warmup(): Promise<void> {
+    return this.provider.warmup()
+  }
+
   async close(): Promise<void> {
-    await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.provider.close()))
-    this.runtimes.clear()
+    await this.provider.close()
+    this.sessions.clear()
+  }
+
+  private sessionFor(key: string): string | null {
+    if (this.sessions.has(key)) return this.sessions.get(key) || null
+    const statePath = this.statePath(key)
+    let sessionId: string | null = null
+    try {
+      if (existsSync(statePath)) sessionId = JSON.parse(readFileSync(statePath, 'utf8'))?.session_id || null
+    } catch {}
+    this.sessions.set(key, sessionId)
+    return sessionId
+  }
+
+  private persistSession(key: string, sessionId: string | null): void {
+    this.sessions.set(key, sessionId)
+    writeFileSync(this.statePath(key), JSON.stringify({ session_id: sessionId, updated_at: new Date().toISOString() }, null, 2), { mode: 0o600 })
+  }
+
+  private statePath(key: string): string {
+    const safe = key.replace(/[^A-Za-z0-9_.-]/g, '_')
+    return path.join(this.config.stateDir, `${safe}.json`)
   }
 
   private runTurn(provider: CodexProvider, prompt: string): Promise<{ content: string; usage: any }> {

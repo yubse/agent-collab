@@ -151,6 +151,14 @@ const MIGRATIONS: Migration[] = [
       db.run(`CREATE INDEX IF NOT EXISTS idx_uploaded_assets_owner ON uploaded_assets(user_id, created_at)`)
     },
   },
+  {
+    version: 5,
+    name: 'connector_device_identity',
+    up(db) {
+      addColumn(db, 'connector_devices', 'platform TEXT')
+      addColumn(db, 'connector_devices', 'connector_version TEXT')
+    },
+  },
 ]
 
 export function runMigrations(db: Database): void {

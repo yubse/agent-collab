@@ -4,7 +4,13 @@ import { runMigrations } from '../db/migrations.ts'
 import { createUser } from '../auth/user-auth.ts'
 import { ConnectorRegistry, type ConnectorSocket } from './registry.ts'
 import { ConnectorDispatcher } from './dispatcher.ts'
-import { createPairingCode, redeemPairingCode } from './pairing.ts'
+import {
+  authenticateDevice,
+  completePairingRequest,
+  createClaimRequest,
+  createPairingRequest,
+  listDevices,
+} from './pairing.ts'
 import { RemoteCodexProvider } from '../providers/remote-codex.ts'
 
 class FakeSocket implements ConnectorSocket {
@@ -25,32 +31,84 @@ function createLegacyTables(db: Database) {
 describe('connector pairing', () => {
   let db: Database
   let userId: string
+  let otherUserId: string
   beforeEach(async () => {
     db = new Database(':memory:')
     db.run('PRAGMA foreign_keys=ON')
     createLegacyTables(db)
     runMigrations(db)
     userId = (await createUser(db, { username: 'pair_user', displayName: 'Pair User', password: 'pair-password-123' })).id
+    otherUserId = (await createUser(db, { username: 'other_user', displayName: 'Other User', password: 'other-password-123' })).id
   })
 
-  test('test_connector_belongs_to_user', () => {
-    const pair = createPairingCode(db, userId)
-    const result = redeemPairingCode(db, pair.code, 'Tina MacBook')
+  test('test_pairing_token_single_use', () => {
+    const pair = createPairingRequest(db, userId)
+    completePairingRequest(db, pairingInput(pair.pairingToken, 'dev_first-device', 'First Device'))
+    expect(() => completePairingRequest(db, pairingInput(pair.pairingToken, 'dev_second-device', 'Second Device'))).toThrow('invalid or expired')
+  })
+
+  test('test_pairing_token_expiration', () => {
+    const pair = createPairingRequest(db, userId, 1_000)
+    const later = new Date(Date.now() + 2_000)
+    expect(() => completePairingRequest(db, pairingInput(pair.pairingToken, 'dev_late-device', 'Late Device'), later)).toThrow('invalid or expired')
+  })
+
+  test('test_claim_single_use', () => {
+    const claim = createClaimRequest(db, userId)
+    completePairingRequest(db, pairingInput(claim.pairingToken, 'dev_claim-once', 'Claim Once'))
+    expect(() => completePairingRequest(db, pairingInput(claim.pairingToken, 'dev_claim-twice', 'Claim Twice')))
+      .toThrow('invalid or expired')
+  })
+
+  test('test_claim_expiration', () => {
+    const claim = createClaimRequest(db, userId, 1_000)
+    const later = new Date(Date.now() + 2_000)
+    expect(() => completePairingRequest(db, pairingInput(claim.pairingToken, 'dev_expired-claim', 'Expired Claim'), later))
+      .toThrow('invalid or expired')
+    expect(Date.parse(claim.expiresAt) - Date.now()).toBeLessThanOrEqual(1_000)
+  })
+
+  test('test_device_auto_bound_to_current_user', () => {
+    const pair = createPairingRequest(db, userId)
+    const result = completePairingRequest(db, pairingInput(pair.pairingToken, 'dev_tina-macbook', 'Tina MacBook'))
     expect(result.device.user_id).toBe(userId)
-    expect(result.deviceToken.length).toBeGreaterThan(30)
+    expect(result.device.platform).toBe('darwin')
+    expect(result.device.connector_version).toBe('0.1.0')
+    expect(listDevices(db, otherUserId)).toHaveLength(0)
+    expect(pair.pairingToken).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(result.deviceCredential.length).toBeGreaterThan(30)
+    expect(authenticateDevice(db, result.deviceCredential)?.id).toBe(result.device.id)
   })
 
-  test('test_pairing_code_single_use', () => {
-    const pair = createPairingCode(db, userId)
-    redeemPairingCode(db, pair.code, 'First Device')
-    expect(() => redeemPairingCode(db, pair.code, 'Second Device')).toThrow('invalid or expired')
+  test('test_existing_device_not_duplicated', () => {
+    const first = createPairingRequest(db, userId)
+    completePairingRequest(db, pairingInput(first.pairingToken, 'dev_same-installation', 'MacBook Pro'))
+    const second = createPairingRequest(db, userId)
+    const result = completePairingRequest(db, pairingInput(second.pairingToken, 'dev_same-installation', 'MacBook Pro'))
+    expect(result.alreadyBound).toBe(true)
+    expect(listDevices(db, userId)).toHaveLength(1)
   })
 
-  test('test_pairing_code_expiration', () => {
-    const pair = createPairingCode(db, userId, 1_000)
-    expect(() => redeemPairingCode(db, pair.code, 'Late Device', new Date(Date.now() + 2_000))).toThrow('invalid or expired')
+  test('test_device_bound_to_other_user_rejected', () => {
+    const first = createPairingRequest(db, userId)
+    completePairingRequest(db, pairingInput(first.pairingToken, 'dev_shared-installation', 'Shared Mac'))
+    const otherPair = createPairingRequest(db, otherUserId)
+    expect(() => completePairingRequest(db, pairingInput(otherPair.pairingToken, 'dev_shared-installation', 'Shared Mac')))
+      .toThrow('DEVICE_ALREADY_BOUND_TO_ANOTHER_USER')
+    expect(listDevices(db, userId)).toHaveLength(1)
+    expect(listDevices(db, otherUserId)).toHaveLength(0)
   })
 })
+
+function pairingInput(pairingToken: string, deviceId: string, deviceName: string) {
+  return {
+    pairingToken,
+    deviceId,
+    deviceName,
+    platform: 'darwin',
+    connectorVersion: '0.1.0',
+  }
+}
 
 describe('connector dispatch isolation', () => {
   const timeouts = { requestAckTimeoutMs: 1_000, serverPendingTimeoutMs: 2_000 }

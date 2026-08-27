@@ -42,9 +42,10 @@ import { ConnectorDispatcher } from './src/connector/dispatcher.ts'
 import { parseConnectorMessage } from './src/connector/protocol.ts'
 import {
   authenticateDevice,
-  createPairingCode,
+  completePairingRequest,
+  createClaimRequest,
+  createPairingRequest,
   listDevices,
-  redeemPairingCode,
   setDeviceStatus,
 } from './src/connector/pairing.ts'
 import { hasRequestAuth, isLocalRequestHost, requestAuthMode } from './src/auth.ts'
@@ -2619,7 +2620,7 @@ Bun.serve<ConnectorSocketData>({
     const publicPath = url.pathname === '/web/login.html'
       || (req.method === 'GET' && url.pathname === '/api/auth/profiles')
       || (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login' || url.pathname === '/api/auth/bootstrap' || url.pathname === '/api/auth/select-profile' || url.pathname === '/api/auth/logout'))
-      || (req.method === 'POST' && url.pathname === '/api/connectors/pair')
+      || (req.method === 'POST' && (url.pathname === '/api/connectors/pairing/complete' || url.pathname === '/api/connectors/claim/complete'))
       || (req.method === 'POST' && url.pathname === '/api/agent-statusline' && isLocalRequestHost(url.hostname))
 
     // One-time bootstrap. The existing operator token authorizes setting the
@@ -2677,19 +2678,41 @@ Bun.serve<ConnectorSocketData>({
       return Response.json({ ok: true }, { headers: { 'Set-Cookie': clearSessionCookie(isSecureRequest) } })
     }
 
-    if (req.method === 'POST' && url.pathname === '/api/connectors/pair') {
+    if (req.method === 'POST' && (url.pathname === '/api/connectors/pairing/complete' || url.pathname === '/api/connectors/claim/complete')) {
       try {
+        // This endpoint returns the raw device credential once. Refuse browser
+        // fetches so Web UI code can never receive or persist that credential.
+        if (req.headers.has('origin') || req.headers.has('sec-fetch-site')) {
+          return Response.json({
+            ok: false,
+            code: 'DEVICE_CREDENTIAL_NOT_AVAILABLE_TO_BROWSER',
+            error: 'pairing must be completed by AI Studio Connector',
+          }, { status: 403 })
+        }
         const body = await req.json() as any
-        const paired = redeemPairingCode(db, String(body.pairing_code || ''), String(body.device_name || ''))
+        if ('user_id' in body || 'username' in body) {
+          return Response.json({ ok: false, error: 'connector user identity is not accepted' }, { status: 400 })
+        }
+        const paired = completePairingRequest(db, {
+          pairingToken: String(url.pathname.endsWith('/claim/complete') ? body.claim_token || '' : body.pairing_token || ''),
+          deviceId: String(body.device_id || ''),
+          deviceName: String(body.device_name || ''),
+          platform: String(body.platform || ''),
+          connectorVersion: String(body.connector_version || ''),
+        })
         return Response.json({
           ok: true,
           device: paired.device,
-          device_token: paired.deviceToken,
+          already_bound: paired.alreadyBound,
+          device_credential: paired.deviceCredential,
           websocket_url: connectorWebsocketUrl(req),
           protocol_version: 1,
         }, { status: 201 })
       } catch (error: any) {
-        return Response.json({ ok: false, error: error?.message || 'pairing failed' }, { status: 400 })
+        const code = error?.message === 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER'
+          ? 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER'
+          : 'PAIRING_FAILED'
+        return Response.json({ ok: false, code, error: error?.message || 'pairing failed' }, { status: code === 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER' ? 409 : 400 })
       }
     }
 
@@ -2808,9 +2831,22 @@ Bun.serve<ConnectorSocketData>({
       return Response.json({ ok: true, devices: listDevices(db, currentUser!.id) })
     }
 
-    if (req.method === 'POST' && url.pathname === '/api/connectors/pairing-code' && isAuthed) {
-      const pairing = createPairingCode(db, currentUser!.id)
-      return Response.json({ ok: true, pairing_code: pairing.code, expires_at: pairing.expiresAt }, { status: 201 })
+    if (req.method === 'POST' && url.pathname === '/api/connectors/pairing/start' && isAuthed) {
+      const pairing = createPairingRequest(db, currentUser!.id)
+      return Response.json({
+        ok: true,
+        deep_link: `aistudio://pair?token=${encodeURIComponent(pairing.pairingToken)}`,
+        expires_at: pairing.expiresAt,
+      }, { status: 201 })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/connectors/claim/start' && isAuthed) {
+      const claim = createClaimRequest(db, currentUser!.id)
+      return Response.json({
+        ok: true,
+        claim_token: claim.pairingToken,
+        expires_at: claim.expiresAt,
+      }, { status: 201 })
     }
 
     if (req.method === 'GET' && url.pathname === '/api/conversations' && isAuthed) {

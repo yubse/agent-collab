@@ -9,7 +9,7 @@
 - Server 从 Session 解析当前用户，忽略客户端提交的 `user_id`；所有私人查询在 SQL 中带 owner 条件。
 - Shared Agent 定义仍由 Server 管理；执行时由 Server 注入 Agent Definition 和 `(user_id, agent_id)` Memory。
 - `RemoteCodexProvider` 通过 `ConnectorDispatcher` 只选择当前用户的在线 Connector。
-- `/connector` 使用 protocol v1 WebSocket。首帧必须携带配对得到的 device token；Server 仅保存 hash。
+- `/connector` 使用 protocol v1 WebSocket。首帧必须携带配对得到的 device credential；Server 仅保存 hash。
 - Connector 在用户电脑复用本机 `codex app-server`。Codex credentials 不离开用户电脑。
 
 数据库迁移由 `schema_migrations` 记录，可重复启动。旧数据归属 `usr_legacy_admin`；不会删除旧数据库。第一位 admin 可通过 `AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD` 初始化，或使用旧 operator token 调用一次性 `/api/auth/bootstrap`。
@@ -38,11 +38,16 @@ connector/src/
 ├── main.ts
 ├── codex/         # preflight + app-server executor
 ├── connection/    # authenticated WebSocket + reconnect/heartbeat
-├── pairing/       # one-time pairing client
+├── pairing/       # one-time claim client
+├── helper/        # loopback-only status + claim HTTP API
 ├── execution/     # request lifecycle + safe logging
 ├── state/         # UI-independent state store
 └── config/        # persisted/env configuration
 ```
+
+Authenticated Web calls `POST /api/connectors/claim/start`; Server binds a 256-bit, 60-second, single-use claim to the Session user. Web sends only that claim to the Helper's `POST http://127.0.0.1:39481/claim`. Helper calls `POST /api/connectors/claim/complete` with stable device metadata and no user identity. Server consumes the claim atomically, binds its stored user, keeps only the device credential hash, and returns the original credential only to the non-browser Helper request. Same-user device claims do not add rows; cross-user claims return `DEVICE_ALREADY_BOUND_TO_ANOTHER_USER`.
+
+Helper shares one warmed-up `codex app-server --listen stdio://` process. `LocalCodexExecutor` serializes turns before selecting their persisted Codex thread, preserving conversation context isolation without spawning a process per conversation. Codex process failure is recovered by warmup or the next request.
 
 `RemoteCodexProvider` is registered with the same Server event callbacks as local providers. A successful `execution_result` therefore emits `assistant`, writes the Agent reply into the user-owned `group_messages` row, and only then completes the queued route. When no authenticated device belongs to the current user, dispatch returns `CODEX_CONNECTOR_OFFLINE` without spawning a Server-side Codex process.
 

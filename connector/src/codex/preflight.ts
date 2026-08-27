@@ -16,41 +16,48 @@ const defaultSpawn: SpawnSyncLike = (command) => Bun.spawnSync(command, {
 }) as any
 
 export type CodexPreflightResult = { version: string; login: 'ready' }
+export type CodexDetectionResult = {
+  installed: boolean
+  loggedIn: boolean
+  status: 'CODEX_NOT_INSTALLED' | 'CODEX_NOT_LOGGED_IN' | 'CODEX_READY'
+  version: string | null
+}
+
+export function detectCodexStatus(
+  binary: string,
+  state: ConnectorStateStore,
+  spawnSync: SpawnSyncLike = defaultSpawn,
+): CodexDetectionResult {
+  let versionResult
+  try { versionResult = spawnSync([binary, '--version']) } catch { versionResult = null }
+  if (!versionResult || versionResult.exitCode !== 0) {
+    state.setCodex('CODEX_NOT_FOUND', '未找到 Codex CLI，请先在本机安装 Codex。')
+    return { installed: false, loggedIn: false, status: 'CODEX_NOT_INSTALLED', version: null }
+  }
+  const version = new TextDecoder().decode(versionResult.stdout).trim().split(/\r?\n/, 1)[0] || 'unknown'
+  let loginResult
+  try { loginResult = spawnSync([binary, 'login', 'status']) } catch { loginResult = null }
+  if (!loginResult || loginResult.exitCode !== 0) {
+    state.setCodex('CODEX_NOT_LOGGED_IN', 'Codex 尚未登录，请先完成本机 Codex 登录。')
+    return { installed: true, loggedIn: false, status: 'CODEX_NOT_LOGGED_IN', version }
+  }
+  state.setCodex('CODEX_READY')
+  return { installed: true, loggedIn: true, status: 'CODEX_READY', version }
+}
 
 export function checkCodex(
   binary: string,
   state: ConnectorStateStore,
   spawnSync: SpawnSyncLike = defaultSpawn,
 ): CodexPreflightResult {
-  let versionResult
-  try {
-    versionResult = spawnSync([binary, '--version'])
-  } catch {
-    const message = '未找到 Codex CLI，请先在本机安装 Codex。'
-    state.setCodex('CODEX_NOT_FOUND', message)
-    throw new CodexPreflightError('CODEX_NOT_FOUND', message)
-  }
-  if (versionResult.exitCode !== 0) {
+  const result = detectCodexStatus(binary, state, spawnSync)
+  if (!result.installed) {
     const message = '未找到 Codex CLI，请检查 CODEX_BINARY_PATH。'
-    state.setCodex('CODEX_NOT_FOUND', message)
     throw new CodexPreflightError('CODEX_NOT_FOUND', message)
   }
-  const version = new TextDecoder().decode(versionResult.stdout).trim().split(/\r?\n/, 1)[0] || 'unknown'
-
-  let loginResult
-  try {
-    loginResult = spawnSync([binary, 'login', 'status'])
-  } catch {
+  if (!result.loggedIn) {
     const message = 'Codex 尚未登录，请先完成本机 Codex 登录。'
-    state.setCodex('CODEX_NOT_LOGGED_IN', message)
     throw new CodexPreflightError('CODEX_NOT_LOGGED_IN', message)
   }
-  if (loginResult.exitCode !== 0) {
-    const message = 'Codex 尚未登录，请先完成本机 Codex 登录。'
-    state.setCodex('CODEX_NOT_LOGGED_IN', message)
-    throw new CodexPreflightError('CODEX_NOT_LOGGED_IN', message)
-  }
-
-  state.setCodex('CODEX_READY')
-  return { version, login: 'ready' }
+  return { version: result.version || 'unknown', login: 'ready' }
 }

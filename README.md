@@ -99,7 +99,7 @@ bun run dev
 
 默认四个 Agent 使用 `remote-codex`。共享人设保存在 Server，可用 `PRODUCT_PROMPT_PATH`、`CREATIVE_PROMPT_PATH`、`SOCIAL_PROMPT_PATH`、`GROWTH_PROMPT_PATH` 指向对应 `AGENTS.md`。开发时仍可显式使用 `PRODUCT_PROVIDER=codex` 或 `claude`。
 
-用户电脑安装 Bun 和 Codex CLI、完成 `codex login` 后：
+开发模式可以直接运行 Helper：
 
 ```bash
 cd connector
@@ -107,7 +107,7 @@ export AI_STUDIO_SERVER_URL="https://studio.example.com"
 bun run start
 ```
 
-在 Web 的“设置 → Codex Connector → 添加设备”生成一次性配对码。Connector 只把完整执行结果返回 Server，不上传 Codex `auth.json`、access token 或 refresh token。
+正式使用时通过 `connector/scripts/install-helper.sh` 安装 standalone Helper 和 macOS LaunchAgent；之后不需要打开 Terminal。Web 先检测 `127.0.0.1:39481`，再通过 60 秒 Session-bound claim 一键绑定。绑定身份只来自 Server Session；Web 和 Helper 都不能提交用户身份，Web 也不会取得 device credential。Helper 不上传 Codex `auth.json`、access token 或 refresh token。
 
 群晖 NAS 的 GHCR 拉取部署见 [docs/NAS_DEPLOYMENT.md](docs/NAS_DEPLOYMENT.md)。正式镜像由 GitHub Actions 在 tests、typecheck、Server build 全部通过后构建并推送；NAS 的 Compose 没有 `build:`，只拉取固定版本镜像并运行。
 

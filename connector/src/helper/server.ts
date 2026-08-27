@@ -1,0 +1,113 @@
+export type HelperCodexStatus = {
+  installed: boolean
+  logged_in: boolean
+  status: 'CODEX_NOT_INSTALLED' | 'CODEX_NOT_LOGGED_IN' | 'CODEX_READY'
+}
+
+export type LocalHelperStatus = {
+  helper: 'online'
+  bound: boolean
+  server: 'connected' | 'disconnected'
+  device_id: string
+  device_name: string
+  platform: string
+  connector_version: string
+  codex: HelperCodexStatus
+}
+
+export type LocalHelperServerOptions = {
+  hostname?: '127.0.0.1'
+  port?: number
+  allowedOrigin: string
+  status: () => LocalHelperStatus
+  claim: (claimToken: string) => Promise<{ bound: boolean; already_bound: boolean }>
+}
+
+export class LocalHelperServer {
+  private server: ReturnType<typeof Bun.serve> | null = null
+
+  constructor(private readonly options: LocalHelperServerOptions) {}
+
+  start(): void {
+    if (this.server) return
+    const hostname = this.options.hostname || '127.0.0.1'
+    if (hostname !== '127.0.0.1') throw new Error('LOCAL_HELPER_MUST_BIND_LOOPBACK')
+    this.server = Bun.serve({
+      hostname,
+      port: this.options.port ?? 39481,
+      fetch: (request) => this.handle(request),
+    })
+  }
+
+  get hostname(): string { return this.server?.hostname || this.options.hostname || '127.0.0.1' }
+  get port(): number { return this.server?.port || this.options.port || 39481 }
+
+  stop(): void {
+    this.server?.stop(true)
+    this.server = null
+  }
+
+  private async handle(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+    const origin = request.headers.get('origin')
+    if (origin && origin !== this.options.allowedOrigin) {
+      return Response.json({ ok: false, error: 'ORIGIN_NOT_ALLOWED' }, { status: 403 })
+    }
+
+    if (request.method === 'OPTIONS') {
+      if (origin !== this.options.allowedOrigin) {
+        return Response.json({ ok: false, error: 'ORIGIN_NOT_ALLOWED' }, { status: 403 })
+      }
+      return new Response(null, { status: 204, headers: this.corsHeaders(true) })
+    }
+
+    if (request.method === 'GET' && url.pathname === '/status') {
+      return Response.json(this.options.status(), { headers: origin ? this.corsHeaders(false) : undefined })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/claim') {
+      if (origin !== this.options.allowedOrigin) {
+        return Response.json({ ok: false, error: 'ORIGIN_REQUIRED' }, { status: 403 })
+      }
+      try {
+        const body = await request.json() as Record<string, unknown>
+        if ('user_id' in body || 'username' in body || 'password' in body) {
+          return Response.json({ ok: false, error: 'USER_IDENTITY_NOT_ACCEPTED' }, {
+            status: 400,
+            headers: this.corsHeaders(false),
+          })
+        }
+        const claimToken = typeof body.claim_token === 'string' ? body.claim_token.trim() : ''
+        if (!claimToken) throw new Error('claim_token required')
+        const result = await this.options.claim(claimToken)
+        return Response.json({ ok: true, ...result }, { headers: this.corsHeaders(false) })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: safeClaimError(error?.message) }, {
+          status: 400,
+          headers: this.corsHeaders(false),
+        })
+      }
+    }
+
+    return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+  }
+
+  private corsHeaders(preflight: boolean): Headers {
+    const headers = new Headers({
+      'Access-Control-Allow-Origin': this.options.allowedOrigin,
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Private-Network': 'true',
+      'Access-Control-Max-Age': '600',
+      'Vary': 'Origin',
+    })
+    if (!preflight) headers.set('Cache-Control', 'no-store')
+    return headers
+  }
+}
+
+function safeClaimError(message: string): string {
+  if (message === 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER') return message
+  if (/invalid|expired/i.test(message)) return 'CLAIM_TOKEN_INVALID_OR_EXPIRED'
+  return 'CLAIM_FAILED'
+}
