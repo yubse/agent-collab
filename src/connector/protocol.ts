@@ -28,6 +28,22 @@ export type ExecutionRequest = {
   created_at: string
 }
 
+export type ExecutionAck = {
+  type: 'execution_ack'
+  request_id: string
+  status: 'running'
+  acknowledged_at: string
+}
+
+export type ExecutionTimings = {
+  execution_request_at: string
+  execution_received_at: string
+  execution_ack_at: string
+  codex_started_at: string
+  codex_finished_at: string
+  execution_result_at: string
+}
+
 export type ExecutionResult = {
   type: 'execution_result'
   request_id: string
@@ -35,9 +51,10 @@ export type ExecutionResult = {
   content?: string
   usage?: Record<string, number> | null
   error?: string
+  timings?: ExecutionTimings
 }
 
-export type ConnectorToServer = ConnectorHello | ConnectorHeartbeat | ExecutionResult
+export type ConnectorToServer = ConnectorHello | ConnectorHeartbeat | ExecutionAck | ExecutionResult
 export type ServerToConnector = ConnectorHelloAck | ConnectorHeartbeatAck | ExecutionRequest
 
 export function parseConnectorMessage(raw: string): ConnectorToServer {
@@ -51,6 +68,12 @@ export function parseConnectorMessage(raw: string): ConnectorToServer {
     return value as ConnectorHello
   }
   if (value.type === 'heartbeat') return { type: 'heartbeat', sent_at: String(value.sent_at || '') }
+  if (value.type === 'execution_ack') {
+    if (typeof value.request_id !== 'string' || !value.request_id) throw new Error('request_id required')
+    if (value.status !== 'running') throw new Error('invalid execution ack status')
+    if (typeof value.acknowledged_at !== 'string' || !value.acknowledged_at) throw new Error('acknowledged_at required')
+    return value as ExecutionAck
+  }
   if (value.type === 'execution_result') {
     if (typeof value.request_id !== 'string' || !value.request_id) throw new Error('request_id required')
     if (value.status !== 'success' && value.status !== 'error') throw new Error('invalid execution status')
@@ -58,4 +81,3 @@ export function parseConnectorMessage(raw: string): ConnectorToServer {
   }
   throw new Error(`unsupported connector message: ${value.type}`)
 }
-

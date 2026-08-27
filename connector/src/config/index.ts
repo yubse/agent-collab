@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import path from 'path'
 import { homedir, hostname } from 'os'
+import { loadConnectorTimeouts } from '../../../src/connector/timeouts.ts'
 
 const configDir = process.env.AI_STUDIO_CONNECTOR_HOME || path.join(homedir(), '.ai-studio-connector')
 const configFile = path.join(configDir, 'device.json')
@@ -25,10 +26,13 @@ export type ConnectorConfig = {
   codexBinary: string
   codexCwd: string
   stateDir: string
+  connectTimeoutMs: number
+  executionTimeoutMs: number
 }
 
 export function loadConfig(): ConnectorConfig {
   const saved = readSaved()
+  const timeouts = loadConnectorTimeouts()
   const serverUrl = (process.env.AI_STUDIO_SERVER_URL || saved.server_url || '').replace(/\/$/, '')
   if (!serverUrl) throw new Error('AI_STUDIO_SERVER_URL is required, for example http://nas.local:3998')
   return {
@@ -40,6 +44,8 @@ export function loadConfig(): ConnectorConfig {
     codexBinary: process.env.CODEX_BINARY_PATH || 'codex',
     codexCwd: process.env.AI_STUDIO_CODEX_CWD || process.cwd(),
     stateDir: path.join(configDir, 'state'),
+    connectTimeoutMs: timeouts.connectTimeoutMs,
+    executionTimeoutMs: timeouts.executionTimeoutMs,
   }
 }
 

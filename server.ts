@@ -701,6 +701,15 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
         delivery,
         activeRoute.userId,
       )
+      const executionRequestId = typeof ev.raw?.request_id === 'string'
+        ? ev.raw.request_id.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
+        : ''
+      if (executionRequestId) {
+        const savedAt = new Date().toISOString()
+        const requestAt = Date.parse(String(ev.raw?.timings?.execution_request_at || ''))
+        const total = Number.isFinite(requestAt) ? Date.now() - requestAt : null
+        console.log(`[execution] request=${executionRequestId} state=message_saved at=${savedAt}${total === null ? '' : ` total_duration_ms=${total}`}`)
+      }
       if (responseTargets.length) {
         dispatchGroupRecord(record, responseTargets, activeRoute.hopCount)
       }
@@ -4619,6 +4628,10 @@ Bun.serve<ConnectorSocketData>({
         if (parsed.type === 'heartbeat') {
           setDeviceStatus(db, ws.data.deviceId, 'online')
           ws.send(JSON.stringify({ type: 'heartbeat_ack', received_at: new Date().toISOString() }))
+          return
+        }
+        if (parsed.type === 'execution_ack') {
+          connectorDispatcher.handleAck(ws.data.deviceId, ws.data.userId, parsed)
           return
         }
         if (parsed.type === 'execution_result') {

@@ -21,6 +21,7 @@
 import { spawn, type Subprocess } from 'bun'
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { dirname } from 'path'
+import { loadConnectorTimeouts } from '../connector/timeouts.ts'
 import type {
   AgentProvider, AgentEvent, AgentSendOpts, AgentCapabilities,
   AgentError, AgentProviderConfig, AgentUsage,
@@ -42,7 +43,7 @@ type PendingRequest = {
   timeoutHandle: ReturnType<typeof setTimeout>
 }
 
-const REQUEST_TIMEOUT_MS = 60_000
+const REQUEST_ACK_TIMEOUT_MS = loadConnectorTimeouts().requestAckTimeoutMs
 const APPROVAL_ACCEPTING_METHODS = new Set([
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
@@ -133,13 +134,12 @@ export class CodexProvider implements AgentProvider {
     }
 
     // AIC-116 cycle 3: await turn/start request — codex must ack the new
-    // turn before we consider this dispatch delivered. JSON-RPC ack is sub-second for a
-    // healthy app-server; cap timeout at 10s so a hung process surfaces fast (dispatch
-    // demote → failed) instead of stalling the optimistic-delivered UI for 60s.
+    // turn before we consider this dispatch delivered. This ACK timeout is deliberately
+    // independent from the much longer model execution timeout owned by Connector.
     await this._request('turn/start', {
       threadId: this._threadId,
       input: [{ type: 'text', text, text_elements: [] }],
-    }, 10_000)
+    })
   }
 
   async interrupt(): Promise<boolean> {
@@ -147,7 +147,7 @@ export class CodexProvider implements AgentProvider {
     // Best-effort turn cancellation before SIGKILL — codex supports turn/interrupt.
     if (this._threadId) {
       try {
-        await this._request('turn/interrupt', { threadId: this._threadId }, 5_000)
+        await this._request('turn/interrupt', { threadId: this._threadId })
       } catch { /* fall through to SIGKILL */ }
     }
     try { this.proc!.kill('SIGKILL') } catch {}
@@ -255,7 +255,7 @@ export class CodexProvider implements AgentProvider {
 
   // ───────────── private: JSON-RPC plumbing ─────────────
 
-  private _request(method: string, params: any, timeoutMs = REQUEST_TIMEOUT_MS): Promise<any> {
+  private _request(method: string, params: any, timeoutMs = REQUEST_ACK_TIMEOUT_MS): Promise<any> {
     return new Promise((resolve, reject) => {
       const id = this._nextId++
       const timeoutHandle = setTimeout(() => {
@@ -294,7 +294,7 @@ export class CodexProvider implements AgentProvider {
 
   // Throws on dead subprocess / stdin write failure so callers (especially `_request`)
   // can synchronously reject the matching pending request instead of waiting out the
-  // 60s timeout. AIC-116 cycle 3: silent stdin write swallow let send() return
+  // request-ACK timeout. AIC-116 cycle 3: silent stdin write swallow let send() return
   // resolve "success" while the actual user input never reached the agent.
   private _writeLine(obj: any): void {
     if (!this.isAlive) {

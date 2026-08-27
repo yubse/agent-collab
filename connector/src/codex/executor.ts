@@ -11,7 +11,7 @@ export class LocalCodexExecutor {
   private runtimes = new Map<string, Runtime>()
 
   constructor(
-    private config: { binary: string; cwd: string; stateDir: string },
+    private config: { binary: string; cwd: string; stateDir: string; executionTimeoutMs: number },
     private log: DiagnosticLogger = (line) => console.error(line),
   ) {
     mkdirSync(config.stateDir, { recursive: true, mode: 0o700 })
@@ -62,8 +62,8 @@ export class LocalCodexExecutor {
         // A timed-out app-server turn may still be retrying in the background. Kill it
         // before this conversation accepts another request, otherwise replies can cross turns.
         provider.interrupt().catch(() => {})
-        reject(new Error('local Codex execution timed out'))
-      }), 115_000)
+        reject(new Error('CODEX_EXECUTION_TIMEOUT'))
+      }), this.config.executionTimeoutMs)
       provider.onEvent((event: AgentEvent) => {
         if (event.type === 'assistant' && event.text?.trim()) assistant.push(event.text.trim())
         if (event.type === 'result') {

@@ -45,7 +45,7 @@ export class RemoteCodexProvider implements AgentProvider {
       await this.eventCb?.({ type: 'result', usage: result.usage || undefined, raw: result })
     } catch (error: any) {
       const message = error?.message || 'remote connector error'
-      this.errorCb?.({ kind: message.includes('timed out') ? 'timeout' : 'protocol_error', message })
+      this.errorCb?.({ kind: /timeout/i.test(message) ? 'timeout' : 'protocol_error', message })
       throw error
     } finally {
       this.active = false

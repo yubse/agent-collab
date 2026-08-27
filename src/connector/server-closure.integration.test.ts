@@ -97,6 +97,10 @@ function openConnector(token: string, name: string, answer: string): Promise<Tes
       if (message.type === 'execution_request') {
         requests.push(message)
         ws.send(JSON.stringify({
+          type: 'execution_ack', request_id: message.request_id,
+          status: 'running', acknowledged_at: new Date().toISOString(),
+        }))
+        ws.send(JSON.stringify({
           type: 'execution_result', request_id: message.request_id,
           status: 'success', content: answer, usage: null,
         }))

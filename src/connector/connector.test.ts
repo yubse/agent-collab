@@ -53,13 +53,15 @@ describe('connector pairing', () => {
 })
 
 describe('connector dispatch isolation', () => {
+  const timeouts = { requestAckTimeoutMs: 1_000, serverPendingTimeoutMs: 2_000 }
+
   test('test_remote_provider_dispatches_correct_user', async () => {
     const registry = new ConnectorRegistry()
     const socketA = new FakeSocket()
     const socketB = new FakeSocket()
     registry.register({ deviceId: 'dev-a', userId: 'user-a', deviceName: 'A', socket: socketA })
     registry.register({ deviceId: 'dev-b', userId: 'user-b', deviceName: 'B', socket: socketB })
-    const dispatcher = new ConnectorDispatcher(registry, 1_000)
+    const dispatcher = new ConnectorDispatcher(registry, timeouts)
     const provider = new RemoteCodexProvider(dispatcher, registry, { userId: 'user-b', conversationId: 'conv-b', agentId: 'social' })
     const events: any[] = []
     provider.onEvent((event) => { events.push(event) })
@@ -69,6 +71,10 @@ describe('connector dispatch isolation', () => {
     const request = JSON.parse(socketB.sent[0])
     expect(request.user_id).toBe('user-b')
     expect(request.conversation_id).toBe('conv-b')
+    expect(dispatcher.handleAck('dev-b', 'user-b', {
+      type: 'execution_ack', request_id: request.request_id, status: 'running', acknowledged_at: new Date().toISOString(),
+    })).toBe(true)
+    expect(dispatcher.pendingState(request.request_id)).toBe('running')
     dispatcher.handleResult('dev-b', 'user-b', { type: 'execution_result', request_id: request.request_id, status: 'success', content: 'answer B' })
     await sendPromise
     expect(events.find((event) => event.type === 'assistant')?.text).toBe('answer B')
@@ -80,7 +86,7 @@ describe('connector dispatch isolation', () => {
     const socketB = new FakeSocket()
     registry.register({ deviceId: 'dev-a', userId: 'user-a', deviceName: 'A', socket: socketA })
     registry.register({ deviceId: 'dev-b', userId: 'user-b', deviceName: 'B', socket: socketB })
-    const dispatcher = new ConnectorDispatcher(registry, 1_000)
+    const dispatcher = new ConnectorDispatcher(registry, timeouts)
     const resultPromise = dispatcher.dispatch({ user_id: 'user-a', conversation_id: 'conv-a', agent_id: 'social', prompt: 'secret' })
     const request = JSON.parse(socketA.sent[0])
     expect(dispatcher.handleResult('dev-b', 'user-b', { type: 'execution_result', request_id: request.request_id, status: 'success', content: 'forged' })).toBe(false)
@@ -93,7 +99,7 @@ describe('connector dispatch isolation', () => {
     const registry = new ConnectorRegistry()
     const socket = new FakeSocket()
     registry.register({ deviceId: 'dev-a', userId: 'user-a', deviceName: 'A', socket })
-    const dispatcher = new ConnectorDispatcher(registry, 1_000)
+    const dispatcher = new ConnectorDispatcher(registry, timeouts)
     const result = dispatcher.dispatch({ user_id: 'user-a', conversation_id: 'conv-a', agent_id: 'social', prompt: 'hello' })
     registry.unregister('dev-a', socket)
     await expect(result).rejects.toThrow('connector disconnected')
@@ -104,12 +110,22 @@ describe('connector dispatch isolation', () => {
     const registry = new ConnectorRegistry()
     const socket = new FakeSocket()
     registry.register({ deviceId: 'dev-a', userId: 'user-a', deviceName: 'A', socket })
-    const dispatcher = new ConnectorDispatcher(registry, 1_000)
+    const dispatcher = new ConnectorDispatcher(registry, timeouts)
     const resultPromise = dispatcher.dispatch({ user_id: 'user-a', conversation_id: 'conv-a', agent_id: 'social', prompt: 'hello' })
     const request = JSON.parse(socket.sent[0])
     const result = { type: 'execution_result', request_id: request.request_id, status: 'success', content: 'one' } as const
     expect(dispatcher.handleResult('dev-a', 'user-a', result)).toBe(true)
     expect(dispatcher.handleResult('dev-a', 'user-a', result)).toBe(false)
     expect((await resultPromise).content).toBe('one')
+  })
+
+  test('ACK timeout does not resend an execution request', async () => {
+    const registry = new ConnectorRegistry()
+    const socket = new FakeSocket()
+    registry.register({ deviceId: 'dev-a', userId: 'user-a', deviceName: 'A', socket })
+    const dispatcher = new ConnectorDispatcher(registry, { requestAckTimeoutMs: 20, serverPendingTimeoutMs: 100 })
+    const result = dispatcher.dispatch({ user_id: 'user-a', conversation_id: 'conv-a', agent_id: 'social', prompt: 'once' })
+    await expect(result).rejects.toThrow('CONNECTOR_REQUEST_ACK_TIMEOUT')
+    expect(socket.sent).toHaveLength(1)
   })
 })

@@ -23,7 +23,12 @@ export async function main(): Promise<never> {
     console.log('[connector] device paired; secret stored only on this computer')
   }
 
-  const executor = new LocalCodexExecutor({ binary: config.codexBinary, cwd: config.codexCwd, stateDir: config.stateDir })
+  const executor = new LocalCodexExecutor({
+    binary: config.codexBinary,
+    cwd: config.codexCwd,
+    stateDir: config.stateDir,
+    executionTimeoutMs: config.executionTimeoutMs,
+  })
   const runner = new ExecutionRunner(executor, state)
   const shutdown = async () => {
     console.log('[connector] status=SERVER_DISCONNECTED reason=shutdown')
