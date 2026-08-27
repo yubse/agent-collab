@@ -29,6 +29,29 @@ location / {
 
 测试与构建：`bun test`、`bun run check`。
 
+### Connector execution closure and NAS preparation
+
+Connector CLI is now a thin shell over reusable modules:
+
+```text
+connector/src/
+├── main.ts
+├── codex/         # preflight + app-server executor
+├── connection/    # authenticated WebSocket + reconnect/heartbeat
+├── pairing/       # one-time pairing client
+├── execution/     # request lifecycle + safe logging
+├── state/         # UI-independent state store
+└── config/        # persisted/env configuration
+```
+
+`RemoteCodexProvider` is registered with the same Server event callbacks as local providers. A successful `execution_result` therefore emits `assistant`, writes the Agent reply into the user-owned `group_messages` row, and only then completes the queued route. When no authenticated device belongs to the current user, dispatch returns `CODEX_CONNECTOR_OFFLINE` without spawning a Server-side Codex process.
+
+The NAS image uses `AICOLLAB_DATABASE_PATH=/data/chat.db` and `AICOLLAB_DATA_DIR=/runtime-data`. Docker bind mounts keep both paths outside the container; shared `agents` and reserved `knowledge` are mounted read-only. `AI_STUDIO_PUBLIC_URL` or `CONNECTOR_WS_URL` controls the future HTTP(S)/WS(S) public address without embedding a NAS IP in code.
+
+Automated closure coverage starts a real Server process and two authenticated protocol-v1 test Connectors. It verifies per-user dispatch, reply persistence, Connector reconnect, Server process recreation using the same database, cross-user API denial, Memory/device isolation, and the offline error. Run it with `bun run test:integration`.
+
+The local real-Codex probe on 2026-08-27 passed `codex --version`, `codex login status`, pairing, WebSocket authentication, `execution_request`, and `codex app-server` startup. The model network request retried five times and timed out, so a real `CONNECTOR_OK` response was **not** verified in this environment.
+
 > 在一台 Mac mini 上让多个 AI agent（Claude Code / Codex / 其他 CLI）一起干活的"工作群"系统。Web UI 看消息流 + 派任务 + 控制 agent 上下班；agent 是 server.ts 直接管理的长寿命 stream 子进程，跨多次对话维持上下文。
 
 ## 这是什么

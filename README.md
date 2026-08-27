@@ -100,6 +100,16 @@ bun run start
 
 在 Web 的“设置 → Codex Connector → 添加设备”生成一次性配对码。Connector 只把完整执行结果返回 Server，不上传 Codex `auth.json`、access token 或 refresh token。
 
+群晖 NAS 的 Docker 配置见 [deploy/nas/README.md](deploy/nas/README.md)。NAS 只运行 Server，默认只把容器端口绑定到宿主机 `127.0.0.1:3998`，由群晖反向代理提供局域网 HTTP/HTTPS 与 WebSocket 入口。
+
+验证：
+
+```bash
+bun run check
+bun test
+bun run test:integration
+```
+
 ## 架构
 
 ```

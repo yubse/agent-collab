@@ -1,0 +1,37 @@
+services:
+  ai-studio-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-studio-server:local
+    container_name: ai-studio-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AICOLLAB_HOST: 0.0.0.0
+      AICOLLAB_PORT: 3998
+      AICOLLAB_DATA_DIR: /runtime-data
+      AICOLLAB_DATABASE_PATH: /data/chat.db
+      PRODUCT_PROVIDER: remote-codex
+      CREATIVE_PROVIDER: remote-codex
+      SOCIAL_PROVIDER: remote-codex
+      GROWTH_PROVIDER: remote-codex
+    ports:
+      # Synology Reverse Proxy/Nginx connects to this loopback port. Do not expose it on WAN.
+      - "127.0.0.1:${AI_STUDIO_INTERNAL_PORT:-3998}:3998"
+    volumes:
+      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/data:/data"
+      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/runtime-data:/runtime-data"
+      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/agents:/app/agents:ro"
+      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/knowledge:/app/knowledge:ro"
+      - "${AI_STUDIO_ROOT:-/volume1/AIStudio}/backups:/backups"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r=await fetch('http://127.0.0.1:3998/healthz');if(!r.ok)process.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+
