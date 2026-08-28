@@ -54,17 +54,9 @@ sudo mkdir -p \
   /volume1/AIStudio/runtime-data \
   /volume1/AIStudio/logs \
   /volume1/AIStudio/backups
-
-sudo chown -R 1000:1000 \
-  /volume1/AIStudio/data \
-  /volume1/AIStudio/agents \
-  /volume1/AIStudio/knowledge \
-  /volume1/AIStudio/runtime-data \
-  /volume1/AIStudio/logs \
-  /volume1/AIStudio/backups
 ```
 
-容器以非 root UID/GID `1000:1000` 运行。不要把 `~/.codex`、`auth.json`、PEM 密钥或 GitHub token 放入这些目录。
+用 `id <DSM用户名>` 查询实际 UID/GID，并把结果写入 `.env` 的 `AI_STUDIO_UID`、`AI_STUDIO_GID`。容器以该非 root 身份运行。不要猜 UID/GID、不要把整个共享文件夹改成 `1000:1000`，也不要用 `chmod 777` 绕过 DSM ACL；目录权限应在 DSM 中授予该用户。不要把 `~/.codex`、`auth.json`、PEM 密钥或 GitHub token 放入这些目录。
 
 ## 3. 准备部署文件与外部 Agent
 

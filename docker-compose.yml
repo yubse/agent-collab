@@ -1,6 +1,7 @@
 services:
   ai-studio-server:
     image: "${AI_STUDIO_IMAGE:?Set AI_STUDIO_IMAGE in .env to an explicit GHCR version tag}"
+    user: "${AI_STUDIO_UID:-1000}:${AI_STUDIO_GID:-1000}"
     container_name: ai-studio-server
     restart: unless-stopped
     init: true
