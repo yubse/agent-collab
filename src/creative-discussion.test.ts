@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  CREATIVE_AGENT_BY_ID,
   CREATIVE_AGENT_IDS,
   CREATIVE_DISCUSSION_MAX_ROUNDS,
   CREATIVE_DISCUSSION_ROUNDS,
@@ -11,11 +12,15 @@ import {
 } from './creative-discussion.ts'
 
 describe('creative discussion plan', () => {
-  test('defines seven agents and exactly ten rounds', () => {
+  test('defines seven agents and exactly seven rounds', () => {
     expect(CREATIVE_AGENT_IDS).toHaveLength(7)
-    expect(CREATIVE_DISCUSSION_MAX_ROUNDS).toBe(10)
-    expect(CREATIVE_DISCUSSION_ROUNDS.map((round) => round.number)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-    expect(CREATIVE_DISCUSSION_ROUNDS[9]?.agents).toEqual(['director'])
+    expect(CREATIVE_DISCUSSION_MAX_ROUNDS).toBe(7)
+    expect(CREATIVE_DISCUSSION_ROUNDS.map((round) => round.number)).toEqual([1, 2, 3, 4, 5, 6, 7])
+    expect(CREATIVE_DISCUSSION_ROUNDS[0]?.agents).toEqual(['creative', 'brand', 'product', 'content'])
+    expect(CREATIVE_DISCUSSION_ROUNDS[6]?.agents).toEqual(['director'])
+    expect(CREATIVE_AGENT_IDS.slice(0, 4).every((id) => CREATIVE_AGENT_BY_ID.get(id)?.model === 'gpt-5.6-luna')).toBe(true)
+    expect(CREATIVE_AGENT_BY_ID.get('market')).toMatchObject({ model: 'gpt-5.6-terra', reasoningEffort: 'low' })
+    expect(CREATIVE_AGENT_BY_ID.get('director')).toMatchObject({ model: 'gpt-5.6-terra', reasoningEffort: 'medium' })
   })
 
   test('prompt contains the current round but not full history', () => {
@@ -25,21 +30,21 @@ describe('creative discussion plan', () => {
       text: `历史观点-${index}-${'内容'.repeat(80)}`,
     }))
     const prompt = buildCreativeDiscussionPrompt({
-      agentId: 'market', topic: '设计一个能被年轻人主动分享的节日礼盒', round: 8, history, persona: '# 市场现实校准员\n- 冷静但不扫兴。',
+      agentId: 'market', topic: '设计一个能被年轻人主动分享的节日礼盒', round: 6, history, persona: '# 市场现实校准员\n- 冷静但不扫兴。',
       knowledgeContext: '1. 潘潘：鲷鱼烧店主。\n2. 潘妮：潘潘妹妹。',
     })
-    expect(prompt).toContain('第8/10轮')
-    expect(prompt).toContain('[关键结论]')
+    expect(prompt).toContain('第6/7轮')
+    expect(prompt).toContain('[讨论摘要]')
     expect(prompt).toContain('[最近必要消息]')
     expect(prompt).toContain('[公司角色知识 · 必须遵守]')
     expect(prompt).toContain('潘潘：鲷鱼烧店主')
-    expect(prompt).toContain('100-180字')
-    expect(prompt).not.toContain('历史观点-0-')
-    expect(contextForCreativeRound(history, 8).recentMessages.length).toBeLessThanOrEqual(3)
+    expect(prompt).toContain('80-150个中文字')
+    expect(prompt).not.toContain('历史观点-2-')
+    expect(contextForCreativeRound(history, 6).recentMessages.length).toBeLessThanOrEqual(4)
   })
 
   test('moderator chooses two to three mentioned agents with safe fallbacks', () => {
-    expect(selectModeratorFollowupAgents('请 @奇想创意家 与 @市场现实校准员 正面讨论', 'debate')).toEqual(['creative', 'market'])
+    expect(selectModeratorFollowupAgents('请 @创想家A 与 @创想家D 正面讨论', 'debate')).toEqual(['creative', 'content'])
     expect(selectModeratorFollowupAgents('争议仍不清楚', 'revision')).toEqual(['creative', 'product'])
     expect(selectModeratorFollowupAgents('@brand @product @content @market', 'debate')).toEqual(['brand', 'product', 'content'])
   })

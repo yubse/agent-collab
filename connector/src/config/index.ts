@@ -55,9 +55,9 @@ export type ConnectorConfig = {
 }
 
 export function parseCodexWorkerCount(value: string | undefined): number {
-  const parsed = Number.parseInt(String(value || '3'), 10)
-  if (!Number.isFinite(parsed)) return 3
-  return Math.min(3, Math.max(1, parsed))
+  const parsed = Number.parseInt(String(value || '4'), 10)
+  if (!Number.isFinite(parsed)) return 4
+  return Math.min(4, Math.max(1, parsed))
 }
 
 export function loadConfig(): ConnectorConfig {

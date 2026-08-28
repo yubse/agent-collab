@@ -1,16 +1,5 @@
 import type { AgentSendOpts } from '../../../src/providers/provider.ts'
-
-const CREATIVE_AGENT_IDS = new Set([
-  'creative',
-  'brand',
-  'product',
-  'content',
-  'market',
-  'moderator',
-  'director',
-])
-
-const MEDIUM_REASONING_AGENT_IDS = new Set(['market', 'director'])
+import { CREATIVE_AGENT_BY_ID, type CreativeAgentId } from '../../../src/creative-discussion.ts'
 
 export const PURE_CHAT_APP_SERVER_ARGS = [
   '--disable', 'shell_tool',
@@ -28,15 +17,16 @@ export const PURE_CHAT_APP_SERVER_ARGS = [
 ] as const
 
 export function creativeAgentSendOptions(agentId: string): AgentSendOpts {
-  const pureChat = CREATIVE_AGENT_IDS.has(agentId)
-  if (!pureChat) return {}
+  const config = CREATIVE_AGENT_BY_ID.get(agentId as CreativeAgentId)
+  if (!config) return {}
   return {
-    reasoningEffort: MEDIUM_REASONING_AGENT_IDS.has(agentId) ? 'medium' : 'low',
-    pureChat,
-    freshThread: pureChat,
+    model: config.model,
+    reasoningEffort: config.reasoningEffort,
+    pureChat: config.pureChat,
+    freshThread: config.freshThread,
   }
 }
 
 export function isCreativeAgent(agentId: string): boolean {
-  return CREATIVE_AGENT_IDS.has(agentId)
+  return CREATIVE_AGENT_BY_ID.has(agentId as CreativeAgentId)
 }

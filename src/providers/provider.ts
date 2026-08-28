@@ -33,6 +33,8 @@ export type AgentUsage = {
 export type AgentSendOpts = {
   /** Future: file/image attachments passed through to providers that support them. */
   attachments?: Array<{ type: 'file' | 'image'; path: string }>
+  /** Optional per-turn model. Omit to preserve the provider's current default model. */
+  model?: string
   /** Per-turn reasoning policy. Creative roles use low; calibration/final synthesis use medium. */
   reasoningEffort?: 'low' | 'medium'
   /** Pure-chat turns have no web, shell, file, app, or environment tools. */

@@ -222,7 +222,7 @@ db.run(`CREATE TABLE IF NOT EXISTS group_agent_settings (
 )`)
 
 // Server-controlled creative discussion state. These tables record the strict
-// ten-round lifecycle and its cost/latency metrics independently from chat text.
+// bounded lifecycle and its cost/latency metrics independently from chat text.
 db.run(`CREATE TABLE IF NOT EXISTS creative_discussions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
@@ -266,6 +266,9 @@ db.run(`CREATE TABLE IF NOT EXISTS creative_discussion_outputs (
   thread_ms INTEGER DEFAULT NULL,
   codex_execution_ms INTEGER DEFAULT NULL,
   total_ms INTEGER DEFAULT NULL,
+  prompt_tokens INTEGER DEFAULT NULL,
+  model TEXT DEFAULT NULL,
+  reasoning_effort TEXT DEFAULT NULL,
   PRIMARY KEY (discussion_id, round_number, agent_id),
   FOREIGN KEY (discussion_id) REFERENCES creative_discussions(id) ON DELETE CASCADE
 )`)
@@ -274,6 +277,9 @@ try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN queue_wait_ms I
 try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN thread_ms INTEGER DEFAULT NULL`) } catch {}
 try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN codex_execution_ms INTEGER DEFAULT NULL`) } catch {}
 try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN total_ms INTEGER DEFAULT NULL`) } catch {}
+try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN prompt_tokens INTEGER DEFAULT NULL`) } catch {}
+try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN model TEXT DEFAULT NULL`) } catch {}
+try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN reasoning_effort TEXT DEFAULT NULL`) } catch {}
 
 // AIC-55: per-actor last-seen-id per channel, so web + iOS app share the same
 // unread state. Previously each client kept its own UserDefaults/localStorage
@@ -1301,10 +1307,10 @@ const ROLE_TO_ACTORS: Record<string, string[]> = {
 
 const ACTOR_DISPLAY_NAMES: Record<string, string> = {
   admin:  'admin',
-  creative: '奇想创意家',
-  brand: 'IP/品牌创意师',
-  product: '产品创意策划',
-  content: '内容传播策划',
+  creative: '创想家A',
+  brand: '创想家B',
+  product: '创想家C',
+  content: '创想家D',
   market: '市场现实校准员',
   moderator: '讨论主持人',
   director: '创意总监',
@@ -2338,6 +2344,7 @@ function recordCreativeDiscussionOutput(route: AgentTurnRoute, agentId: string, 
   if (!meta || !CREATIVE_AGENT_BY_ID.has(agentId as CreativeAgentId)) return
   const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(meta.discussionId) as any
   if (!discussion || discussion.status !== 'running') return
+  const agentConfig = CREATIVE_AGENT_BY_ID.get(agentId as CreativeAgentId)
   const existing = db.prepare(`SELECT message_id, text FROM creative_discussion_outputs
     WHERE discussion_id=? AND round_number=? AND agent_id=?`).get(meta.discussionId, meta.round, agentId) as any
   const nextText = existing?.text && existing.text !== text ? `${existing.text}\n${text}` : text
@@ -2358,11 +2365,14 @@ function recordCreativeDiscussionOutput(route: AgentTurnRoute, agentId: string, 
     ])
   }
   db.run(`INSERT INTO creative_discussion_outputs
-    (discussion_id, round_number, agent_id, message_id, text, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    (discussion_id, round_number, agent_id, message_id, text, created_at, prompt_tokens, model, reasoning_effort)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(discussion_id, round_number, agent_id) DO UPDATE SET
-      message_id=excluded.message_id, text=excluded.text, created_at=excluded.created_at`, [
-        meta.discussionId, meta.round, agentId, messageId, nextText, groupNowIso(),
+      message_id=excluded.message_id, text=excluded.text, created_at=excluded.created_at,
+      prompt_tokens=COALESCE(creative_discussion_outputs.prompt_tokens, excluded.prompt_tokens),
+      model=excluded.model, reasoning_effort=excluded.reasoning_effort`, [
+        meta.discussionId, meta.round, agentId, messageId, nextText, groupNowIso(), meta.promptTokensEstimate,
+        agentConfig?.model || null, agentConfig?.reasoningEffort || null,
       ])
 }
 
@@ -2383,15 +2393,19 @@ function completeCreativeAgentTurn(route: AgentTurnRoute, agentId: string, usage
   const threadMs = metric('thread_ms')
   const codexExecutionMs = metric('codex_execution_ms')
   const totalMs = metric('total_ms')
+  const reportedTokens = Number(usage?.input_tokens)
+  const promptTokens = Number.isFinite(reportedTokens) && reportedTokens >= 0
+    ? Math.round(reportedTokens)
+    : meta.promptTokensEstimate
   const completedAt = groupNowIso()
-  db.run(`UPDATE creative_discussion_outputs SET completed_at=?, queue_wait_ms=?, thread_ms=?, codex_execution_ms=?, total_ms=?
+  db.run(`UPDATE creative_discussion_outputs SET completed_at=?, queue_wait_ms=?, thread_ms=?, codex_execution_ms=?, total_ms=?, prompt_tokens=?
     WHERE discussion_id=? AND round_number=? AND agent_id=?`, [
-      completedAt, queueWaitMs, threadMs, codexExecutionMs, totalMs,
+      completedAt, queueWaitMs, threadMs, codexExecutionMs, totalMs, promptTokens,
       meta.discussionId, meta.round, agentId,
     ])
-  console.log(`[creative-execution] discussion=${meta.discussionId} round=${meta.round} agent=${agentId} queue_wait_ms=${queueWaitMs ?? 'unknown'} thread_ms=${threadMs ?? 'unknown'} codex_execution_ms=${codexExecutionMs ?? 'unknown'} total_ms=${totalMs ?? 'unknown'}`)
+  const agentConfig = CREATIVE_AGENT_BY_ID.get(agentId as CreativeAgentId)
+  console.log(`[creative-execution] discussion=${meta.discussionId} round=${meta.round} agent=${agentId} model=${agentConfig?.model || 'default'} reasoning=${agentConfig?.reasoningEffort || 'default'} queue_wait_ms=${queueWaitMs ?? 'unknown'} thread_ms=${threadMs ?? 'unknown'} codex_execution_ms=${codexExecutionMs ?? 'unknown'} total_ms=${totalMs ?? 'unknown'} prompt_tokens=${promptTokens}`)
 
-  const reportedTokens = Number(usage?.input_tokens)
   if (Number.isFinite(reportedTokens) && reportedTokens >= 0) {
     const delta = Math.round(reportedTokens) - meta.promptTokensEstimate
     db.run(`UPDATE creative_discussion_rounds SET prompt_tokens=prompt_tokens+?, prompt_tokens_source='reported_or_estimated'
@@ -3403,7 +3417,7 @@ Bun.serve<ConnectorSocketData>({
         started_at, completed_at, duration_ms, prompt_tokens, prompt_tokens_source
         FROM creative_discussion_rounds WHERE discussion_id=? ORDER BY round_number`).all(discussion.id) as any[]
       const outputs = db.prepare(`SELECT round_number, agent_id, message_id, created_at, completed_at,
-        queue_wait_ms, thread_ms, codex_execution_ms, total_ms
+        queue_wait_ms, thread_ms, codex_execution_ms, total_ms, prompt_tokens, model, reasoning_effort
         FROM creative_discussion_outputs WHERE discussion_id=? ORDER BY round_number, created_at`).all(discussion.id) as any[]
       return Response.json({
         ok: true,

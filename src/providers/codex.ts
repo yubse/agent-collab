@@ -210,6 +210,7 @@ export class CodexProvider implements AgentProvider {
     await this._request('turn/start', {
       threadId: this._threadId,
       input: [{ type: 'text', text, text_elements: [] }],
+      ...(opts.model ? { model: opts.model } : {}),
       ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
       ...(opts.pureChat ? {
         summary: 'none',
@@ -305,6 +306,7 @@ export class CodexProvider implements AgentProvider {
       cwd: this.cfg.cwd || process.cwd(),
       approvalPolicy: 'never',
       sandbox: opts.pureChat ? 'read-only' : 'workspace-write',
+      ...(opts.model ? { model: opts.model } : {}),
       ...(opts.pureChat ? {
         ephemeral: true,
         developerInstructions: 'Pure chat response only. Do not browse, search, read files, write files, edit files, run commands, use apps, or invoke tools.',
@@ -336,6 +338,7 @@ export class CodexProvider implements AgentProvider {
     try {
       const res: any = await this._request('thread/resume', {
         sessionId: this._threadId,
+        ...(opts.model ? { model: opts.model } : {}),
         ...(opts.pureChat ? {
           sandbox: 'read-only',
           developerInstructions: 'Pure chat response only. Do not browse, search, read files, write files, edit files, run commands, use apps, or invoke tools.',

@@ -63,9 +63,9 @@ Timeouts are independent and may be overridden with environment variables:
 - `REQUEST_ACK_TIMEOUT_MS=10000` — Server deadline for the immediate `execution_ack` and Codex app-server RPC acknowledgements.
 - `EXECUTION_TIMEOUT_MS=300000` — maximum duration of one Codex model turn on Connector.
 - `SERVER_PENDING_TIMEOUT_MS=330000` — Server deadline for the final `execution_result` after dispatch.
-- `AI_STUDIO_CODEX_WORKERS=3` — local Codex app-server pool size, clamped to 1–3 (default 3).
+- `AI_STUDIO_CODEX_WORKERS=4` — local Codex app-server pool size, clamped to 1–4 (default 4; lower values remain supported).
 
-The Connector sends `execution_ack` before starting Codex, keeps heartbeat traffic independent from model execution, and never retries a model turn for the same `request_id`. Up to three independent `codex app-server --listen stdio://` workers execute same-round creative Agents concurrently. Creative/IP/Product/Content/Moderator use low reasoning; Market and Director use medium. Creative discussions are pure-chat turns with web, shell, file, app, and environment tools disabled.
+The Connector sends `execution_ack` before starting Codex, keeps heartbeat traffic independent from model execution, and never retries a model turn for the same `request_id`. Up to four independent `codex app-server --listen stdio://` workers execute same-round creative Agents concurrently. Agent-owned configuration selects Luna + low for A/B/C/D and Moderator, Terra + low for Market, and Terra + medium for Director; unconfigured requests retain the Codex default model. Creative discussions are pure-chat turns with web, shell, file, app, and environment tools disabled.
 
 Reusable core modules live under `src/codex`, `src/connection`, `src/pairing`, `src/helper`, `src/execution`, `src/state`, and `src/config`.
 

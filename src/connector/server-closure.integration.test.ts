@@ -240,20 +240,17 @@ describe('Server → Connector → Conversation closure', () => {
     expect(response.record.delivery.errors.content).toBe('CODEX_CONNECTOR_OFFLINE')
   })
 
-  test('creative discussion is capped at ten rounds with moderator-selected followups', async () => {
+  test('creative discussion is capped at seven rounds with moderator-selected followups', async () => {
     const conversationId = await defaultConversation(userACookie)
     const connector = await pairConnector(userACookie, 'Creative Discussion Connector', (request) => {
       const prompt = String(request.prompt || '')
-      if (request.agent_id === 'moderator' && prompt.includes('第7/10轮')) {
-        return '@奇想创意家 与 @市场现实校准员 围绕新鲜感和接受度继续正面讨论。'
-      }
-      if (request.agent_id === 'moderator' && prompt.includes('第9/10轮')) {
-        return '@产品创意策划 与 @内容传播策划 做最后修正，别再扩展新方向。'
+      if (request.agent_id === 'moderator' && prompt.includes('第3/7轮')) {
+        return '@创想家A 与 @创想家D 围绕视觉新鲜感和体验成本继续正面讨论。'
       }
       if (request.agent_id === 'director') {
         return 'TOP1 仪式化开箱：兼具记忆和传播；TOP2 可共创IP：能沉淀资产；TOP3 场景化隐藏款：购买理由清晰。保留因差异化与可落地，淘汰同质化且解释成本高的方向。'
       }
-      return '@奇想创意家 我支持保留创意核，并补充一条本轮相关的新判断。'
+      return '@创想家A 我支持保留创意核，并补充一条本轮相关的新判断。'
     })
 
     await json(await api('/group/send', userACookie, {
@@ -267,16 +264,23 @@ describe('Server → Connector → Conversation closure', () => {
       await Bun.sleep(20)
     }
     expect(snapshot?.discussion?.status).toBe('completed')
-    expect(snapshot.rounds).toHaveLength(10)
+    expect(snapshot.rounds).toHaveLength(7)
     expect(snapshot.rounds.every((round: any) => round.status === 'completed')).toBe(true)
     expect(snapshot.rounds.every((round: any) => typeof round.duration_ms === 'number')).toBe(true)
     expect(snapshot.rounds.every((round: any) => round.prompt_tokens > 0)).toBe(true)
-    expect(snapshot.outputs).toHaveLength(17)
+    expect(snapshot.outputs).toHaveLength(18)
     expect(snapshot.outputs.every((output: any) => output.queue_wait_ms === 2)).toBe(true)
     expect(snapshot.outputs.every((output: any) => typeof output.codex_execution_ms === 'number')).toBe(true)
-    expect(snapshot.rounds[6].agents).toEqual(['moderator', 'creative', 'market'])
-    expect(snapshot.rounds[8].agents).toEqual(['moderator', 'product', 'content'])
-    expect(connector.requests).toHaveLength(17)
+    expect(snapshot.outputs.every((output: any) => output.prompt_tokens === 123)).toBe(true)
+    expect(snapshot.outputs.filter((output: any) => ['creative', 'brand', 'product', 'content', 'moderator'].includes(output.agent_id))
+      .every((output: any) => output.model === 'gpt-5.6-luna' && output.reasoning_effort === 'low')).toBe(true)
+    expect(snapshot.outputs.filter((output: any) => output.agent_id === 'market')
+      .every((output: any) => output.model === 'gpt-5.6-terra' && output.reasoning_effort === 'low')).toBe(true)
+    expect(snapshot.outputs.filter((output: any) => output.agent_id === 'director')
+      .every((output: any) => output.model === 'gpt-5.6-terra' && output.reasoning_effort === 'medium')).toBe(true)
+    expect(snapshot.rounds[0].agents).toEqual(['creative', 'brand', 'product', 'content'])
+    expect(snapshot.rounds[2].agents).toEqual(['moderator', 'creative', 'content'])
+    expect(connector.requests).toHaveLength(18)
     expect(connector.requests.every((request) => String(request.prompt).includes('[最近必要消息]'))).toBe(true)
     expect(connector.requests.every((request) => !String(request.prompt).includes('[当前 Conversation 近期上下文]'))).toBe(true)
     expect(Math.max(...connector.requests.map((request) => String(request.prompt).length))).toBeLessThan(8_000)
@@ -289,13 +293,12 @@ describe('Server → Connector → Conversation closure', () => {
     const conversationId = await defaultConversation(userACookie)
     const connector = await pairConnector(userACookie, 'Creative Progressive Connector', async (request) => {
       const prompt = String(request.prompt || '')
-      if (request.agent_id === 'brand' && prompt.includes('第2/10轮')) return 'BRAND_FIRST'
-      if (request.agent_id === 'product' && prompt.includes('第2/10轮')) {
+      if (request.agent_id === 'creative' && prompt.includes('第1/7轮')) return 'CREATOR_A_FIRST'
+      if (request.agent_id === 'content' && prompt.includes('第1/7轮')) {
         await Bun.sleep(250)
-        return 'PRODUCT_SECOND'
+        return 'CREATOR_D_SECOND'
       }
-      if (request.agent_id === 'moderator' && prompt.includes('第7/10轮')) return '@奇想创意家 @市场现实校准员 继续。'
-      if (request.agent_id === 'moderator' && prompt.includes('第9/10轮')) return '@产品创意策划 @内容传播策划 修正。'
+      if (request.agent_id === 'moderator' && prompt.includes('第3/7轮')) return '@创想家A @创想家D 继续。'
       if (request.agent_id === 'director') return 'TOP1 A；TOP2 B；TOP3 C。保留差异化，淘汰重复方向。'
       return '本轮补充一个新判断。'
     })
@@ -308,8 +311,8 @@ describe('Server → Connector → Conversation closure', () => {
     while (Date.now() < deadline) {
       const messages = (await json(await api(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, userACookie))).messages
       const snapshot = await json(await api(`/api/creative-discussions/current?conversation_id=${encodeURIComponent(conversationId)}`, userACookie))
-      const roundTwo = snapshot.rounds?.find((round: any) => round.round_number === 2)
-      if (messages.some((message: any) => message.text === 'BRAND_FIRST') && roundTwo?.pending_agents?.includes('product')) {
+      const roundOne = snapshot.rounds?.find((round: any) => round.round_number === 1)
+      if (messages.some((message: any) => message.text === 'CREATOR_A_FIRST') && roundOne?.pending_agents?.includes('content')) {
         observedBeforeRoundCompletion = true
         break
       }

@@ -14,6 +14,9 @@ export type CreativeAgentDefinition = {
   id: CreativeAgentId
   displayName: string
   model: string
+  reasoningEffort: 'low' | 'medium'
+  pureChat: boolean
+  freshThread: boolean
   avatar: string
   color: string
   envPrefix: string
@@ -23,37 +26,37 @@ export type CreativeAgentDefinition = {
 
 export const CREATIVE_AGENTS: CreativeAgentDefinition[] = [
   {
-    id: 'creative', displayName: '奇想创意家', model: 'Whimsy Injector', avatar: '✨', color: 'purple', envPrefix: 'CREATIVE',
-    aliases: ['creative', 'whimsy', '奇想', '奇想创意家'],
-    workingPhrases: ['制造意外感...', '寻找反常规切口...', '放大趣味体验...'],
+    id: 'creative', displayName: '创想家A', model: 'gpt-5.6-luna', reasoningEffort: 'low', pureChat: true, freshThread: true, avatar: '✨', color: 'purple', envPrefix: 'CREATIVE',
+    aliases: ['creative', 'creator-a', '创想家a', '创想家A'],
+    workingPhrases: ['制造视觉意外...', '寻找反常规切口...', '放大IP记忆点...'],
   },
   {
-    id: 'brand', displayName: 'IP/品牌创意师', model: 'Brand Guardian', avatar: '🎭', color: 'blue', envPrefix: 'BRAND',
-    aliases: ['brand', 'ip', '品牌', '品牌创意师', 'ip/品牌创意师'],
-    workingPhrases: ['校准 IP 调性...', '提炼视觉记忆...', '守住品牌一致性...'],
+    id: 'brand', displayName: '创想家B', model: 'gpt-5.6-luna', reasoningEffort: 'low', pureChat: true, freshThread: true, avatar: '🎲', color: 'blue', envPrefix: 'BRAND',
+    aliases: ['brand', 'creator-b', '创想家b', '创想家B'],
+    workingPhrases: ['设计商品玩法...', '强化购买理由...', '组合产品形态...'],
   },
   {
-    id: 'product', displayName: '产品创意策划', model: 'Product Manager', avatar: '🧭', color: 'green', envPrefix: 'PRODUCT',
-    aliases: ['product', '产品', '产品策划', '产品创意策划'],
-    workingPhrases: ['拆解购买理由...', '验证商品形态...', '收敛落地路径...'],
+    id: 'product', displayName: '创想家C', model: 'gpt-5.6-luna', reasoningEffort: 'low', pureChat: true, freshThread: true, avatar: '📣', color: 'green', envPrefix: 'PRODUCT',
+    aliases: ['product', 'creator-c', '创想家c', '创想家C'],
+    workingPhrases: ['制造传播钩子...', '设计UGC入口...', '适配社媒语境...'],
   },
   {
-    id: 'content', displayName: '内容传播策划', model: 'Social Media Strategist', avatar: '📣', color: 'orange', envPrefix: 'CONTENT',
-    aliases: ['content', 'social', '内容', '传播', '内容传播策划'],
-    workingPhrases: ['设计内容钩子...', '推演 UGC 话题...', '适配平台语境...'],
+    id: 'content', displayName: '创想家D', model: 'gpt-5.6-luna', reasoningEffort: 'low', pureChat: true, freshThread: true, avatar: '🤝', color: 'orange', envPrefix: 'CONTENT',
+    aliases: ['content', 'creator-d', '创想家d', '创想家D'],
+    workingPhrases: ['寻找跨界对象...', '设计联名关系...', '构造体验事件...'],
   },
   {
-    id: 'market', displayName: '市场现实校准员', model: 'Trend Researcher', avatar: '🔎', color: 'neutral', envPrefix: 'MARKET',
+    id: 'market', displayName: '市场现实校准员', model: 'gpt-5.6-terra', reasoningEffort: 'low', pureChat: true, freshThread: true, avatar: '🔎', color: 'neutral', envPrefix: 'MARKET',
     aliases: ['market', 'growth', '市场', '校准', '市场现实校准员'],
     workingPhrases: ['核对市场信号...', '扫描竞品风险...', '校准接受度...'],
   },
   {
-    id: 'moderator', displayName: '讨论主持人', model: 'Agents Orchestrator', avatar: '🎙️', color: 'blue', envPrefix: 'MODERATOR',
+    id: 'moderator', displayName: '讨论主持人', model: 'gpt-5.6-luna', reasoningEffort: 'low', pureChat: true, freshThread: true, avatar: '🎙️', color: 'blue', envPrefix: 'MODERATOR',
     aliases: ['moderator', 'host', '主持', '主持人', '讨论主持人'],
     workingPhrases: ['标记核心争议...', '合并重复观点...', '选择下一棒...'],
   },
   {
-    id: 'director', displayName: '创意总监', model: 'Studio Producer', avatar: '🎬', color: 'purple', envPrefix: 'DIRECTOR',
+    id: 'director', displayName: '创意总监', model: 'gpt-5.6-terra', reasoningEffort: 'medium', pureChat: true, freshThread: true, avatar: '🎬', color: 'purple', envPrefix: 'DIRECTOR',
     aliases: ['director', '总监', '创意总监'],
     workingPhrases: ['组合最终方案...', '排序创意优先级...', '做最终取舍...'],
   },
@@ -69,16 +72,13 @@ export type CreativeRoundPlan = {
 }
 
 export const CREATIVE_DISCUSSION_ROUNDS: CreativeRoundPlan[] = [
-  { number: 1, title: '奇想发散', agents: ['creative'] },
-  { number: 2, title: 'IP + 产品回应', agents: ['brand', 'product'] },
-  { number: 3, title: '内容传播挑战', agents: ['content'] },
+  { number: 1, title: '四路并行发散', agents: ['creative', 'brand', 'product', 'content'] },
+  { number: 2, title: '交叉回应与组合', agents: ['creative', 'brand', 'product', 'content'] },
+  { number: 3, title: '主持挑选争议并自由讨论', agents: ['moderator'], dynamicFollowup: 'debate' },
   { number: 4, title: '市场第一次校准', agents: ['market'] },
-  { number: 5, title: '创意争论与改进', agents: ['creative', 'brand'] },
-  { number: 6, title: '产品 + 传播深化', agents: ['product', 'content'] },
-  { number: 7, title: '争议焦点自由讨论', agents: ['moderator'], dynamicFollowup: 'debate' },
-  { number: 8, title: '市场第二次校准', agents: ['market'] },
-  { number: 9, title: '主持收束与最后修正', agents: ['moderator'], dynamicFollowup: 'revision' },
-  { number: 10, title: '创意总监总结', agents: ['director'] },
+  { number: 5, title: '四路快速修正', agents: ['creative', 'brand', 'product', 'content'] },
+  { number: 6, title: '市场第二次筛选', agents: ['market'] },
+  { number: 7, title: '创意总监最终筛选', agents: ['director'] },
 ]
 
 export const CREATIVE_DISCUSSION_MAX_ROUNDS = CREATIVE_DISCUSSION_ROUNDS.length
@@ -90,16 +90,13 @@ export type CreativeDiscussionMessage = {
 }
 
 const ROUND_GUIDANCE: Record<number, string> = {
-  1: '从反常规、趣味、视觉或体验切口大胆发散，先制造值得继续讨论的新鲜张力。',
-  2: '回应第1轮：品牌侧守住IP调性和视觉记忆，产品侧验证需求、形态与购买理由。',
-  3: '挑战现有想法能否变成小红书/抖音话题、UGC参与机制和前三秒内容钩子。',
-  4: '用趋势、消费者、竞品与接受度第一次校准；指出风险，同时保留可改进的创意核。',
-  5: '针对市场意见明确支持或反驳，并把有潜力的创意改得更新鲜、更可信。',
-  6: '把候选方向深化成商品形态、购买理由、内容钩子与可执行传播动作。',
-  7: '主持人先指出最大争议、重复和跑题点，并在正文中@最相关的2至3个Agent；被点名者围绕同一争议自由支持、反驳或延伸。',
-  8: '对深化方案做第二次市场校准，明确接受度、差异化、主要风险和可保留条件。',
-  9: '主持人收束共识与未决点，并在正文中@最需要最后修正的2至3个Agent；被点名者只做关键修正。',
-  10: '去重、组合、取舍并排序，输出TOP3；每项说明保留理由，并概括其余方向的淘汰原因。',
+  1: 'A/B/C/D从各自专长独立提出明显不同的创意，不重复其他赛道，不求深度论证。',
+  2: '阅读其他三位创想家的观点，明确@支持、@反驳、@组合或@延伸，形成新的候选方向。',
+  3: '主持人指出偏题、重复和最大争议，并@最相关的2至3位创想家继续；被点名者只围绕该争议自由讨论。',
+  4: '从市场、消费者、成本、趋势和落地性第一次校准，指出不现实、同质化或偏题之处，并给出保留条件。',
+  5: '根据市场校准快速修改候选方案，保留创意核，同时降低理解、成本和执行风险。',
+  6: '第二次筛选修正后的方向，明确通过、待验证和淘汰项，不再开启新方向。',
+  7: '综合去重、组合、取舍并排序，最终输出TOP3至TOP5及保留、淘汰原因。',
 }
 
 function compact(value: string, max: number): string {
@@ -114,13 +111,11 @@ export function contextForCreativeRound(history: CreativeDiscussionMessage[], ro
 } {
   const prior = history.filter((message) => message.round < round && !isSkipCreativeResponse(message.text))
   const recentRound = Math.max(0, ...prior.map((message) => message.round))
-  const recentMessages = prior.filter((message) => message.round === recentRound).slice(-3)
+  const recentMessages = prior.filter((message) => message.round === recentRound).slice(-4)
 
-  const keyAgents: CreativeAgentId[] = round >= 9
-    ? ['market', 'moderator', 'product', 'content']
-    : round >= 5
-      ? ['market', 'creative', 'brand', 'product', 'content']
-      : ['creative', 'brand', 'product', 'content', 'market']
+  const keyAgents: CreativeAgentId[] = round >= 6
+    ? ['market', 'moderator', 'creative', 'brand', 'product', 'content']
+    : ['creative', 'brand', 'product', 'content', 'market', 'moderator']
   const keyConclusions: string[] = []
   for (const agentId of keyAgents) {
     const message = [...prior].reverse().find((item) => item.agentId === agentId)
@@ -154,7 +149,7 @@ export function buildCreativeDiscussionPrompt(input: {
       return `- @${name}：${compact(message.text, 280)}`
     }).join('\n')
     : '- 无。'
-  const lengthRule = '正文约100-180字'
+  const lengthRule = '正文约80-150个中文字'
   return [
     '[Agent 人设]',
     input.persona.trim(),
@@ -169,7 +164,7 @@ export function buildCreativeDiscussionPrompt(input: {
       ? compact(input.knowledgeContext, 4000)
       : '所有方向必须以白熊百货既有角色为主角，并遵守公司知识库中的角色优先级与设定。',
     '',
-    '[关键结论]',
+    '[讨论摘要]',
     conclusions,
     '',
     '[最近必要消息]',
@@ -180,7 +175,7 @@ export function buildCreativeDiscussionPrompt(input: {
     '- 必须针对已有观点做@支持、@反驳、@补充或@延伸；不要写成独立汇报。',
     '- 发现跑题就回到原始主题；不要复述完整历史。',
     '- 确实没有新观点时只回复 SKIP。',
-    input.round === 10 ? '- 必须明确写出 TOP1、TOP2、TOP3，并分别给出保留原因和总体淘汰原因。' : '',
+    input.round === 7 ? '- 必须明确写出 TOP1 至 TOP3；若确有价值可扩展到 TOP5，并说明保留与总体淘汰原因。' : '',
   ].filter(Boolean).join('\n')
 }
 
@@ -188,12 +183,12 @@ export function selectModeratorFollowupAgents(text: string, mode: 'debate' | 're
   const normalized = text.toLowerCase()
   const selected: CreativeAgentId[] = []
   for (const agent of CREATIVE_AGENTS) {
-    if (agent.id === 'moderator' || agent.id === 'director') continue
+    if (!['creative', 'brand', 'product', 'content'].includes(agent.id)) continue
     const mentioned = agent.aliases.some((alias) => normalized.includes(`@${alias.toLowerCase()}`))
     if (mentioned && !selected.includes(agent.id)) selected.push(agent.id)
   }
   const fallback: CreativeAgentId[] = mode === 'debate'
-    ? ['creative', 'market', 'product']
+    ? ['creative', 'brand', 'product']
     : ['creative', 'product', 'content']
   for (const agentId of fallback) {
     if (selected.length >= 2) break

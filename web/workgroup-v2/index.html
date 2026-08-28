@@ -2236,7 +2236,7 @@ button, textarea, input { font: inherit; }
             <div class="ws-chat-title-row">
               <span class="ws-chat-title" id="groupChatTitle">创意讨论群</span>
               <span class="ws-chat-divider">｜</span>
-              <span class="ws-chat-members" id="groupChatMembers">admin · 奇想创意家 · IP/品牌创意师 · 产品创意策划 · 内容传播策划 · 市场现实校准员 · 讨论主持人 · 创意总监</span>
+              <span class="ws-chat-members" id="groupChatMembers">admin · 创想家A · 创想家B · 创想家C · 创想家D · 市场现实校准员 · 讨论主持人 · 创意总监</span>
             </div>
           </div>
           <div class="ws-chat-messages" data-ws-scroll="y" id="groupMessages">
@@ -2643,7 +2643,7 @@ const SERVER_TO_DESIGN_ID = { admin: 'pm', creative: 'actorA', brand: 'actorB', 
 const DESIGN_AGENT_ORDER = ['actorA', 'actorB', 'actorC', 'actorD', 'actorE', 'actorF', 'actorG'];
 const ROLE_AGENT_IDS = ['creative', 'brand', 'product', 'content', 'market', 'moderator', 'director'];
 const ROLE_DISPLAY_NAMES = {
-  creative: '奇想创意家', brand: 'IP/品牌创意师', product: '产品创意策划', content: '内容传播策划',
+  creative: '创想家A', brand: '创想家B', product: '创想家C', content: '创想家D',
   market: '市场现实校准员', moderator: '讨论主持人', director: '创意总监',
 };
 
@@ -2947,10 +2947,10 @@ function syncActorIdentityCssVars() {
 // === AIC-63 cycle 4: identity panel (PM edits actor avatar + bg, per design) ===
 const IDENTITY_ACTOR_META = [
   { id: 'admin',  name: 'admin',  runtime: 'PM', isYou: true },
-  { id: 'creative', name: '奇想创意家', runtime: 'Whimsy Injector · Codex' },
-  { id: 'brand', name: 'IP/品牌创意师', runtime: 'Brand Guardian · Codex' },
-  { id: 'product', name: '产品创意策划', runtime: 'Product Manager · Codex' },
-  { id: 'content', name: '内容传播策划', runtime: 'Social Media Strategist · Codex' },
+  { id: 'creative', name: '创想家A', runtime: '视觉 / IP 创意 · Codex' },
+  { id: 'brand', name: '创想家B', runtime: '产品 / 玩法创意 · Codex' },
+  { id: 'product', name: '创想家C', runtime: '内容 / 社媒创意 · Codex' },
+  { id: 'content', name: '创想家D', runtime: '跨界 / 体验创意 · Codex' },
   { id: 'market', name: '市场现实校准员', runtime: 'Trend Researcher · Codex' },
   { id: 'moderator', name: '讨论主持人', runtime: 'Agents Orchestrator · Codex' },
   { id: 'director', name: '创意总监', runtime: 'Studio Producer · Codex' },
@@ -4111,10 +4111,10 @@ function startPolling() {
 function parseMentions(text) {
   const m = [], lower = text.toLowerCase();
   const aliases = {
-    creative: ['creative', 'whimsy', '奇想', '奇想创意家'],
-    brand: ['brand', 'ip', '品牌', '品牌创意师', 'ip/品牌创意师'],
-    product: ['product', '产品', '产品策划', '产品创意策划'],
-    content: ['content', 'social', '内容', '传播', '内容传播策划'],
+    creative: ['creative', 'creator-a', '创想家a', '奇想', '奇想创意家'],
+    brand: ['brand', 'creator-b', '创想家b', 'ip', '品牌', '品牌创意师'],
+    product: ['product', 'creator-c', '创想家c', '产品', '内容', '社媒'],
+    content: ['content', 'creator-d', '创想家d', '跨界', '联名', '体验'],
     market: ['market', 'growth', '市场', '校准', '市场现实校准员'],
     moderator: ['moderator', 'host', '主持', '主持人', '讨论主持人'],
     director: ['director', '总监', '创意总监'],
@@ -4166,7 +4166,7 @@ async function sendCurrentMessage() {
     const sent = await apiJson('/group/send', { method: 'POST', body: JSON.stringify(body) });
     if (!sent?.ok) {
       if (sent?.error === 'CREATIVE_DISCUSSION_ALREADY_RUNNING') {
-        showWipToast(`当前创意讨论正在第 ${sent.current_round || '—'}/10 轮，请等待创意总监总结。`);
+        showWipToast(`当前创意讨论正在第 ${sent.current_round || '—'}/${sent.max_rounds || 7} 轮，请等待创意总监总结。`);
       } else {
         showWipToast(sent?.error || '消息发送失败');
       }
@@ -6494,8 +6494,8 @@ function renderSettingsPhaseEditor(tpl) {
   }
   const ROLE_DEFS = [
     { key: 'pm',     label: 'PM',      emoji: '👾' },
-    { key: 'implementer',   label: '产品创意策划', emoji: '🧭' },
-    { key: 'reviewer',     label: '奇想创意家', emoji: '✨' },
+    { key: 'implementer',   label: '创想家C', emoji: '🧭' },
+    { key: 'reviewer',     label: '创想家A', emoji: '✨' },
     { key: 'system', label: 'System',  emoji: '⚙' },
   ];
   const isReserved = !!tpl.is_reserved;
@@ -6688,8 +6688,8 @@ function renderTypeCreateForm() {
 function renderPhaseCreateForm() {
   const ROLE_DEFS = [
     { key: 'pm',     label: 'PM',      emoji: '👾' },
-    { key: 'implementer',   label: '产品创意策划', emoji: '🧭' },
-    { key: 'reviewer',     label: '奇想创意家', emoji: '✨' },
+    { key: 'implementer',   label: '创想家C', emoji: '🧭' },
+    { key: 'reviewer',     label: '创想家A', emoji: '✨' },
     { key: 'system', label: 'System',  emoji: '⚙' },
   ];
   const rolesSet = new Set(entityCreateForm.required_roles);

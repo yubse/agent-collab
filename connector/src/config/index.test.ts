@@ -4,12 +4,13 @@ import { tmpdir } from 'os'
 import path from 'path'
 import { clearDeviceCredential, parseCodexWorkerCount, type ConnectorConfig } from './index.ts'
 
-test('test_codex_worker_count_defaults_to_three_and_is_clamped', () => {
-  expect(parseCodexWorkerCount(undefined)).toBe(3)
+test('test_codex_worker_count_defaults_to_four_and_is_clamped', () => {
+  expect(parseCodexWorkerCount(undefined)).toBe(4)
   expect(parseCodexWorkerCount('2')).toBe(2)
+  expect(parseCodexWorkerCount('3')).toBe(3)
   expect(parseCodexWorkerCount('0')).toBe(1)
-  expect(parseCodexWorkerCount('99')).toBe(3)
-  expect(parseCodexWorkerCount('not-a-number')).toBe(3)
+  expect(parseCodexWorkerCount('99')).toBe(4)
+  expect(parseCodexWorkerCount('not-a-number')).toBe(4)
 })
 
 test('test_clear_device_credential_preserves_device_identity_and_codex_auth', () => {

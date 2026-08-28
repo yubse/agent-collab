@@ -73,18 +73,19 @@ describe('LocalCodexExecutor worker pool', () => {
     expect(provider.selections).toEqual([null, null, 'thread_1'])
   })
 
-  test('runs three same-round creative agents concurrently with independent workers', async () => {
+  test('runs four same-round creative agents concurrently with independent workers', async () => {
     const tracker = { active: 0, maxActive: 0 }
-    const providers = [0, 1, 2].map(() => new FakeSharedProvider(60, tracker))
+    const providers = [0, 1, 2, 3].map(() => new FakeSharedProvider(60, tracker))
     const local = executor(providers)
     const started = Date.now()
     const results = await Promise.all([
       local.execute(request('creative', 'conversation-a', 'creative')),
       local.execute(request('brand', 'conversation-a', 'brand')),
       local.execute(request('product', 'conversation-a', 'product')),
+      local.execute(request('content', 'conversation-a', 'content')),
     ])
 
-    expect(tracker.maxActive).toBe(3)
+    expect(tracker.maxActive).toBe(4)
     expect(Date.now() - started).toBeLessThan(150)
     expect(results.every((result) => result.metrics.queue_wait_ms < 30)).toBe(true)
     expect(providers.every((provider) => provider.selections[0] === null)).toBe(true)
@@ -103,8 +104,8 @@ describe('LocalCodexExecutor worker pool', () => {
 
     expect(Math.max(creative.metrics.queue_wait_ms, market.metrics.queue_wait_ms)).toBeLessThan(30)
     expect(director.metrics.queue_wait_ms).toBeGreaterThanOrEqual(50)
-    expect(first.options[0]).toMatchObject({ reasoningEffort: 'low', pureChat: true, freshThread: true })
-    expect(second.options[0]).toMatchObject({ reasoningEffort: 'medium', pureChat: true, freshThread: true })
-    expect(first.options[1]).toMatchObject({ reasoningEffort: 'medium', pureChat: true, freshThread: true })
+    expect(first.options[0]).toMatchObject({ model: 'gpt-5.6-luna', reasoningEffort: 'low', pureChat: true, freshThread: true })
+    expect(second.options[0]).toMatchObject({ model: 'gpt-5.6-terra', reasoningEffort: 'low', pureChat: true, freshThread: true })
+    expect(first.options[1]).toMatchObject({ model: 'gpt-5.6-terra', reasoningEffort: 'medium', pureChat: true, freshThread: true })
   })
 })
