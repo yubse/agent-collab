@@ -23,6 +23,24 @@ describe('ExecutionRunner', () => {
     expect(state.snapshot().execution).toBe('EXECUTION_IDLE')
   })
 
+  test('forwards four execution metrics without exposing content in logs', async () => {
+    const logs: string[] = []
+    const runner = new ExecutionRunner({
+      execute: async (_request, hooks) => {
+        hooks?.onStarted?.(new Date().toISOString())
+        return {
+          content: 'private response', usage: null,
+          metrics: { queue_wait_ms: 4, thread_ms: 8, codex_execution_ms: 12, total_ms: 24 },
+        }
+      },
+    }, new ConnectorStateStore(), (line) => logs.push(line))
+    const result = await runner.run({ ...request, request_id: 'req_metrics' })
+    expect(result.timings).toMatchObject({ queue_wait_ms: 4, thread_ms: 8, codex_execution_ms: 12 })
+    expect(typeof result.timings?.total_ms).toBe('number')
+    expect(logs.join('\n')).toContain('queue_wait_ms=4 thread_ms=8 codex_execution_ms=12')
+    expect(logs.join('\n')).not.toContain('private response')
+  })
+
   test('executes the same request_id only once', async () => {
     let calls = 0
     const state = new ConnectorStateStore()

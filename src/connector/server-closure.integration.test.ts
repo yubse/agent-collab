@@ -69,8 +69,9 @@ async function json(response: Response): Promise<any> {
 }
 
 type TestConnector = { ws: WebSocket; requests: any[]; token: string; close(): Promise<void> }
+type ConnectorAnswer = string | ((request: any) => string | Promise<string>)
 
-async function pairConnector(cookie: string, name: string, answer: string | ((request: any) => string)): Promise<TestConnector> {
+async function pairConnector(cookie: string, name: string, answer: ConnectorAnswer): Promise<TestConnector> {
   const pairing = await json(await api('/api/connectors/claim/start', cookie, { method: 'POST', body: '{}' }))
   const paired = await json(await api('/api/connectors/claim/complete', '', {
     method: 'POST', body: JSON.stringify({
@@ -84,7 +85,7 @@ async function pairConnector(cookie: string, name: string, answer: string | ((re
   return openConnector(paired.device_credential, name, answer)
 }
 
-function openConnector(token: string, name: string, answer: string | ((request: any) => string)): Promise<TestConnector> {
+function openConnector(token: string, name: string, answer: ConnectorAnswer): Promise<TestConnector> {
   return new Promise((resolve, reject) => {
     const requests: any[] = []
     const ws = new WebSocket(`ws://127.0.0.1:${port}/connector`)
@@ -107,15 +108,30 @@ function openConnector(token: string, name: string, answer: string | ((request: 
       }
       if (message.type === 'execution_request') {
         requests.push(message)
-        const content = typeof answer === 'function' ? answer(message) : answer
         ws.send(JSON.stringify({
           type: 'execution_ack', request_id: message.request_id,
           status: 'running', acknowledged_at: new Date().toISOString(),
         }))
-        ws.send(JSON.stringify({
-          type: 'execution_result', request_id: message.request_id,
-          status: 'success', content, usage: { input_tokens: 123, output_tokens: 40 },
-        }))
+        const started = Date.now()
+        void Promise.resolve(typeof answer === 'function' ? answer(message) : answer).then((content) => {
+          const finished = Date.now()
+          ws.send(JSON.stringify({
+            type: 'execution_result', request_id: message.request_id,
+            status: 'success', content, usage: { input_tokens: 123, output_tokens: 40 },
+            timings: {
+              execution_request_at: message.created_at,
+              execution_received_at: new Date(started).toISOString(),
+              execution_ack_at: new Date(started).toISOString(),
+              codex_started_at: new Date(started).toISOString(),
+              codex_finished_at: new Date(finished).toISOString(),
+              execution_result_at: new Date(finished).toISOString(),
+              queue_wait_ms: 2,
+              thread_ms: 3,
+              codex_execution_ms: Math.max(0, finished - started),
+              total_ms: Math.max(5, finished - started + 5),
+            },
+          }))
+        })
       }
     })
     ws.addEventListener('error', () => reject(new Error(`connector ${name} websocket failed`)))
@@ -255,6 +271,9 @@ describe('Server → Connector → Conversation closure', () => {
     expect(snapshot.rounds.every((round: any) => round.status === 'completed')).toBe(true)
     expect(snapshot.rounds.every((round: any) => typeof round.duration_ms === 'number')).toBe(true)
     expect(snapshot.rounds.every((round: any) => round.prompt_tokens > 0)).toBe(true)
+    expect(snapshot.outputs).toHaveLength(17)
+    expect(snapshot.outputs.every((output: any) => output.queue_wait_ms === 2)).toBe(true)
+    expect(snapshot.outputs.every((output: any) => typeof output.codex_execution_ms === 'number')).toBe(true)
     expect(snapshot.rounds[6].agents).toEqual(['moderator', 'creative', 'market'])
     expect(snapshot.rounds[8].agents).toEqual(['moderator', 'product', 'content'])
     expect(connector.requests).toHaveLength(17)
@@ -265,4 +284,44 @@ describe('Server → Connector → Conversation closure', () => {
     expect(messages.filter((message: any) => message.text.includes('TOP1')).length).toBe(1)
     await connector.close()
   }, 15_000)
+
+  test('persists and exposes each same-round agent result before the round completes', async () => {
+    const conversationId = await defaultConversation(userACookie)
+    const connector = await pairConnector(userACookie, 'Creative Progressive Connector', async (request) => {
+      const prompt = String(request.prompt || '')
+      if (request.agent_id === 'brand' && prompt.includes('第2/10轮')) return 'BRAND_FIRST'
+      if (request.agent_id === 'product' && prompt.includes('第2/10轮')) {
+        await Bun.sleep(250)
+        return 'PRODUCT_SECOND'
+      }
+      if (request.agent_id === 'moderator' && prompt.includes('第7/10轮')) return '@奇想创意家 @市场现实校准员 继续。'
+      if (request.agent_id === 'moderator' && prompt.includes('第9/10轮')) return '@产品创意策划 @内容传播策划 修正。'
+      if (request.agent_id === 'director') return 'TOP1 A；TOP2 B；TOP3 C。保留差异化，淘汰重复方向。'
+      return '本轮补充一个新判断。'
+    })
+
+    await json(await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: conversationId, text: '验证同轮逐条显示的创意主题' }),
+    }))
+    const deadline = Date.now() + 5_000
+    let observedBeforeRoundCompletion = false
+    while (Date.now() < deadline) {
+      const messages = (await json(await api(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, userACookie))).messages
+      const snapshot = await json(await api(`/api/creative-discussions/current?conversation_id=${encodeURIComponent(conversationId)}`, userACookie))
+      const roundTwo = snapshot.rounds?.find((round: any) => round.round_number === 2)
+      if (messages.some((message: any) => message.text === 'BRAND_FIRST') && roundTwo?.pending_agents?.includes('product')) {
+        observedBeforeRoundCompletion = true
+        break
+      }
+      await Bun.sleep(10)
+    }
+    expect(observedBeforeRoundCompletion).toBe(true)
+
+    while (Date.now() < deadline) {
+      const snapshot = await json(await api(`/api/creative-discussions/current?conversation_id=${encodeURIComponent(conversationId)}`, userACookie))
+      if (snapshot.discussion?.status === 'completed') break
+      await Bun.sleep(20)
+    }
+    await connector.close()
+  }, 10_000)
 })

@@ -2633,7 +2633,9 @@ button, textarea, input { font: inherit; }
 // State
 // ============================================================================
 const STORAGE_KEY = 'wgv2:state';
-const POLL_MS = 2500;
+// Creative workers finish independently; poll fast enough to reveal each result
+// instead of making the first finisher appear to wait for the rest of its round.
+const POLL_MS = 1000;
 
 // Map server roster.id ↔ design token id. Design system has tokens for
 // Runtime actor ids mapped to stable visual design tokens.

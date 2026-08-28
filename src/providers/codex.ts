@@ -190,7 +190,7 @@ export class CodexProvider implements AgentProvider {
    * Subsequent calls reuse the same process + threadId. Resolves once `turn/start`
    * is acknowledged; downstream notifications fire through onEvent as they arrive.
    */
-  async send(text: string, _opts?: AgentSendOpts): Promise<void> {
+  async send(text: string, opts: AgentSendOpts = {}): Promise<void> {
     // AIC-116 cycle 2: send() reject semantics — rejects on spawn / initialize /
     // thread handshake failure (callers learn "agent can't accept this turn at all"), but
     // resolves once the turn/start request is dispatched fire-and-forget. Mid-turn protocol
@@ -200,8 +200,8 @@ export class CodexProvider implements AgentProvider {
     // AIC-116: first send in this process starts or resumes the thread;
     // subsequent sends reuse it directly (no extra thread/resume call).
     if (!this._threadStartedInThisProcess) {
-      if (this._threadId) await this._resumeOrStartThread()  // throws on thread fail
-      else await this._startThread()
+      if (this._threadId) await this._resumeOrStartThread(opts)  // throws on thread fail
+      else await this._startThread(opts)
     }
 
     // AIC-116 cycle 3: await turn/start request — codex must ack the new
@@ -210,6 +210,11 @@ export class CodexProvider implements AgentProvider {
     await this._request('turn/start', {
       threadId: this._threadId,
       input: [{ type: 'text', text, text_elements: [] }],
+      ...(opts.reasoningEffort ? { effort: opts.reasoningEffort } : {}),
+      ...(opts.pureChat ? {
+        summary: 'none',
+        sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      } : {}),
     })
   }
 
@@ -295,11 +300,29 @@ export class CodexProvider implements AgentProvider {
     this._initialized = true
   }
 
-  private async _startThread(): Promise<void> {
+  private async _startThread(opts: AgentSendOpts = {}): Promise<void> {
     const res: any = await this._request('thread/start', {
       cwd: this.cfg.cwd || process.cwd(),
       approvalPolicy: 'never',
-      sandbox: 'workspace-write',
+      sandbox: opts.pureChat ? 'read-only' : 'workspace-write',
+      ...(opts.pureChat ? {
+        ephemeral: true,
+        developerInstructions: 'Pure chat response only. Do not browse, search, read files, write files, edit files, run commands, use apps, or invoke tools.',
+        config: {
+          web_search: 'disabled',
+          features: {
+            shell_tool: false,
+            unified_exec: false,
+            browser_use: false,
+            computer_use: false,
+            view_image: false,
+            image_generation: false,
+            apps: false,
+            skill_search: false,
+            workspace_dependencies: false,
+          },
+        },
+      } : {}),
     })
     this._threadId = res?.thread?.id ?? res?.thread?.sessionId ?? null
     if (!this._threadId) throw new Error(`${this.label}: thread/start returned no thread id`)
@@ -308,10 +331,17 @@ export class CodexProvider implements AgentProvider {
     this.eventCb?.({ type: 'system_init', session_id: this._threadId, raw: res })
   }
 
-  private async _resumeOrStartThread(): Promise<void> {
-    if (!this._threadId) return this._startThread()
+  private async _resumeOrStartThread(opts: AgentSendOpts = {}): Promise<void> {
+    if (!this._threadId) return this._startThread(opts)
     try {
-      const res: any = await this._request('thread/resume', { sessionId: this._threadId })
+      const res: any = await this._request('thread/resume', {
+        sessionId: this._threadId,
+        ...(opts.pureChat ? {
+          sandbox: 'read-only',
+          developerInstructions: 'Pure chat response only. Do not browse, search, read files, write files, edit files, run commands, use apps, or invoke tools.',
+          config: { web_search: 'disabled' },
+        } : {}),
+      })
       const newId = res?.thread?.id ?? res?.thread?.sessionId
       if (newId && newId !== this._threadId) this._threadId = newId
       this._persistSessionId()
@@ -321,7 +351,7 @@ export class CodexProvider implements AgentProvider {
       // Resume failed — sid expired or thread/resume unsupported. Fall back to fresh thread.
       this._threadId = null
       this._persistSessionId()
-      await this._startThread()
+      await this._startThread(opts)
     }
   }
 

@@ -261,9 +261,19 @@ db.run(`CREATE TABLE IF NOT EXISTS creative_discussion_outputs (
   message_id TEXT DEFAULT NULL,
   text TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  completed_at TEXT DEFAULT NULL,
+  queue_wait_ms INTEGER DEFAULT NULL,
+  thread_ms INTEGER DEFAULT NULL,
+  codex_execution_ms INTEGER DEFAULT NULL,
+  total_ms INTEGER DEFAULT NULL,
   PRIMARY KEY (discussion_id, round_number, agent_id),
   FOREIGN KEY (discussion_id) REFERENCES creative_discussions(id) ON DELETE CASCADE
 )`)
+try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN completed_at TEXT DEFAULT NULL`) } catch {}
+try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN queue_wait_ms INTEGER DEFAULT NULL`) } catch {}
+try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN thread_ms INTEGER DEFAULT NULL`) } catch {}
+try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN codex_execution_ms INTEGER DEFAULT NULL`) } catch {}
+try { db.run(`ALTER TABLE creative_discussion_outputs ADD COLUMN total_ms INTEGER DEFAULT NULL`) } catch {}
 
 // AIC-55: per-actor last-seen-id per channel, so web + iOS app share the same
 // unread state. Previously each client kept its own UserDefaults/localStorage
@@ -689,7 +699,7 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
       markAgentIdle(agentId)
     }
     startNextAgentTurn(userId, conversationId, agentId)
-    if (completedRoute?.creativeDiscussion) completeCreativeAgentTurn(completedRoute, agentId, ev.usage)
+    if (completedRoute?.creativeDiscussion) completeCreativeAgentTurn(completedRoute, agentId, ev.usage, ev.raw?.timings)
   }
 
   if (ev.type === 'assistant' && typeof ev.text === 'string' && ev.text.trim()) {
@@ -2356,7 +2366,7 @@ function recordCreativeDiscussionOutput(route: AgentTurnRoute, agentId: string, 
       ])
 }
 
-function completeCreativeAgentTurn(route: AgentTurnRoute, agentId: string, usage?: any) {
+function completeCreativeAgentTurn(route: AgentTurnRoute, agentId: string, usage?: any, timings?: any) {
   const meta = route.creativeDiscussion
   if (!meta) return
   const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(meta.discussionId) as any
@@ -2364,6 +2374,22 @@ function completeCreativeAgentTurn(route: AgentTurnRoute, agentId: string, usage
   const output = db.prepare(`SELECT text FROM creative_discussion_outputs
     WHERE discussion_id=? AND round_number=? AND agent_id=?`).get(meta.discussionId, meta.round, agentId) as any
   if (!output) recordCreativeDiscussionOutput(route, agentId, 'SKIP')
+
+  const metric = (name: string): number | null => {
+    const value = Number(timings?.[name])
+    return Number.isFinite(value) && value >= 0 ? Math.round(value) : null
+  }
+  const queueWaitMs = metric('queue_wait_ms')
+  const threadMs = metric('thread_ms')
+  const codexExecutionMs = metric('codex_execution_ms')
+  const totalMs = metric('total_ms')
+  const completedAt = groupNowIso()
+  db.run(`UPDATE creative_discussion_outputs SET completed_at=?, queue_wait_ms=?, thread_ms=?, codex_execution_ms=?, total_ms=?
+    WHERE discussion_id=? AND round_number=? AND agent_id=?`, [
+      completedAt, queueWaitMs, threadMs, codexExecutionMs, totalMs,
+      meta.discussionId, meta.round, agentId,
+    ])
+  console.log(`[creative-execution] discussion=${meta.discussionId} round=${meta.round} agent=${agentId} queue_wait_ms=${queueWaitMs ?? 'unknown'} thread_ms=${threadMs ?? 'unknown'} codex_execution_ms=${codexExecutionMs ?? 'unknown'} total_ms=${totalMs ?? 'unknown'}`)
 
   const reportedTokens = Number(usage?.input_tokens)
   if (Number.isFinite(reportedTokens) && reportedTokens >= 0) {
@@ -3376,6 +3402,9 @@ Bun.serve<ConnectorSocketData>({
       const rounds = db.prepare(`SELECT round_number, title, status, stage, agents, pending_agents,
         started_at, completed_at, duration_ms, prompt_tokens, prompt_tokens_source
         FROM creative_discussion_rounds WHERE discussion_id=? ORDER BY round_number`).all(discussion.id) as any[]
+      const outputs = db.prepare(`SELECT round_number, agent_id, message_id, created_at, completed_at,
+        queue_wait_ms, thread_ms, codex_execution_ms, total_ms
+        FROM creative_discussion_outputs WHERE discussion_id=? ORDER BY round_number, created_at`).all(discussion.id) as any[]
       return Response.json({
         ok: true,
         discussion,
@@ -3384,6 +3413,7 @@ Bun.serve<ConnectorSocketData>({
           agents: jsonParseSafe(round.agents, []),
           pending_agents: jsonParseSafe(round.pending_agents, []),
         })),
+        outputs,
       })
     }
 

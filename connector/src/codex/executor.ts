@@ -1,8 +1,9 @@
 import path from 'path'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { CodexProvider } from '../../../src/providers/codex.ts'
-import type { AgentEvent } from '../../../src/providers/provider.ts'
+import type { AgentEvent, AgentSendOpts } from '../../../src/providers/provider.ts'
 import type { ExecutionRequest } from '../protocol.ts'
+import { creativeAgentSendOptions } from './options.ts'
 
 type DiagnosticLogger = (line: string) => void
 
@@ -10,50 +11,111 @@ type SharedCodexProvider = Pick<CodexProvider,
   'selectThread' | 'sessionId' | 'onEvent' | 'onError' | 'send' | 'warmup' | 'close' | 'interrupt'
 >
 
+export type CodexExecutionMetrics = {
+  queue_wait_ms: number
+  thread_ms: number
+  codex_execution_ms: number
+  total_ms: number
+}
+
+export type CodexExecutionHooks = {
+  onStarted?: (startedAt: string) => void
+}
+
+type WorkerLease = { index: number; provider: SharedCodexProvider }
+
+/** Fixed app-server pool: one active turn per provider, FIFO when all are busy. */
 export class LocalCodexExecutor {
-  private readonly provider: SharedCodexProvider
-  private tail: Promise<unknown> = Promise.resolve()
+  private readonly providers: SharedCodexProvider[]
+  private readonly available: number[]
+  private readonly waiters: Array<(lease: WorkerLease) => void> = []
   private sessions = new Map<string, string | null>()
 
   constructor(
     private config: { binary: string; cwd: string; stateDir: string; executionTimeoutMs: number },
     private log: DiagnosticLogger = (line) => console.error(line),
-    provider?: SharedCodexProvider,
+    providers?: SharedCodexProvider | SharedCodexProvider[],
   ) {
     mkdirSync(config.stateDir, { recursive: true, mode: 0o700 })
-    this.provider = provider || new CodexProvider({
-      label: 'connector:shared-app-server',
+    const supplied = providers ? (Array.isArray(providers) ? providers : [providers]) : []
+    this.providers = supplied.length ? supplied : [this.createProvider(0)]
+    this.available = this.providers.map((_, index) => index)
+  }
+
+  async execute(
+    request: ExecutionRequest,
+    hooks: CodexExecutionHooks = {},
+  ): Promise<{ content: string; usage: any; metrics: CodexExecutionMetrics }> {
+    const totalStartedMs = Date.now()
+    const lease = await this.acquire()
+    const workerStartedMs = Date.now()
+    const queueWaitMs = Math.max(0, workerStartedMs - totalStartedMs)
+    hooks.onStarted?.(new Date(workerStartedMs).toISOString())
+    const key = `${request.user_id}:${request.conversation_id}:${request.agent_id}`
+    const opts = creativeAgentSendOptions(request.agent_id)
+
+    try {
+      // Creative prompts already contain the exact scoped context for this round.
+      // A fresh ephemeral thread avoids silently reloading complete hidden history.
+      lease.provider.selectThread(opts.freshThread ? null : this.sessionFor(key))
+      const execution = await this.runTurn(lease.provider, request.prompt, opts)
+      if (!opts.freshThread) this.persistSession(key, lease.provider.sessionId)
+      return {
+        content: execution.content,
+        usage: execution.usage,
+        metrics: {
+          queue_wait_ms: queueWaitMs,
+          thread_ms: execution.threadMs,
+          codex_execution_ms: execution.codexExecutionMs,
+          total_ms: Math.max(0, Date.now() - totalStartedMs),
+        },
+      }
+    } finally {
+      this.release(lease.index)
+    }
+  }
+
+  async warmup(): Promise<void> {
+    // Managed runtime installation happens on the primary before raw workers start.
+    await this.providers[0].warmup()
+    await Promise.all(this.providers.slice(1).map((provider) => provider.warmup()))
+  }
+
+  async close(): Promise<void> {
+    await Promise.all(this.providers.map((provider) => provider.close()))
+    this.sessions.clear()
+  }
+
+  get workerCount(): number { return this.providers.length }
+
+  private createProvider(index: number): SharedCodexProvider {
+    return new CodexProvider({
+      label: `connector:app-server-worker-${index + 1}`,
       binaryPath: this.config.binary,
       cwd: this.config.cwd,
       onDiagnostic: (event) => {
         if (event.stream === 'process') {
-          this.log(`[codex] status=exited code=${event.exitCode ?? 'unknown'} ${event.message}`)
+          this.log(`[codex] worker=${index + 1} status=exited code=${event.exitCode ?? 'unknown'} ${event.message}`)
         } else {
-          this.log(`[codex] stream=stderr ${diagnosticSummary(event.message)}`)
+          this.log(`[codex] worker=${index + 1} stream=stderr ${diagnosticSummary(event.message)}`)
         }
       },
     })
   }
 
-  execute(request: ExecutionRequest): Promise<{ content: string; usage: any }> {
-    const key = `${request.user_id}:${request.conversation_id}:${request.agent_id}`
-    const run = this.tail.catch(() => {}).then(async () => {
-      this.provider.selectThread(this.sessionFor(key))
-      const result = await this.runTurn(this.provider, request.prompt)
-      this.persistSession(key, this.provider.sessionId)
-      return result
-    })
-    this.tail = run
-    return run
+  private acquire(): Promise<WorkerLease> {
+    const index = this.available.shift()
+    if (index !== undefined) return Promise.resolve({ index, provider: this.providers[index] })
+    return new Promise((resolve) => this.waiters.push(resolve))
   }
 
-  warmup(): Promise<void> {
-    return this.provider.warmup()
-  }
-
-  async close(): Promise<void> {
-    await this.provider.close()
-    this.sessions.clear()
+  private release(index: number): void {
+    const waiter = this.waiters.shift()
+    if (waiter) {
+      waiter({ index, provider: this.providers[index] })
+      return
+    }
+    this.available.push(index)
   }
 
   private sessionFor(key: string): string | null {
@@ -77,9 +139,15 @@ export class LocalCodexExecutor {
     return path.join(this.config.stateDir, `${safe}.json`)
   }
 
-  private runTurn(provider: SharedCodexProvider, prompt: string): Promise<{ content: string; usage: any }> {
+  private runTurn(
+    provider: SharedCodexProvider,
+    prompt: string,
+    opts: AgentSendOpts,
+  ): Promise<{ content: string; usage: any; threadMs: number; codexExecutionMs: number }> {
     return new Promise((resolve, reject) => {
       const assistant: string[] = []
+      const threadStartedMs = Date.now()
+      let turnAcknowledgedMs: number | null = null
       let settled = false
       const finish = (callback: () => void) => {
         if (settled) return
@@ -88,19 +156,26 @@ export class LocalCodexExecutor {
         callback()
       }
       const timer = setTimeout(() => finish(() => {
-        // A timed-out app-server turn may still be retrying in the background. Kill it
-        // before this conversation accepts another request, otherwise replies can cross turns.
         provider.interrupt().catch(() => {})
         reject(new Error('CODEX_EXECUTION_TIMEOUT'))
       }), this.config.executionTimeoutMs)
       provider.onEvent((event: AgentEvent) => {
         if (event.type === 'assistant' && event.text?.trim()) assistant.push(event.text.trim())
         if (event.type === 'result') {
-          finish(() => resolve({ content: assistant.join('\n\n'), usage: event.usage || null }))
+          const finishedMs = Date.now()
+          const ackMs = turnAcknowledgedMs ?? threadStartedMs
+          finish(() => resolve({
+            content: assistant.join('\n\n'),
+            usage: event.usage || null,
+            threadMs: Math.max(0, ackMs - threadStartedMs),
+            codexExecutionMs: Math.max(0, finishedMs - ackMs),
+          }))
         }
       })
       provider.onError((error) => finish(() => reject(new Error(error.message))))
-      provider.send(prompt).catch((error) => finish(() => reject(error)))
+      provider.send(prompt, opts)
+        .then(() => { turnAcknowledgedMs = Date.now() })
+        .catch((error) => finish(() => reject(error)))
     })
   }
 }

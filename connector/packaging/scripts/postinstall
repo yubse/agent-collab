@@ -10,15 +10,30 @@ if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" =
 fi
 
 CONSOLE_UID=$(/usr/bin/id -u "$CONSOLE_USER")
-/bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 || true
-/bin/launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST"
-/bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.connector"
+run_as_console_user() {
+  /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" "$@"
+}
+
+# Package scripts run as root, but LaunchAgents belong to the signed-in user's
+# GUI bootstrap domain. Running launchctl as that user avoids macOS error 5.
+run_as_console_user /bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 \
+  || /bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 \
+  || true
+# bootout can return before launchd has fully removed the old job. Avoid an
+# immediate bootstrap race (macOS reports it as error 5).
+/bin/sleep 1
+if /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" >/dev/null 2>&1 \
+  || run_as_console_user /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" >/dev/null 2>&1; then
+  /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 \
+    || run_as_console_user /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 \
+    || true
+fi
 
 if [ -f "$CONFIG_ROOT/server-url.txt" ]; then
   SERVER_URL=$(/usr/bin/head -n 1 "$CONFIG_ROOT/server-url.txt")
   case "$SERVER_URL" in
     http://*|https://*)
-      /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/open "$SERVER_URL" >/dev/null 2>&1 || true
+      run_as_console_user /usr/bin/open "$SERVER_URL" >/dev/null 2>&1 || true
       ;;
   esac
 fi

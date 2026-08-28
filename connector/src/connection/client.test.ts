@@ -27,6 +27,7 @@ function config(port: number, connectTimeoutMs = 1_000): ConnectorConfig {
     stateDir: '/tmp/connector-client-test',
     connectTimeoutMs,
     executionTimeoutMs: 300_000,
+    codexWorkerCount: 3,
   }
 }
 

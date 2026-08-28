@@ -51,6 +51,13 @@ export type ConnectorConfig = {
   stateDir: string
   connectTimeoutMs: number
   executionTimeoutMs: number
+  codexWorkerCount: number
+}
+
+export function parseCodexWorkerCount(value: string | undefined): number {
+  const parsed = Number.parseInt(String(value || '3'), 10)
+  if (!Number.isFinite(parsed)) return 3
+  return Math.min(3, Math.max(1, parsed))
 }
 
 export function loadConfig(): ConnectorConfig {
@@ -93,7 +100,7 @@ export function loadConfig(): ConnectorConfig {
     deviceName: process.env.AI_STUDIO_DEVICE_NAME || saved.device_name || hostname(),
     deviceId,
     platform: process.platform,
-    connectorVersion: process.env.AI_STUDIO_CONNECTOR_VERSION || '0.2.0',
+    connectorVersion: process.env.AI_STUDIO_CONNECTOR_VERSION || '0.2.1',
     webOrigin,
     helperHost: '127.0.0.1',
     helperPort: Number(process.env.AI_STUDIO_HELPER_PORT || 39481),
@@ -109,6 +116,7 @@ export function loadConfig(): ConnectorConfig {
     stateDir: path.join(appSupportDir, 'state'),
     connectTimeoutMs: timeouts.connectTimeoutMs,
     executionTimeoutMs: timeouts.executionTimeoutMs,
+    codexWorkerCount: parseCodexWorkerCount(process.env.AI_STUDIO_CODEX_WORKERS),
   }
 }
 

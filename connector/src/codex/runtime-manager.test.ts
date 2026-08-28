@@ -57,6 +57,7 @@ function setup(account: any = null) {
     codexHome: path.join(root, 'codex-home'), appSupportDir: path.join(root, 'support'),
     managedCodexPath: managed, bundledCodexPath: bundled, useSystemCodex: false,
     stateDir: path.join(root, 'state'), connectTimeoutMs: 15_000, executionTimeoutMs: 300_000,
+    codexWorkerCount: 3,
   }
   let opened = ''
   let providerCreations = 0

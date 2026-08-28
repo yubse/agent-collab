@@ -9,8 +9,10 @@ import {
 import path from 'path'
 import { CodexProvider, type CodexAccountSnapshot } from '../../../src/providers/codex.ts'
 import type { AgentError, AgentEvent } from '../../../src/providers/provider.ts'
+import type { AgentSendOpts } from '../../../src/providers/provider.ts'
 import type { ConnectorConfig } from '../config/index.ts'
 import type { ConnectorStateStore, CodexStatus } from '../state/store.ts'
+import { PURE_CHAT_APP_SERVER_ARGS } from './options.ts'
 
 export type CodexRuntimeSnapshot = {
   runtimeInstalled: boolean
@@ -106,6 +108,7 @@ export class CodexRuntimeManager {
         binaryPath: binary,
         cwd: this.config.codexCwd,
         env,
+        extraArgs: [...PURE_CHAT_APP_SERVER_ARGS],
         onDiagnostic: (event) => {
           if (event.stream === 'process') console.error(`[codex] status=exited code=${event.exitCode ?? 'unknown'}`)
           else console.error('[codex] status=diagnostic')
@@ -241,12 +244,12 @@ export class CodexRuntimeManager {
     this.runtimeProvider?.onError(callback)
   }
   async warmup(): Promise<void> { await this.start() }
-  async send(text: string): Promise<void> {
+  async send(text: string, opts?: AgentSendOpts): Promise<void> {
     await this.start()
     if (this.current.status !== 'CODEX_READY') await this.refreshAuth()
     if (this.current.status !== 'CODEX_READY') throw new Error('CODEX_NOT_LOGGED_IN')
     this.runtimeProvider!.selectThread(this.selectedThread)
-    await this.runtimeProvider!.send(text)
+    await this.runtimeProvider!.send(text, opts)
   }
   async interrupt(): Promise<boolean> { return this.runtimeProvider?.interrupt() || false }
   async close(): Promise<void> { await this.stop() }

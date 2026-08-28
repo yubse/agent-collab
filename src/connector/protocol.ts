@@ -42,6 +42,10 @@ export type ExecutionTimings = {
   codex_started_at: string
   codex_finished_at: string
   execution_result_at: string
+  queue_wait_ms?: number
+  thread_ms?: number
+  codex_execution_ms?: number
+  total_ms?: number
 }
 
 export type ExecutionResult = {

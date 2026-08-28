@@ -1,8 +1,12 @@
 import type { ExecutionRequest, ExecutionResult, ExecutionTimings } from '../protocol.ts'
+import type { CodexExecutionHooks, CodexExecutionMetrics } from '../codex/executor.ts'
 import type { ConnectorStateStore } from '../state/store.ts'
 
 export type CodexExecutor = {
-  execute(request: ExecutionRequest): Promise<{ content: string; usage: Record<string, number> | null }>
+  execute(
+    request: ExecutionRequest,
+    hooks?: CodexExecutionHooks,
+  ): Promise<{ content: string; usage: Record<string, number> | null; metrics?: CodexExecutionMetrics }>
 }
 
 type ExecutionRecord = {
@@ -53,10 +57,9 @@ export class ExecutionRunner {
     if (record.result) return Promise.resolve(record.result)
     if (record.promise) return record.promise
 
-    record.codexStartedAt = new Date().toISOString()
     this.activeCount += 1
     this.state.setExecution('EXECUTION_RUNNING')
-    this.log(`[execution] request=${safeId(request.request_id)} state=codex_running at=${record.codexStartedAt}`)
+    this.log(`[execution] request=${safeId(request.request_id)} state=queued`)
     record.promise = this.executeOnce(record)
     return record.promise
   }
@@ -71,9 +74,16 @@ export class ExecutionRunner {
 
   private async executeOnce(record: ExecutionRecord): Promise<ExecutionResult> {
     const request = record.request
-    const startedMs = Date.parse(record.codexStartedAt!)
+    let startedMs = Date.now()
+    const markStarted = (startedAt: string) => {
+      if (record.codexStartedAt) return
+      record.codexStartedAt = startedAt
+      startedMs = Date.parse(startedAt)
+      this.log(`[execution] request=${safeId(request.request_id)} state=codex_running at=${startedAt}`)
+    }
     try {
-      const execution = await this.executor.execute(request)
+      const execution = await this.executor.execute(request, { onStarted: markStarted })
+      if (!record.codexStartedAt) markStarted(new Date(startedMs).toISOString())
       const finishedAt = new Date().toISOString()
       const resultAt = new Date().toISOString()
       const result: ExecutionResult = {
@@ -82,10 +92,10 @@ export class ExecutionRunner {
         status: 'success',
         content: execution.content,
         usage: execution.usage,
-        timings: this.timings(record, finishedAt, resultAt),
+        timings: this.timings(record, finishedAt, resultAt, execution.metrics),
       }
       record.result = result
-      this.logCompleted(request.request_id, startedMs, finishedAt, 'success')
+      this.logCompleted(request.request_id, startedMs, finishedAt, 'success', undefined, execution.metrics)
       this.activeCount -= 1
       if (this.activeCount === 0) this.state.setExecution('EXECUTION_IDLE')
       return result
@@ -94,6 +104,7 @@ export class ExecutionRunner {
       const errorCode = safeErrorCode(rawMessage)
       const finishedAt = new Date().toISOString()
       const resultAt = new Date().toISOString()
+      if (!record.codexStartedAt) markStarted(new Date(startedMs).toISOString())
       const result: ExecutionResult = {
         type: 'execution_result',
         request_id: request.request_id,
@@ -109,7 +120,8 @@ export class ExecutionRunner {
     }
   }
 
-  private timings(record: ExecutionRecord, finishedAt: string, resultAt: string): ExecutionTimings {
+  private timings(record: ExecutionRecord, finishedAt: string, resultAt: string, metrics?: CodexExecutionMetrics): ExecutionTimings {
+    const connectorTotalMs = Math.max(0, Date.parse(resultAt) - Date.parse(record.receivedAt))
     return {
       execution_request_at: record.request.created_at,
       execution_received_at: record.receivedAt,
@@ -117,12 +129,24 @@ export class ExecutionRunner {
       codex_started_at: record.codexStartedAt || record.receivedAt,
       codex_finished_at: finishedAt,
       execution_result_at: resultAt,
+      ...(metrics || {}),
+      total_ms: connectorTotalMs,
     }
   }
 
-  private logCompleted(requestId: string, startedMs: number, finishedAt: string, status: 'success' | 'error', error?: string): void {
+  private logCompleted(
+    requestId: string,
+    startedMs: number,
+    finishedAt: string,
+    status: 'success' | 'error',
+    error?: string,
+    metrics?: CodexExecutionMetrics,
+  ): void {
     const duration = Math.max(0, Date.parse(finishedAt) - startedMs)
-    this.log(`[execution] request=${safeId(requestId)} state=completed at=${finishedAt} duration_ms=${duration} status=${status}${error ? ` error=${error}` : ''}`)
+    const metricLog = metrics
+      ? ` queue_wait_ms=${metrics.queue_wait_ms} thread_ms=${metrics.thread_ms} codex_execution_ms=${metrics.codex_execution_ms} total_ms=${metrics.total_ms}`
+      : ''
+    this.log(`[execution] request=${safeId(requestId)} state=completed at=${finishedAt} duration_ms=${duration}${metricLog} status=${status}${error ? ` error=${error}` : ''}`)
   }
 
   private trimCompleted(): void {

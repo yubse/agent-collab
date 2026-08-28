@@ -1,6 +1,8 @@
 import { clearDeviceCredential, loadConfig, saveDevice } from './config/index.ts'
 import { LocalCodexExecutor } from './codex/executor.ts'
 import { CodexRuntimeManager } from './codex/runtime-manager.ts'
+import { PURE_CHAT_APP_SERVER_ARGS } from './codex/options.ts'
+import { CodexProvider } from '../../src/providers/codex.ts'
 import { ExecutionRunner } from './execution/runner.ts'
 import { runConnector } from './connection/client.ts'
 import { PairingService } from './pairing/service.ts'
@@ -15,12 +17,29 @@ export async function main(): Promise<never> {
 
   const runtime = new CodexRuntimeManager(config, state)
 
+  const codexBinary = config.useSystemCodex ? config.codexBinary : config.managedCodexPath
+  const providers = [
+    runtime,
+    ...Array.from({ length: config.codexWorkerCount - 1 }, (_, index) => new CodexProvider({
+      label: `connector:managed-app-server-worker-${index + 2}`,
+      binaryPath: codexBinary,
+      cwd: config.codexCwd,
+      env: { CODEX_HOME: config.codexHome },
+      extraArgs: [...PURE_CHAT_APP_SERVER_ARGS],
+      onDiagnostic: (event) => {
+        if (event.stream === 'process') console.error(`[codex] worker=${index + 2} status=exited code=${event.exitCode ?? 'unknown'}`)
+        else console.error(`[codex] worker=${index + 2} status=diagnostic`)
+      },
+    })),
+  ]
+
   const executor = new LocalCodexExecutor({
     binary: config.managedCodexPath,
     cwd: config.codexCwd,
     stateDir: config.stateDir,
     executionTimeoutMs: config.executionTimeoutMs,
-  }, undefined, runtime)
+  }, undefined, providers)
+  console.log(`[codex] worker_pool=${executor.workerCount}`)
   const runner = new ExecutionRunner(executor, state)
   let connectorController: AbortController | null = null
   const ensureConnector = () => {
@@ -117,7 +136,7 @@ export async function main(): Promise<never> {
   helper.start()
   console.log(`[helper] status=online address=http://${helper.hostname}:${helper.port}`)
 
-  void runtime.start().catch((error: any) => console.error(`[codex] status=prepare_failed code=${safeCodexCode(error?.message)}`))
+  void executor.warmup().catch((error: any) => console.error(`[codex] status=prepare_failed code=${safeCodexCode(error?.message)}`))
   ensureConnector()
   if (config.pairingToken) {
     try { await completeClaim(config.pairingToken) }
