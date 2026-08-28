@@ -4,7 +4,7 @@ import { LocalHelperServer, type LocalHelperStatus } from './server.ts'
 const origin = 'http://192.168.20.200:3998'
 const status: LocalHelperStatus = {
   helper: 'online',
-  device: { bound: false, device_name: 'Tina MacBook Pro' },
+  device: { bound: false, device_id: 'dev_tina-mac', device_name: 'Tina MacBook Pro' },
   server: { connected: false },
   platform: 'macos',
   connector_version: '0.1.0',
@@ -15,7 +15,7 @@ let helper: LocalHelperServer | null = null
 afterEach(() => { helper?.stop(); helper = null })
 
 function startHelper(
-  claim: (claimToken: string) => Promise<{ bound: boolean; already_bound: boolean }> = async () => ({ bound: true, already_bound: false }),
+  claim: (claimToken: string, requestId: string | null) => Promise<{ bound: boolean; already_bound: boolean }> = async () => ({ bound: true, already_bound: false }),
   codexLogin: () => Promise<{ started: true; status: 'CODEX_AUTHENTICATING' }> = async () => ({ started: true, status: 'CODEX_AUTHENTICATING' }),
 ) {
   helper = new LocalHelperServer({ port: 0, allowedOrigin: origin, status: () => status, claim, codexLogin })
@@ -32,8 +32,10 @@ test('test_local_helper_status', async () => {
 
 test('test_local_helper_does_not_expose_credentials', async () => {
   let received = ''
-  const base = startHelper(async (token) => {
+  let receivedRequestId: string | null = null
+  const base = startHelper(async (token, requestId) => {
     received = token
+    receivedRequestId = requestId
     return { bound: true, already_bound: false }
   })
   const result = await (await fetch(`${base}/status`, { headers: { origin } })).json() as any
@@ -41,9 +43,10 @@ test('test_local_helper_does_not_expose_credentials', async () => {
   const claimed = await (await fetch(`${base}/claim`, {
     method: 'POST',
     headers: { origin, 'content-type': 'application/json' },
-    body: JSON.stringify({ claim_token: 'local-claim-token' }),
+    body: JSON.stringify({ claim_token: 'local-claim-token', request_id: 'claim_trace_1' }),
   })).json() as any
   expect(received).toBe('local-claim-token')
+  expect(receivedRequestId).toBe('claim_trace_1')
   expect(claimed).toEqual({ ok: true, bound: true, already_bound: false })
   expect(JSON.stringify(claimed)).not.toMatch(/credential|device_token/i)
 })

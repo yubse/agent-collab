@@ -13,8 +13,8 @@ export type HelperCodexStatus = {
 
 export type LocalHelperStatus = {
   helper: 'online'
-  device: { bound: boolean; device_name: string }
-  server: { connected: boolean }
+  device: { bound: boolean; device_id: string; device_name: string }
+  server: { connected: boolean; error_code?: string | null }
   platform: string
   connector_version: string
   codex: HelperCodexStatus
@@ -25,7 +25,7 @@ export type LocalHelperServerOptions = {
   port?: number
   allowedOrigin: string
   status: () => LocalHelperStatus
-  claim: (claimToken: string) => Promise<{ bound: boolean; already_bound: boolean }>
+  claim: (claimToken: string, requestId: string | null) => Promise<{ bound: boolean; already_bound: boolean }>
   codexLogin: () => Promise<{ started: true; status: 'CODEX_AUTHENTICATING' }>
   codexRestart?: () => Promise<void>
 }
@@ -89,8 +89,9 @@ export class LocalHelperServer {
           })
         }
         const claimToken = typeof body.claim_token === 'string' ? body.claim_token.trim() : ''
+        const requestId = safeRequestId(body.request_id)
         if (!claimToken) throw new Error('claim_token required')
-        const result = await this.options.claim(claimToken)
+        const result = await this.options.claim(claimToken, requestId)
         return Response.json({ ok: true, ...result }, { headers: this.corsHeaders(false) })
       } catch (error: any) {
         return Response.json({ ok: false, error: safeClaimError(error?.message) }, {
@@ -149,8 +150,14 @@ export class LocalHelperServer {
 
 function safeClaimError(message: string): string {
   if (message === 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER') return message
-  if (/invalid|expired/i.test(message)) return 'CLAIM_TOKEN_INVALID_OR_EXPIRED'
+  if (/invalid|expired/i.test(message)) return 'CLAIM_TOKEN_REJECTED'
+  if (/DEVICE_CREDENTIAL_SAVE_FAILED/i.test(message)) return 'DEVICE_CREDENTIAL_SAVE_FAILED'
   return 'CLAIM_FAILED'
+}
+
+function safeRequestId(value: unknown): string | null {
+  const id = String(value || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
+  return id || null
 }
 
 function safeCodexError(message: string): string {

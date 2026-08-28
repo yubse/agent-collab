@@ -2582,6 +2582,15 @@ function connectorWebsocketUrl(req: Request): string {
   return incoming.toString()
 }
 
+function safeConnectorTraceId(value: unknown): string {
+  return String(value || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100) || 'unknown'
+}
+
+function connectorClaimRequestId(req: Request): string {
+  const provided = safeConnectorTraceId(req.headers.get('x-aistudio-claim-request-id'))
+  return provided === 'unknown' ? `claim_${randomBytes(8).toString('hex')}` : provided
+}
+
 // Image HTTP server for upload/download
 Bun.serve<ConnectorSocketData>({
   port: IMG_PORT,
@@ -2679,6 +2688,7 @@ Bun.serve<ConnectorSocketData>({
     }
 
     if (req.method === 'POST' && (url.pathname === '/api/connectors/pairing/complete' || url.pathname === '/api/connectors/claim/complete')) {
+      const requestId = connectorClaimRequestId(req)
       try {
         // This endpoint returns the raw device credential once. Refuse browser
         // fetches so Web UI code can never receive or persist that credential.
@@ -2693,6 +2703,7 @@ Bun.serve<ConnectorSocketData>({
         if ('user_id' in body || 'username' in body) {
           return Response.json({ ok: false, error: 'connector user identity is not accepted' }, { status: 400 })
         }
+        console.error(`[connector-claim] request=${requestId} stage=complete_received`)
         const paired = completePairingRequest(db, {
           pairingToken: String(url.pathname.endsWith('/claim/complete') ? body.claim_token || '' : body.pairing_token || ''),
           deviceId: String(body.device_id || ''),
@@ -2700,6 +2711,7 @@ Bun.serve<ConnectorSocketData>({
           platform: String(body.platform || ''),
           connectorVersion: String(body.connector_version || ''),
         })
+        console.error(`[connector-claim] request=${requestId} user=${safeConnectorTraceId(paired.device.user_id)} device=${safeConnectorTraceId(paired.device.id)} stage=device_saved credential_issued=true`)
         return Response.json({
           ok: true,
           device: paired.device,
@@ -2712,6 +2724,7 @@ Bun.serve<ConnectorSocketData>({
         const code = error?.message === 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER'
           ? 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER'
           : 'PAIRING_FAILED'
+        console.error(`[connector-claim] request=${requestId} stage=complete_rejected code=${code}`)
         return Response.json({ ok: false, code, error: error?.message || 'pairing failed' }, { status: code === 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER' ? 409 : 400 })
       }
     }
@@ -2841,9 +2854,12 @@ Bun.serve<ConnectorSocketData>({
     }
 
     if (req.method === 'POST' && url.pathname === '/api/connectors/claim/start' && isAuthed) {
+      const requestId = connectorClaimRequestId(req)
       const claim = createClaimRequest(db, currentUser!.id)
+      console.error(`[connector-claim] request=${requestId} user=${safeConnectorTraceId(currentUser!.id)} stage=start_created http_status=201 expires_at=${claim.expiresAt} used=false`)
       return Response.json({
         ok: true,
+        request_id: requestId,
         claim_token: claim.pairingToken,
         expires_at: claim.expiresAt,
       }, { status: 201 })
@@ -4676,6 +4692,7 @@ Bun.serve<ConnectorSocketData>({
           }
           const device = authenticateDevice(db, parsed.device_token)
           if (!device) {
+            console.error('[connector-auth] device=unknown user=unknown stage=rejected code=WEBSOCKET_AUTH_FAILED')
             ws.send(JSON.stringify({ type: 'hello_ack', status: 'error', error: 'invalid device token' }))
             ws.close(4003, 'authentication failed')
             return
@@ -4689,6 +4706,7 @@ Bun.serve<ConnectorSocketData>({
             socket: ws,
           })
           setDeviceStatus(db, device.id, 'online')
+          console.error(`[connector-auth] device=${safeConnectorTraceId(device.id)} user=${safeConnectorTraceId(device.user_id)} stage=authenticated registry=online`)
           ws.send(JSON.stringify({
             type: 'hello_ack',
             status: 'ok',

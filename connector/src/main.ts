@@ -29,25 +29,38 @@ export async function main(): Promise<never> {
     void runConnector(config, () => deviceToken || '', runner, state)
   }
 
-  const completeClaim = async (claimToken: string): Promise<{ bound: boolean; already_bound: boolean }> => {
+  const completeClaim = async (claimToken: string, incomingRequestId: string | null = null): Promise<{ bound: boolean; already_bound: boolean }> => {
     if (claimInFlight) return claimInFlight
+    const requestId = safeTraceId(incomingRequestId) || `claim_${Date.now()}`
     claimInFlight = (async () => {
-      console.log('[helper] claim=received')
+      console.log(`[connector-claim] request=${requestId} stage=helper_received`)
       const pairing = new PairingService(config.serverUrl)
+      console.log(`[connector-claim] request=${requestId} stage=server_submit_started`)
       const paired = await pairing.complete({
         pairingToken: claimToken,
         deviceId: config.deviceId,
         deviceName: config.deviceName,
         platform: config.platform,
         connectorVersion: config.connectorVersion,
+        requestId,
       })
       deviceToken = paired.deviceCredential
       if (paired.connectorWsUrl && !config.connectorWsUrl) config.connectorWsUrl = paired.connectorWsUrl
-      saveDevice(config, paired.deviceCredential, paired.connectorWsUrl)
+      try {
+        saveDevice(config, paired.deviceCredential, paired.connectorWsUrl)
+      } catch {
+        console.error(`[connector-claim] request=${requestId} stage=credential_save_failed`)
+        throw new Error('DEVICE_CREDENTIAL_SAVE_FAILED')
+      }
+      console.log(`[connector-claim] request=${requestId} stage=credential_saved`)
       ensureConnector()
-      console.log(`[helper] claim=${paired.alreadyBound ? 'already_bound' : 'bound'}`)
+      console.log(`[connector-claim] request=${requestId} stage=websocket_starting`)
+      console.log(`[connector-claim] request=${requestId} stage=${paired.alreadyBound ? 'already_bound' : 'device_bound'}`)
       return { bound: true, already_bound: paired.alreadyBound }
-    })().finally(() => { claimInFlight = null })
+    })().catch((error) => {
+      console.error(`[connector-claim] request=${requestId} stage=failed code=${safeClaimCode(error?.message)}`)
+      throw error
+    }).finally(() => { claimInFlight = null })
     return claimInFlight
   }
 
@@ -60,8 +73,11 @@ export async function main(): Promise<never> {
       const codex = runtime.snapshot()
       return {
         helper: 'online',
-        device: { bound: Boolean(deviceToken), device_name: config.deviceName },
-        server: { connected: snapshot.server === 'SERVER_CONNECTED' },
+        device: { bound: Boolean(deviceToken), device_id: config.deviceId, device_name: config.deviceName },
+        server: {
+          connected: snapshot.server === 'SERVER_CONNECTED',
+          error_code: safeServerErrorCode(snapshot.serverError),
+        },
         platform: config.platform === 'darwin' ? 'macos' : config.platform,
         connector_version: config.connectorVersion,
         codex: {
@@ -107,4 +123,15 @@ function safeClaimCode(message: string): string {
   if (message === 'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER') return message
   if (/invalid|expired/i.test(message)) return 'CLAIM_TOKEN_INVALID_OR_EXPIRED'
   return 'CLAIM_FAILED'
+}
+
+function safeTraceId(value: string | null): string | null {
+  const id = String(value || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
+  return id || null
+}
+
+function safeServerErrorCode(message: string | null): string | null {
+  if (!message) return null
+  if (/authentication|device token|before authentication/i.test(message)) return 'WEBSOCKET_AUTH_FAILED'
+  return 'SERVER_CONNECTION_FAILED'
 }

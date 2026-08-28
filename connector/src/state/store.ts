@@ -10,6 +10,7 @@ export type ExecutionStatus = 'EXECUTION_IDLE' | 'EXECUTION_RUNNING' | 'EXECUTIO
 
 export type ConnectorState = {
   server: ServerStatus
+  serverError: string | null
   codex: CodexStatus
   execution: ExecutionStatus
   lastError: string | null
@@ -21,6 +22,7 @@ export type ConnectorStateListener = (state: Readonly<ConnectorState>) => void
 export class ConnectorStateStore {
   private state: ConnectorState = {
     server: 'SERVER_DISCONNECTED',
+    serverError: null,
     codex: 'CODEX_RUNTIME_NOT_INSTALLED',
     execution: 'EXECUTION_IDLE',
     lastError: null,
@@ -37,7 +39,7 @@ export class ConnectorStateStore {
   }
 
   setServer(server: ServerStatus, error: string | null = null): void {
-    this.update({ server, lastError: error })
+    this.update({ server, serverError: error, lastError: error })
   }
 
   setCodex(codex: CodexStatus, error: string | null = null): void {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { PairingService, pairingTokenFromLaunchArgs } from './service.ts'
+import { PairingService, pairingTokenFromLaunchArgs, safeConnectorWebsocketUrl } from './service.ts'
 
 describe('PairingService', () => {
   test('parses CLI and future Tauri deep-link inputs', () => {
@@ -10,13 +10,13 @@ describe('PairingService', () => {
   })
 
   test('automatically completes pairing without sending a user identity', async () => {
-    const requests: Array<{ pathname: string; body: any }> = []
+    const requests: Array<{ pathname: string; body: any; requestId: string | null }> = []
     const server = Bun.serve({
       port: 0,
       async fetch(request) {
         const url = new URL(request.url)
         const body = await request.json() as any
-        requests.push({ pathname: url.pathname, body })
+        requests.push({ pathname: url.pathname, body, requestId: request.headers.get('x-aistudio-claim-request-id') })
         return Response.json({
           ok: true,
           already_bound: false,
@@ -33,6 +33,7 @@ describe('PairingService', () => {
         deviceName: 'Liu Ting Mac',
         platform: 'darwin',
         connectorVersion: '0.1.0',
+        requestId: 'claim_trace_1',
       })
       expect(confirmed.deviceCredential).toBe('device-credential-only-after-confirm')
       expect(confirmed.connectorWsUrl).toBe(`ws://127.0.0.1:${server.port}/connector`)
@@ -40,6 +41,7 @@ describe('PairingService', () => {
       expect(requests).toEqual([
         {
           pathname: '/api/connectors/claim/complete',
+          requestId: 'claim_trace_1',
           body: {
             claim_token: 'secret-pairing-token',
             device_id: 'dev_local-installation',
@@ -52,5 +54,12 @@ describe('PairingService', () => {
     } finally {
       server.stop(true)
     }
+  })
+
+  test('ignores an advertised websocket URL with the wrong port', () => {
+    expect(safeConnectorWebsocketUrl(
+      'http://192.168.20.200:3998',
+      'ws://192.168.20.200/connector',
+    )).toBe('ws://192.168.20.200:3998/connector')
   })
 })

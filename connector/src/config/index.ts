@@ -3,7 +3,7 @@ import path from 'path'
 import { homedir, hostname } from 'os'
 import { randomUUID } from 'crypto'
 import { loadConnectorTimeouts } from '../../../src/connector/timeouts.ts'
-import { pairingTokenFromLaunchArgs } from '../pairing/service.ts'
+import { pairingTokenFromLaunchArgs, safeConnectorWebsocketUrl } from '../pairing/service.ts'
 
 type SavedDevice = {
   server_url?: string
@@ -72,6 +72,8 @@ export function loadConfig(): ConnectorConfig {
   const timeouts = loadConnectorTimeouts()
   const serverUrl = (process.env.AI_STUDIO_SERVER_URL || installed.server_url || saved.server_url || '').replace(/\/$/, '')
   if (!serverUrl) throw new Error('AI_STUDIO_SERVER_URL is required, for example http://nas.local:3998')
+  const connectorWsUrl = process.env.CONNECTOR_WS_URL
+    || (saved.connector_ws_url ? safeConnectorWebsocketUrl(serverUrl, saved.connector_ws_url) : null)
   const webOrigin = process.env.AI_STUDIO_WEB_ORIGIN || installed.web_origin || new URL(serverUrl).origin
   const deviceId = process.env.AI_STUDIO_DEVICE_ID || saved.device_id || `dev_${randomUUID()}`
   mkdirSync(credentialsDir, { recursive: true, mode: 0o700 })
@@ -87,7 +89,7 @@ export function loadConfig(): ConnectorConfig {
   mkdirSync(workspaceDir, { recursive: true, mode: 0o700 })
   return {
     serverUrl,
-    connectorWsUrl: process.env.CONNECTOR_WS_URL || saved.connector_ws_url || null,
+    connectorWsUrl,
     deviceName: process.env.AI_STUDIO_DEVICE_NAME || saved.device_name || hostname(),
     deviceId,
     platform: process.platform,

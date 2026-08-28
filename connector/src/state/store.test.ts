@@ -15,5 +15,8 @@ describe('ConnectorStateStore', () => {
     })
     store.setExecution('EXECUTION_ERROR', 'network unavailable')
     expect(store.snapshot().lastError).toBe('network unavailable')
+    store.setServer('SERVER_DISCONNECTED', 'connector authentication failed')
+    store.setCodex('CODEX_READY')
+    expect(store.snapshot().serverError).toBe('connector authentication failed')
   })
 })

@@ -3049,29 +3049,83 @@ async function loadLocalHelperStatus() {
 }
 async function connectThisComputer() {
   if (connectorPairingState.status === 'creating') return;
+  const requestId = `claim_${crypto.randomUUID ? crypto.randomUUID() : Date.now()}`;
+  const trace = (stage, details = {}) => console.info('[connector-claim]', { request_id: requestId, stage, ...details });
+  trace('button_clicked');
   if (!localHelperStatus.available) {
-    connectorPairingState = { status: 'not-installed', startingDeviceIds: connectorDevices.map(device => device.id) };
+    trace('failed', { code: 'LOCAL_HELPER_UNREACHABLE' });
+    connectorPairingState = { status: 'error', error: 'LOCAL_HELPER_UNREACHABLE', startingDeviceIds: connectorDevices.map(device => device.id) };
     renderAppSettings();
     return;
   }
   connectorPairingState = { status: 'creating', startingDeviceIds: connectorDevices.map(device => device.id) };
   renderAppSettings();
   try {
-    const claim = await apiJson('/api/connectors/claim/start', { method: 'POST', body: '{}' });
-    if (!claim?.ok || !claim.claim_token) throw new Error(claim?.error || '无法创建连接请求');
-    const response = await fetch(`${LOCAL_HELPER_URL}/claim`, {
+    const claimResponse = await fetch('/api/connectors/claim/start', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ claim_token: claim.claim_token }),
+      headers: { 'Content-Type': 'application/json', 'X-AIStudio-Claim-Request-ID': requestId },
+      body: '{}',
     });
+    const claim = await claimResponse.json().catch(() => ({}));
+    trace('claim_start_response', { http_status: claimResponse.status, authenticated_user_id: currentProfile?.id || null });
+    if (!claimResponse.ok || !claim?.claim_token) throw connectorClaimError('CLAIM_START_FAILED');
+    let response;
+    try {
+      response = await fetch(`${LOCAL_HELPER_URL}/claim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ claim_token: claim.claim_token, request_id: claim.request_id || requestId }),
+      });
+    } catch {
+      let helperStillReachable = false;
+      try { helperStillReachable = (await fetch(`${LOCAL_HELPER_URL}/status`, { cache: 'no-store' })).ok; } catch {}
+      throw connectorClaimError(helperStillReachable ? 'LOCAL_HELPER_CORS_FAILED' : 'LOCAL_HELPER_UNREACHABLE');
+    }
     const result = await response.json().catch(() => ({}));
-    if (!response.ok || !result?.ok) throw new Error(result?.error || 'Helper 连接失败');
-    connectorPairingState = { status: 'connected', startingDeviceIds: connectorDevices.map(device => device.id) };
-    await Promise.all([loadConnectorDevices(), loadLocalHelperStatus()]);
+    trace('local_helper_claim_response', { http_status: response.status, ok: response.ok });
+    if (!response.ok || !result?.ok) {
+      const allowed = new Set(['CLAIM_TOKEN_REJECTED', 'DEVICE_CREDENTIAL_SAVE_FAILED']);
+      throw connectorClaimError(allowed.has(result?.error) ? result.error : 'CLAIM_TOKEN_REJECTED');
+    }
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      await Promise.all([loadConnectorDevices(), loadLocalHelperStatus()]);
+      const currentDeviceId = localHelperStatus.data?.device?.device_id;
+      const currentDevice = connectorDevices.find(device => device.id === currentDeviceId);
+      if (currentDevice?.status === 'online' && localHelperStatus.data?.server?.connected === true) {
+        trace('registry_online', { device_id: currentDevice.id, user_id: currentDevice.user_id });
+        connectorPairingState = { status: 'connected', startingDeviceIds: connectorDevices.map(device => device.id), deviceId: currentDevice.id };
+        renderAppSettings();
+        return;
+      }
+      if (localHelperStatus.data?.server?.error_code === 'WEBSOCKET_AUTH_FAILED') {
+        throw connectorClaimError('WEBSOCKET_AUTH_FAILED');
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    throw connectorClaimError('CONNECTOR_REGISTRY_OFFLINE');
   } catch (e) {
-    connectorPairingState = { status: 'error', error: e.message || String(e), startingDeviceIds: connectorDevices.map(device => device.id) };
+    const code = e?.code || e?.message || 'CONNECTOR_REGISTRY_OFFLINE';
+    trace('failed', { code });
+    connectorPairingState = { status: 'error', error: code, startingDeviceIds: connectorDevices.map(device => device.id) };
     renderAppSettings();
   }
+}
+function connectorClaimError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+function connectorClaimErrorText(code) {
+  return {
+    CLAIM_START_FAILED: '无法向 AI Studio 创建连接请求',
+    LOCAL_HELPER_UNREACHABLE: '无法访问本机 AI Studio Helper',
+    LOCAL_HELPER_CORS_FAILED: '浏览器被本机 Helper 的安全策略拒绝',
+    CLAIM_TOKEN_REJECTED: '一次性连接请求无效或已过期',
+    DEVICE_CREDENTIAL_SAVE_FAILED: '设备凭据无法安全保存',
+    WEBSOCKET_AUTH_FAILED: 'Connector WebSocket 身份验证失败',
+    CONNECTOR_REGISTRY_OFFLINE: '设备已绑定，但 Connector 尚未在服务器上线',
+  }[code] || code || '连接失败';
 }
 function installLocalHelper() {
   showWipToast('请安装 AI-Studio-Helper.pkg；安装完成后本页会自动检测');
@@ -3177,7 +3231,8 @@ function renderAppSettings() {
   if (devicesBox) {
     const helper = localHelperStatus.data;
     const codexReady = helper?.codex?.status === 'CODEX_READY';
-    const onlineDevice = connectorDevices.find(device => device.status === 'online');
+    const currentHelperDeviceId = helper?.device?.device_id;
+    const onlineDevice = connectorDevices.find(device => device.id === currentHelperDeviceId && device.status === 'online');
     const deviceRows = connectorDevices.length ? connectorDevices.map(device => `<div style="display:flex; align-items:center; gap:9px; padding:7px 0; border-top:1px solid var(--border-2);">
       <span style="width:8px;height:8px;border-radius:50%;background:${device.status === 'online' ? 'var(--good)' : 'var(--ink-3)'};"></span>
       <span style="flex:1;color:var(--ink);">${esc(device.device_name)}</span>
@@ -3227,7 +3282,7 @@ function renderAppSettings() {
           : connectorPairingState.status === 'connected'
             ? '<div style="margin-top:9px;color:var(--good);font-weight:600;">连接成功，设备列表已自动更新。</div>'
             : connectorPairingState.status === 'error'
-              ? `<div style="margin-top:9px;color:var(--bad);">${esc(connectorPairingState.error || '无法发起连接')}</div>`
+              ? `<div style="margin-top:9px;color:var(--bad);">${esc(connectorClaimErrorText(connectorPairingState.error))}<div style="margin-top:3px;font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--ink-3);">${esc(connectorPairingState.error || '')}</div></div>`
               : '';
     devicesBox.innerHTML = helperLayer + codexLayer + stateMessage;
   }
