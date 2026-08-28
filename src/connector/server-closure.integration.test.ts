@@ -26,7 +26,8 @@ function spawnServer(): Subprocess<'ignore', 'pipe', 'pipe'> {
       AICOLLAB_DATABASE_PATH: path.join(tempRoot, 'data', 'chat.db'),
       AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD: adminPassword,
       PRODUCT_PROVIDER: 'remote-codex', CREATIVE_PROVIDER: 'remote-codex',
-      SOCIAL_PROVIDER: 'remote-codex', GROWTH_PROVIDER: 'remote-codex',
+      BRAND_PROVIDER: 'remote-codex', CONTENT_PROVIDER: 'remote-codex', MARKET_PROVIDER: 'remote-codex',
+      MODERATOR_PROVIDER: 'remote-codex', DIRECTOR_PROVIDER: 'remote-codex',
     },
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
   })
@@ -69,7 +70,7 @@ async function json(response: Response): Promise<any> {
 
 type TestConnector = { ws: WebSocket; requests: any[]; token: string; close(): Promise<void> }
 
-async function pairConnector(cookie: string, name: string, answer: string): Promise<TestConnector> {
+async function pairConnector(cookie: string, name: string, answer: string | ((request: any) => string)): Promise<TestConnector> {
   const pairing = await json(await api('/api/connectors/claim/start', cookie, { method: 'POST', body: '{}' }))
   const paired = await json(await api('/api/connectors/claim/complete', '', {
     method: 'POST', body: JSON.stringify({
@@ -83,7 +84,7 @@ async function pairConnector(cookie: string, name: string, answer: string): Prom
   return openConnector(paired.device_credential, name, answer)
 }
 
-function openConnector(token: string, name: string, answer: string): Promise<TestConnector> {
+function openConnector(token: string, name: string, answer: string | ((request: any) => string)): Promise<TestConnector> {
   return new Promise((resolve, reject) => {
     const requests: any[] = []
     const ws = new WebSocket(`ws://127.0.0.1:${port}/connector`)
@@ -106,13 +107,14 @@ function openConnector(token: string, name: string, answer: string): Promise<Tes
       }
       if (message.type === 'execution_request') {
         requests.push(message)
+        const content = typeof answer === 'function' ? answer(message) : answer
         ws.send(JSON.stringify({
           type: 'execution_ack', request_id: message.request_id,
           status: 'running', acknowledged_at: new Date().toISOString(),
         }))
         ws.send(JSON.stringify({
           type: 'execution_result', request_id: message.request_id,
-          status: 'success', content: answer, usage: null,
+          status: 'success', content, usage: { input_tokens: 123, output_tokens: 40 },
         }))
       }
     })
@@ -123,6 +125,13 @@ function openConnector(token: string, name: string, answer: string): Promise<Tes
 async function defaultConversation(cookie: string): Promise<string> {
   const data = await json(await api('/api/conversations', cookie))
   return data.conversations.find((item: any) => item.is_default)?.id
+}
+
+async function freeConversation(cookie: string, name: string): Promise<string> {
+  const data = await json(await api('/groups', cookie, {
+    method: 'POST', body: JSON.stringify({ name, member_ids: ['content'] }),
+  }))
+  return data.group.id
 }
 
 async function waitForMessage(cookie: string, conversationId: string, expected: string): Promise<any> {
@@ -158,25 +167,25 @@ afterAll(async () => {
 
 describe('Server → Connector → Conversation closure', () => {
   test('test_existing_credential_reconnects and preserves per-user execution closure', async () => {
-    const convA = await defaultConversation(userACookie)
-    const convB = await defaultConversation(userBCookie)
+    const convA = await freeConversation(userACookie, 'Connector closure A')
+    const convB = await freeConversation(userBCookie, 'Connector closure B')
     const connectorA = await pairConnector(userACookie, 'Connector A', 'CONNECTOR_OK_A')
     const connectorB = await pairConnector(userBCookie, 'Connector B', 'CONNECTOR_OK_B')
 
     await json(await api('/group/send', userACookie, {
-      method: 'POST', body: JSON.stringify({ conversation_id: convA, text: '@social test A', mentions: ['social'] }),
+      method: 'POST', body: JSON.stringify({ conversation_id: convA, text: '@content test A', mentions: ['content'] }),
     }))
     await waitForMessage(userACookie, convA, 'CONNECTOR_OK_A')
     expect(connectorA.requests).toHaveLength(1)
-    expect(connectorA.requests[0]).toMatchObject({ user_id: userA.id, conversation_id: convA, agent_id: 'social' })
+    expect(connectorA.requests[0]).toMatchObject({ user_id: userA.id, conversation_id: convA, agent_id: 'content' })
     expect(connectorB.requests).toHaveLength(0)
 
     await json(await api('/group/send', userBCookie, {
-      method: 'POST', body: JSON.stringify({ conversation_id: convB, text: '@social test B', mentions: ['social'] }),
+      method: 'POST', body: JSON.stringify({ conversation_id: convB, text: '@content test B', mentions: ['content'] }),
     }))
     await waitForMessage(userBCookie, convB, 'CONNECTOR_OK_B')
     expect(connectorB.requests).toHaveLength(1)
-    expect(connectorB.requests[0]).toMatchObject({ user_id: userB.id, conversation_id: convB, agent_id: 'social' })
+    expect(connectorB.requests[0]).toMatchObject({ user_id: userB.id, conversation_id: convB, agent_id: 'content' })
     expect(connectorA.requests).toHaveLength(1)
 
     expect((await api(`/api/conversations/${encodeURIComponent(convA)}/messages`, userBCookie)).status).toBe(404)
@@ -207,11 +216,53 @@ describe('Server → Connector → Conversation closure', () => {
   }, 15_000)
 
   test('returns CODEX_CONNECTOR_OFFLINE immediately without local fallback', async () => {
-    const convA = await defaultConversation(userACookie)
+    const convA = await freeConversation(userACookie, 'Connector offline')
     const response = await json(await api('/group/send', userACookie, {
-      method: 'POST', body: JSON.stringify({ conversation_id: convA, text: '@social offline', mentions: ['social'] }),
+      method: 'POST', body: JSON.stringify({ conversation_id: convA, text: '@content offline', mentions: ['content'] }),
     }))
-    expect(response.record.delivery.failed).toContain('social')
-    expect(response.record.delivery.errors.social).toBe('CODEX_CONNECTOR_OFFLINE')
+    expect(response.record.delivery.failed).toContain('content')
+    expect(response.record.delivery.errors.content).toBe('CODEX_CONNECTOR_OFFLINE')
   })
+
+  test('creative discussion is capped at ten rounds with moderator-selected followups', async () => {
+    const conversationId = await defaultConversation(userACookie)
+    const connector = await pairConnector(userACookie, 'Creative Discussion Connector', (request) => {
+      const prompt = String(request.prompt || '')
+      if (request.agent_id === 'moderator' && prompt.includes('第7/10轮')) {
+        return '@奇想创意家 与 @市场现实校准员 围绕新鲜感和接受度继续正面讨论。'
+      }
+      if (request.agent_id === 'moderator' && prompt.includes('第9/10轮')) {
+        return '@产品创意策划 与 @内容传播策划 做最后修正，别再扩展新方向。'
+      }
+      if (request.agent_id === 'director') {
+        return 'TOP1 仪式化开箱：兼具记忆和传播；TOP2 可共创IP：能沉淀资产；TOP3 场景化隐藏款：购买理由清晰。保留因差异化与可落地，淘汰同质化且解释成本高的方向。'
+      }
+      return '@奇想创意家 我支持保留创意核，并补充一条本轮相关的新判断。'
+    })
+
+    await json(await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: conversationId, text: '为年轻消费者设计一个愿意主动分享的节日礼盒' }),
+    }))
+    const deadline = Date.now() + 10_000
+    let snapshot: any = null
+    while (Date.now() < deadline) {
+      snapshot = await json(await api(`/api/creative-discussions/current?conversation_id=${encodeURIComponent(conversationId)}`, userACookie))
+      if (snapshot.discussion?.status === 'completed') break
+      await Bun.sleep(20)
+    }
+    expect(snapshot?.discussion?.status).toBe('completed')
+    expect(snapshot.rounds).toHaveLength(10)
+    expect(snapshot.rounds.every((round: any) => round.status === 'completed')).toBe(true)
+    expect(snapshot.rounds.every((round: any) => typeof round.duration_ms === 'number')).toBe(true)
+    expect(snapshot.rounds.every((round: any) => round.prompt_tokens > 0)).toBe(true)
+    expect(snapshot.rounds[6].agents).toEqual(['moderator', 'creative', 'market'])
+    expect(snapshot.rounds[8].agents).toEqual(['moderator', 'product', 'content'])
+    expect(connector.requests).toHaveLength(17)
+    expect(connector.requests.every((request) => String(request.prompt).includes('[最近必要消息]'))).toBe(true)
+    expect(connector.requests.every((request) => !String(request.prompt).includes('[当前 Conversation 近期上下文]'))).toBe(true)
+    expect(Math.max(...connector.requests.map((request) => String(request.prompt).length))).toBeLessThan(8_000)
+    const messages = (await json(await api(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, userACookie))).messages
+    expect(messages.filter((message: any) => message.text.includes('TOP1')).length).toBe(1)
+    await connector.close()
+  }, 15_000)
 })

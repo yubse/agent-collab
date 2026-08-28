@@ -55,6 +55,19 @@ import { dangerousEndpointFor, hasRemoteControlConfirm, logDangerousOperation } 
 import { runMigrations, LEGACY_ADMIN_ID } from './src/db/migrations.ts'
 import { UserRepository } from './src/data/user-repository.ts'
 import {
+  CREATIVE_AGENTS,
+  CREATIVE_AGENT_BY_ID,
+  CREATIVE_AGENT_IDS,
+  CREATIVE_DISCUSSION_MAX_ROUNDS,
+  CREATIVE_DISCUSSION_ROUNDS,
+  buildCreativeDiscussionPrompt,
+  estimatePromptTokens,
+  isSkipCreativeResponse,
+  selectModeratorFollowupAgents,
+  type CreativeAgentId,
+  type CreativeDiscussionMessage,
+} from './src/creative-discussion.ts'
+import {
   authenticatePassword,
   authenticatedUser,
   clearSessionCookie,
@@ -76,13 +89,10 @@ const RUNTIME_UPLOADS_DIR = runtimeUploadsDir(import.meta.dir)
 const GENERATED_ARTIFACTS_DIR = generatedArtifactsDir(import.meta.dir)
 const HEARTBEAT_PATH = heartbeatStatePath(import.meta.dir)
 
-const ROLE_AGENT_IDS = ['product', 'creative', 'social', 'growth'] as const
-const ROLE_AGENT_CONFIGS = {
-  product: loadAgentRuntimeEnv('PRODUCT'),
-  creative: loadAgentRuntimeEnv('CREATIVE'),
-  social: loadAgentRuntimeEnv('SOCIAL'),
-  growth: loadAgentRuntimeEnv('GROWTH'),
-}
+const ROLE_AGENT_IDS = CREATIVE_AGENT_IDS
+const ROLE_AGENT_CONFIGS = Object.fromEntries(
+  CREATIVE_AGENTS.map((agent) => [agent.id, loadAgentRuntimeEnv(agent.envPrefix)]),
+) as Record<CreativeAgentId, ReturnType<typeof loadAgentRuntimeEnv>>
 
 function migrateLegacyFile(legacyPath: string, nextPath: string) {
   if (legacyPath === nextPath) return
@@ -167,17 +177,19 @@ db.run(`CREATE TABLE IF NOT EXISTS group_conversation_members (
 )`)
 const defaultGroupCreatedAt = new Date().toISOString()
 db.run(`INSERT OR IGNORE INTO group_conversations (id, name, created_at, created_by, is_default)
-  VALUES ('workgroup', '工作群', ?, 'admin', 1)`, [defaultGroupCreatedAt])
+  VALUES ('workgroup', '创意讨论群', ?, 'admin', 1)`, [defaultGroupCreatedAt])
 for (const memberId of ['admin', ...ROLE_AGENT_IDS]) {
   db.run(`INSERT OR IGNORE INTO group_conversation_members (conversation_id, member_id, added_at)
     VALUES ('workgroup', ?, ?)`, [memberId, defaultGroupCreatedAt])
 }
-// One-time/idempotent migration from the original two placeholder agents.
-// Custom groups keep their intent: agent1 expands into product/creative, while
-// agent2 expands into social/growth. The default group always contains all four.
+// One-time/idempotent roster migration. Custom groups keep their broad intent,
+// while default groups are normalized to the complete creative discussion panel
+// after the multi-user migration has attached ownership.
 for (const [legacyId, replacements] of Object.entries({
-  agent1: ['product', 'creative'],
-  agent2: ['social', 'growth'],
+  agent1: ['creative', 'brand', 'product'],
+  agent2: ['content', 'market'],
+  social: ['content'],
+  growth: ['market'],
 })) {
   const groups = db.prepare(`SELECT conversation_id FROM group_conversation_members WHERE member_id=?`).all(legacyId) as any[]
   for (const group of groups) {
@@ -207,6 +219,50 @@ db.run(`CREATE TABLE IF NOT EXISTS group_agent_settings (
   agent_id TEXT PRIMARY KEY,
   auto_reply INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
+)`)
+
+// Server-controlled creative discussion state. These tables record the strict
+// ten-round lifecycle and its cost/latency metrics independently from chat text.
+db.run(`CREATE TABLE IF NOT EXISTS creative_discussions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  current_round INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT NOT NULL,
+  completed_at TEXT DEFAULT NULL,
+  total_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  error TEXT DEFAULT NULL
+)`)
+db.run(`CREATE INDEX IF NOT EXISTS idx_creative_discussions_active
+  ON creative_discussions(user_id, conversation_id, status)`)
+db.run(`CREATE TABLE IF NOT EXISTS creative_discussion_rounds (
+  discussion_id TEXT NOT NULL,
+  round_number INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  stage TEXT NOT NULL DEFAULT 'main',
+  agents TEXT NOT NULL DEFAULT '[]',
+  pending_agents TEXT NOT NULL DEFAULT '[]',
+  started_at TEXT NOT NULL,
+  completed_at TEXT DEFAULT NULL,
+  duration_ms INTEGER DEFAULT NULL,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens_source TEXT NOT NULL DEFAULT 'estimated',
+  marker_message_id TEXT DEFAULT NULL,
+  PRIMARY KEY (discussion_id, round_number),
+  FOREIGN KEY (discussion_id) REFERENCES creative_discussions(id) ON DELETE CASCADE
+)`)
+db.run(`CREATE TABLE IF NOT EXISTS creative_discussion_outputs (
+  discussion_id TEXT NOT NULL,
+  round_number INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  message_id TEXT DEFAULT NULL,
+  text TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (discussion_id, round_number, agent_id),
+  FOREIGN KEY (discussion_id) REFERENCES creative_discussions(id) ON DELETE CASCADE
 )`)
 
 // AIC-55: per-actor last-seen-id per channel, so web + iOS app share the same
@@ -401,6 +457,7 @@ const userRepo = new UserRepository(db)
 const connectorRegistry = new ConnectorRegistry()
 const connectorDispatcher = new ConnectorDispatcher(connectorRegistry)
 db.run(`UPDATE connector_devices SET status='offline' WHERE status!='offline'`)
+normalizeDefaultCreativeGroups()
 if (process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD) {
   await ensureLegacyAdminPassword(db, process.env.AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD)
 }
@@ -462,47 +519,17 @@ const GROUP_ROSTER: GroupMember[] = [
     tmux: null,
     can_reply: false,
   },
-  {
-    id: 'product',
-    display_name: '产品企划',
-    kind: 'agent',
-    avatar: '🧭',
-    color: 'blue',
-    model: 'Product Manager',
-    tmux: ROLE_AGENT_CONFIGS.product.provider,
+  ...CREATIVE_AGENTS.map((agent, index) => ({
+    id: agent.id,
+    display_name: agent.displayName,
+    kind: 'agent' as const,
+    avatar: agent.avatar,
+    color: agent.color,
+    model: agent.model,
+    tmux: ROLE_AGENT_CONFIGS[agent.id].provider,
     can_reply: true,
-    default_responder: true,
-  },
-  {
-    id: 'creative',
-    display_name: '创意设计',
-    kind: 'agent',
-    avatar: '🎬',
-    color: 'purple',
-    model: 'Visual Storyteller',
-    tmux: ROLE_AGENT_CONFIGS.creative.provider,
-    can_reply: true,
-  },
-  {
-    id: 'social',
-    display_name: '社媒运营',
-    kind: 'agent',
-    avatar: '📣',
-    color: 'green',
-    model: 'Social Media Strategist',
-    tmux: ROLE_AGENT_CONFIGS.social.provider,
-    can_reply: true,
-  },
-  {
-    id: 'growth',
-    display_name: '营销增长',
-    kind: 'agent',
-    avatar: '🚀',
-    color: 'orange',
-    model: 'Growth Hacker',
-    tmux: ROLE_AGENT_CONFIGS.growth.provider,
-    can_reply: true,
-  },
+    default_responder: index === 0,
+  })),
 ]
 const GROUP_ROSTER_BY_ID = new Map(GROUP_ROSTER.map((m) => [m.id, m]))
 
@@ -532,10 +559,7 @@ type AgentRuntimeConfig = {
   promptPath?: string
 }
 const AGENT_RUNTIMES: Record<string, AgentRuntimeConfig> = {
-  product: ROLE_AGENT_CONFIGS.product,
-  creative: ROLE_AGENT_CONFIGS.creative,
-  social: ROLE_AGENT_CONFIGS.social,
-  growth: ROLE_AGENT_CONFIGS.growth,
+  ...ROLE_AGENT_CONFIGS,
 }
 const AGENT_PROVIDERS = new Map<string, AgentProvider>()
 // Provider events do not carry the workgroup conversation/observe intent that caused
@@ -651,10 +675,11 @@ function ensureProvider(userId: string, conversationId: string, agentId: string)
 function handleProviderEvent(userId: string, conversationId: string, agentId: string, ev: AgentEvent): void {
   const key = runtimeProviderKey(userId, conversationId, agentId)
   const activeRoute = _agentTurnRoutes.current(key)
+  let completedRoute: AgentTurnRoute | null = null
   if ((ev.type === 'system_init' || ev.type === 'assistant') && activeRoute && !activeRoute.observeOnly) {
     if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId, { dispatch_id: activeRoute.dispatchId })
   } else if (ev.type === 'result') {
-    _agentTurnRoutes.complete(key)
+    completedRoute = _agentTurnRoutes.complete(key)
     // A completed response must not make the workstation look idle when another
     // visible response is already queued behind it. Observe-only turns stay silent.
     if (_agentTurnRoutes.hasResponseTurn(key)) {
@@ -664,6 +689,7 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
       markAgentIdle(agentId)
     }
     startNextAgentTurn(userId, conversationId, agentId)
+    if (completedRoute?.creativeDiscussion) completeCreativeAgentTurn(completedRoute, agentId, ev.usage)
   }
 
   if (ev.type === 'assistant' && typeof ev.text === 'string' && ev.text.trim()) {
@@ -681,6 +707,10 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
     const conversationId = activeRoute.conversationId
     const text = ev.text.trim()
     if (_dedupAgentReply(key, text)) return
+    if (activeRoute.creativeDiscussion) {
+      recordCreativeDiscussionOutput(activeRoute, agentId, text)
+      return
+    }
     try {
       const dispatchId = groupId('dsp')
       // Agent-authored @mentions are real response targets, not passive observers.
@@ -744,7 +774,10 @@ function handleProviderError(userId: string, conversationId: string, agentId: st
     // A dead provider cannot emit result events for its accepted routes. Clear them so
     // a fresh instance starts with an unambiguous routing queue.
     const abandonedRoutes = _agentTurnRoutes.clear(key)
-    for (const route of abandonedRoutes) demoteAgentTurnDelivery(agentId, route)
+    for (const route of abandonedRoutes) {
+      demoteAgentTurnDelivery(agentId, route)
+      if (route.creativeDiscussion) failCreativeDiscussion(route.creativeDiscussion.discussionId, `PROVIDER_${err.kind.toUpperCase()}`)
+    }
   }
 }
 
@@ -792,18 +825,7 @@ const GROUP_ALIASES = new Map<string, string>([
   ['everyone', GROUP_ALL_TOKEN],
   ['全员', GROUP_ALL_TOKEN],
   ['admin', 'admin'],
-  ['product', 'product'],
-  ['产品', 'product'],
-  ['产品企划', 'product'],
-  ['creative', 'creative'],
-  ['创意', 'creative'],
-  ['创意设计', 'creative'],
-  ['social', 'social'],
-  ['社媒', 'social'],
-  ['社媒运营', 'social'],
-  ['growth', 'growth'],
-  ['增长', 'growth'],
-  ['营销增长', 'growth'],
+  ...CREATIVE_AGENTS.flatMap((agent) => agent.aliases.map((alias) => [alias.toLowerCase(), agent.id] as [string, string])),
 ])
 
 type GroupConversationSummary = {
@@ -821,7 +843,7 @@ function ensureUserDefaultConversation(user: AuthenticatedUser): GroupConversati
   const id = user.id === LEGACY_ADMIN_ID ? 'workgroup' : `workgroup-${user.id.slice(4, 16)}`
   const now = groupNowIso()
   db.run(`INSERT INTO group_conversations (id, name, created_at, created_by, is_default, user_id)
-    VALUES (?, '工作群', ?, ?, 1, ?)`, [id, now, user.id, user.id])
+    VALUES (?, '创意讨论群', ?, ?, 1, ?)`, [id, now, user.id, user.id])
   saveConversationMembers(id, ['admin', ...ROLE_AGENT_IDS])
   return groupConversationById(id, user.id)!
 }
@@ -868,6 +890,15 @@ function saveConversationMembers(conversationId: string, memberIds: string[]) {
   db.run(`DELETE FROM group_conversation_members WHERE conversation_id=?`, [conversationId])
   for (const memberId of memberIds) {
     db.run(`INSERT INTO group_conversation_members (conversation_id, member_id, added_at) VALUES (?, ?, ?)`, [conversationId, memberId, now])
+  }
+}
+
+function normalizeDefaultCreativeGroups() {
+  const rows = db.prepare(`SELECT id FROM group_conversations WHERE is_default=1`).all() as any[]
+  for (const row of rows) {
+    const conversationId = String(row.id)
+    db.run(`UPDATE group_conversations SET name='创意讨论群' WHERE id=?`, [conversationId])
+    saveConversationMembers(conversationId, ['admin', ...ROLE_AGENT_IDS])
   }
 }
 
@@ -1075,10 +1106,13 @@ type ActorStyleRow = {
 }
 const DEFAULT_ACTOR_STYLES: ActorStyleRow[] = [
   { actor_id: 'admin',  avatar_kind: 'emoji', avatar_value: '👾', bubble_bg: '#dccfe8' },
-  { actor_id: 'product', avatar_kind: 'emoji', avatar_value: '🧭', bubble_bg: '#cdddec' },
-  { actor_id: 'creative', avatar_kind: 'emoji', avatar_value: '🎬', bubble_bg: '#dccfe8' },
-  { actor_id: 'social', avatar_kind: 'emoji', avatar_value: '📣', bubble_bg: '#cee0c5' },
-  { actor_id: 'growth', avatar_kind: 'emoji', avatar_value: '🚀', bubble_bg: '#f4d990' },
+  { actor_id: 'creative', avatar_kind: 'emoji', avatar_value: '✨', bubble_bg: '#dccfe8' },
+  { actor_id: 'brand', avatar_kind: 'emoji', avatar_value: '🎭', bubble_bg: '#cdddec' },
+  { actor_id: 'product', avatar_kind: 'emoji', avatar_value: '🧭', bubble_bg: '#cee0c5' },
+  { actor_id: 'content', avatar_kind: 'emoji', avatar_value: '📣', bubble_bg: '#f4d990' },
+  { actor_id: 'market', avatar_kind: 'emoji', avatar_value: '🔎', bubble_bg: '#b8d6cc' },
+  { actor_id: 'moderator', avatar_kind: 'emoji', avatar_value: '🎙️', bubble_bg: '#f7d4b8' },
+  { actor_id: 'director', avatar_kind: 'emoji', avatar_value: '🎬', bubble_bg: '#f7d3d0' },
   { actor_id: 'system', avatar_kind: 'emoji', avatar_value: '⚙', bubble_bg: '#d4d0c8' },
 ]
 const PRESET_BG_COLORS = [
@@ -1257,10 +1291,13 @@ const ROLE_TO_ACTORS: Record<string, string[]> = {
 
 const ACTOR_DISPLAY_NAMES: Record<string, string> = {
   admin:  'admin',
-  product: '产品企划',
-  creative: '创意设计',
-  social: '社媒运营',
-  growth: '营销增长',
+  creative: '奇想创意家',
+  brand: 'IP/品牌创意师',
+  product: '产品创意策划',
+  content: '内容传播策划',
+  market: '市场现实校准员',
+  moderator: '讨论主持人',
+  director: '创意总监',
   system: 'System',
 }
 
@@ -1711,10 +1748,7 @@ function groupObserverTargetsFor(senderId: string, responseTargets: string[], co
 // AIC-60: per-agent session context tokens — mirrors Hub iOS CTX card.
 // Each agent writes its own heartbeat from a Stop/SessionStart hook (or equivalent).
 const AGENT_HEARTBEAT_PATHS: Record<string, string> = {
-  product: ROLE_AGENT_CONFIGS.product.heartbeatPath,
-  creative: ROLE_AGENT_CONFIGS.creative.heartbeatPath,
-  social: ROLE_AGENT_CONFIGS.social.heartbeatPath,
-  growth: ROLE_AGENT_CONFIGS.growth.heartbeatPath,
+  ...Object.fromEntries(ROLE_AGENT_IDS.map((id) => [id, ROLE_AGENT_CONFIGS[id].heartbeatPath])),
 }
 function readAgentContext(agentId: string): { tokens: number | null; percent: number | null; detail: string | null } {
   const path = AGENT_HEARTBEAT_PATHS[agentId]
@@ -1981,10 +2015,7 @@ function updateGroupAgentState(agentId: string, patch: Record<string, any>) {
 // "working" status text shown on each agent's worker card. Per-agent phrase pools — pick
 // something playful or just leave the generic defaults. Customize per agent personality.
 const WORKING_PHRASES: Record<string, string[]> = {
-  product: ['梳理需求中...', '规划系列中...', '拆解 SKU 中...', '校准上市节奏...'],
-  creative: ['构思画面中...', '搭建视觉叙事...', '打磨提示词中...', '整理 KV 方向...'],
-  social: ['规划内容中...', '适配平台语境...', '排内容日历中...', '分析互动机会...'],
-  growth: ['设计增长实验...', '优化转化漏斗...', '寻找增长杠杆...', '核算活动回报...'],
+  ...Object.fromEntries(CREATIVE_AGENTS.map((agent) => [agent.id, agent.workingPhrases])),
 }
 function pickWorkingPhrase(agentId: string): string {
   const pool = WORKING_PHRASES[agentId]
@@ -2055,7 +2086,9 @@ function setGroupAgentAutoReply(agentId: string, enabled: boolean) {
 
 function appendGroupRecord(input: any, mentions: string[], delivery: any, userId: string) {
   const senderId = String(input.sender_id || 'admin').trim()
-  const member = GROUP_ROSTER_BY_ID.get(senderId)
+  const member = GROUP_ROSTER_BY_ID.get(senderId) || (senderId === 'system'
+    ? { model: null }
+    : null)
   if (!member) throw new Error(`unknown sender_id: ${senderId}`)
   const text = String(input.text || '').trim()
   const images: string[] = Array.isArray(input.images) ? input.images.filter((x: any) => typeof x === 'string') : []
@@ -2121,6 +2154,284 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
 
 function saveGroupDelivery(recordId: string, delivery: any) {
   db.run(`UPDATE group_messages SET delivery = ? WHERE id = ?`, [JSON.stringify(delivery), recordId])
+}
+
+function creativeConversation(userId: string, conversationId: string): boolean {
+  const row = db.prepare(`SELECT is_default FROM group_conversations WHERE id=? AND user_id=?`).get(conversationId, userId) as any
+  return Boolean(row?.is_default)
+}
+
+function activeCreativeDiscussion(userId: string, conversationId: string) {
+  return db.prepare(`SELECT * FROM creative_discussions
+    WHERE user_id=? AND conversation_id=? AND status='running'
+    ORDER BY started_at DESC LIMIT 1`).get(userId, conversationId) as any
+}
+
+function creativeDiscussionHistory(discussionId: string): CreativeDiscussionMessage[] {
+  return (db.prepare(`SELECT round_number, agent_id, text FROM creative_discussion_outputs
+    WHERE discussion_id=? ORDER BY round_number ASC, created_at ASC`).all(discussionId) as any[])
+    .filter((row) => CREATIVE_AGENT_BY_ID.has(String(row.agent_id) as CreativeAgentId))
+    .map((row) => ({
+      round: Number(row.round_number),
+      agentId: String(row.agent_id) as CreativeAgentId,
+      text: String(row.text || ''),
+    }))
+}
+
+function creativePersona(agentId: CreativeAgentId): string {
+  const configured = AGENT_RUNTIMES[agentId]?.promptPath
+  const candidates = [configured, path.join(import.meta.dir, 'agents', agentId, 'AGENTS.md')].filter(Boolean) as string[]
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return readFileSync(candidate, 'utf8').trim()
+    } catch {}
+  }
+  return `# ${CREATIVE_AGENT_BY_ID.get(agentId)?.displayName || agentId}\n- 只围绕当前轮次贡献专业判断。`
+}
+
+function creativeBrandKnowledge(): string {
+  const configured = String(process.env.CREATIVE_ROLE_KNOWLEDGE_PATH || '').trim()
+  const candidates = [
+    configured,
+    path.join(import.meta.dir, 'knowledge', 'company', '白熊百货_创意角色优先级.md'),
+  ].filter(Boolean)
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return readFileSync(candidate, 'utf8').trim()
+    } catch {}
+  }
+  return '所有创意方向必须围绕白熊百货既有角色展开；未读取到角色索引时，不得自行发明或改写角色设定。'
+}
+
+function appendCreativeSystemMessage(discussion: any, text: string, round: number, extraMeta: Record<string, any> = {}) {
+  return appendGroupRecord({
+    sender_id: 'system',
+    sender_model: null,
+    conversation_id: discussion.conversation_id,
+    text,
+    source: 'creative_orchestrator',
+    message_type: 'system_notification',
+    meta: { creative_discussion_id: discussion.id, creative_round: round, ...extraMeta },
+  }, [], { mode: 'orchestrated', targets: [], delivered: [], failed: [] }, discussion.user_id)
+}
+
+function creativeRoundRecord(discussionId: string, round: number) {
+  return db.prepare(`SELECT * FROM creative_discussion_rounds WHERE discussion_id=? AND round_number=?`).get(discussionId, round) as any
+}
+
+function failCreativeDiscussion(discussionId: string, reason: string) {
+  const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(discussionId) as any
+  if (!discussion || discussion.status !== 'running') return
+  const safeReason = reason.replace(/[^A-Za-z0-9_:\- ]/g, '').slice(0, 120) || 'AGENT_EXECUTION_FAILED'
+  const now = groupNowIso()
+  db.run(`UPDATE creative_discussions SET status='failed', completed_at=?, error=? WHERE id=?`, [now, safeReason, discussionId])
+  db.run(`UPDATE creative_discussion_rounds SET status='failed', completed_at=?, duration_ms=?
+    WHERE discussion_id=? AND round_number=? AND status='running'`, [
+      now,
+      Math.max(0, Date.now() - Date.parse(String(creativeRoundRecord(discussionId, discussion.current_round)?.started_at || now))),
+      discussionId,
+      discussion.current_round,
+    ])
+  appendCreativeSystemMessage(discussion, `⚠ 创意讨论在第${discussion.current_round}轮停止：${safeReason}`, discussion.current_round, { status: 'failed' })
+}
+
+function dispatchCreativeAgent(discussion: any, round: number, stage: 'main' | 'followup', agentId: CreativeAgentId, marker: GroupRecord): boolean {
+  if (AGENT_RUNTIMES[agentId]?.provider === 'remote-codex' && !connectorRegistry.isUserOnline(discussion.user_id)) {
+    failCreativeDiscussion(discussion.id, 'CODEX_CONNECTOR_OFFLINE')
+    return false
+  }
+  const provider = ensureProvider(discussion.user_id, discussion.conversation_id, agentId)
+  if (!provider) {
+    failCreativeDiscussion(discussion.id, `NO_PROVIDER_${agentId}`)
+    return false
+  }
+  const prompt = buildCreativeDiscussionPrompt({
+    agentId,
+    topic: discussion.topic,
+    round,
+    history: creativeDiscussionHistory(discussion.id),
+    persona: creativePersona(agentId),
+    knowledgeContext: creativeBrandKnowledge(),
+  })
+  const promptTokensEstimate = estimatePromptTokens(prompt)
+  db.run(`UPDATE creative_discussion_rounds SET prompt_tokens=prompt_tokens+? WHERE discussion_id=? AND round_number=?`, [promptTokensEstimate, discussion.id, round])
+  db.run(`UPDATE creative_discussions SET total_prompt_tokens=total_prompt_tokens+? WHERE id=?`, [promptTokensEstimate, discussion.id])
+  const routeId = groupId('turn')
+  const key = runtimeProviderKey(discussion.user_id, discussion.conversation_id, agentId)
+  markAgentWorking(agentId, { dispatch_id: marker.delivery.dispatch_id })
+  _agentTurnRoutes.enqueue(key, {
+    id: routeId,
+    userId: discussion.user_id,
+    conversationId: discussion.conversation_id,
+    observeOnly: false,
+    dispatchId: marker.delivery.dispatch_id,
+    recordId: marker.id,
+    prompt,
+    started: false,
+    hopCount: 0,
+    creativeDiscussion: { discussionId: discussion.id, round, stage, promptTokensEstimate },
+  })
+  startNextAgentTurn(discussion.user_id, discussion.conversation_id, agentId)
+  return true
+}
+
+function dispatchCreativeAgents(discussion: any, round: number, stage: 'main' | 'followup', agents: CreativeAgentId[], marker: GroupRecord) {
+  const delivered: string[] = []
+  const failed: string[] = []
+  for (const agentId of agents) {
+    if (dispatchCreativeAgent(discussion, round, stage, agentId, marker)) delivered.push(agentId)
+    else failed.push(agentId)
+  }
+  marker.delivery.targets = agents
+  marker.delivery.delivered = delivered
+  marker.delivery.failed = failed
+  saveGroupDelivery(marker.id, marker.delivery)
+}
+
+function startCreativeRound(discussionId: string, round: number) {
+  const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(discussionId) as any
+  if (!discussion || discussion.status !== 'running') return
+  if (round > CREATIVE_DISCUSSION_MAX_ROUNDS) return finishCreativeDiscussion(discussionId)
+  const plan = CREATIVE_DISCUSSION_ROUNDS[round - 1]
+  if (!plan) return finishCreativeDiscussion(discussionId)
+  const now = groupNowIso()
+  const marker = appendCreativeSystemMessage(
+    discussion,
+    `第${round}/${CREATIVE_DISCUSSION_MAX_ROUNDS}轮 · ${plan.title}`,
+    round,
+    { status: 'running', agents: plan.agents },
+  )
+  db.run(`INSERT INTO creative_discussion_rounds
+    (discussion_id, round_number, title, status, stage, agents, pending_agents, started_at, marker_message_id)
+    VALUES (?, ?, ?, 'running', 'main', ?, ?, ?, ?)`, [
+      discussionId, round, plan.title, JSON.stringify(plan.agents), JSON.stringify(plan.agents), now, marker.id,
+    ])
+  db.run(`UPDATE creative_discussions SET current_round=? WHERE id=?`, [round, discussionId])
+  console.log(`[creative-discussion] discussion=${discussionId} round=${round} state=started agents=${plan.agents.join(',')}`)
+  dispatchCreativeAgents(discussion, round, 'main', plan.agents, marker)
+}
+
+function startCreativeDiscussion(topicRecord: GroupRecord) {
+  const id = groupId('creative')
+  const now = groupNowIso()
+  db.run(`INSERT INTO creative_discussions
+    (id, user_id, conversation_id, topic, status, current_round, started_at)
+    VALUES (?, ?, ?, ?, 'running', 0, ?)`, [id, topicRecord.user_id, topicRecord.conversation_id, topicRecord.text, now])
+  const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(id) as any
+  appendCreativeSystemMessage(discussion, `创意讨论已启动 · 固定最多${CREATIVE_DISCUSSION_MAX_ROUNDS}轮`, 0, { status: 'running' })
+  queueMicrotask(() => startCreativeRound(id, 1))
+  return discussion
+}
+
+function recordCreativeDiscussionOutput(route: AgentTurnRoute, agentId: string, text: string) {
+  const meta = route.creativeDiscussion
+  if (!meta || !CREATIVE_AGENT_BY_ID.has(agentId as CreativeAgentId)) return
+  const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(meta.discussionId) as any
+  if (!discussion || discussion.status !== 'running') return
+  const existing = db.prepare(`SELECT message_id, text FROM creative_discussion_outputs
+    WHERE discussion_id=? AND round_number=? AND agent_id=?`).get(meta.discussionId, meta.round, agentId) as any
+  const nextText = existing?.text && existing.text !== text ? `${existing.text}\n${text}` : text
+  let messageId = existing?.message_id || null
+  if (!messageId && !isSkipCreativeResponse(nextText)) {
+    const record = appendGroupRecord({
+      sender_id: agentId,
+      conversation_id: discussion.conversation_id,
+      text: nextText,
+      source: 'creative_discussion',
+      message_type: 'chat',
+      meta: { creative_discussion_id: discussion.id, creative_round: meta.round, creative_stage: meta.stage },
+    }, normalizeGroupMentions([], nextText), { mode: 'orchestrated', targets: [], delivered: [], failed: [] }, discussion.user_id)
+    messageId = record.id
+  } else if (messageId) {
+    db.run(`UPDATE group_messages SET text=?, mentions=? WHERE id=? AND user_id=?`, [
+      nextText, JSON.stringify(normalizeGroupMentions([], nextText)), messageId, discussion.user_id,
+    ])
+  }
+  db.run(`INSERT INTO creative_discussion_outputs
+    (discussion_id, round_number, agent_id, message_id, text, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(discussion_id, round_number, agent_id) DO UPDATE SET
+      message_id=excluded.message_id, text=excluded.text, created_at=excluded.created_at`, [
+        meta.discussionId, meta.round, agentId, messageId, nextText, groupNowIso(),
+      ])
+}
+
+function completeCreativeAgentTurn(route: AgentTurnRoute, agentId: string, usage?: any) {
+  const meta = route.creativeDiscussion
+  if (!meta) return
+  const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(meta.discussionId) as any
+  if (!discussion || discussion.status !== 'running') return
+  const output = db.prepare(`SELECT text FROM creative_discussion_outputs
+    WHERE discussion_id=? AND round_number=? AND agent_id=?`).get(meta.discussionId, meta.round, agentId) as any
+  if (!output) recordCreativeDiscussionOutput(route, agentId, 'SKIP')
+
+  const reportedTokens = Number(usage?.input_tokens)
+  if (Number.isFinite(reportedTokens) && reportedTokens >= 0) {
+    const delta = Math.round(reportedTokens) - meta.promptTokensEstimate
+    db.run(`UPDATE creative_discussion_rounds SET prompt_tokens=prompt_tokens+?, prompt_tokens_source='reported_or_estimated'
+      WHERE discussion_id=? AND round_number=?`, [delta, meta.discussionId, meta.round])
+    db.run(`UPDATE creative_discussions SET total_prompt_tokens=total_prompt_tokens+? WHERE id=?`, [delta, meta.discussionId])
+  }
+
+  const roundRow = creativeRoundRecord(meta.discussionId, meta.round)
+  if (!roundRow || roundRow.status !== 'running') return
+  const pending = (jsonParseSafe(roundRow.pending_agents, []) as string[]).filter((id) => id !== agentId)
+  db.run(`UPDATE creative_discussion_rounds SET pending_agents=? WHERE discussion_id=? AND round_number=?`, [
+    JSON.stringify(pending), meta.discussionId, meta.round,
+  ])
+  if (pending.length > 0) return
+
+  const plan = CREATIVE_DISCUSSION_ROUNDS[meta.round - 1]
+  if (meta.stage === 'main' && plan?.dynamicFollowup) {
+    const moderatorOutput = db.prepare(`SELECT text FROM creative_discussion_outputs
+      WHERE discussion_id=? AND round_number=? AND agent_id='moderator'`).get(meta.discussionId, meta.round) as any
+    const selected = selectModeratorFollowupAgents(String(moderatorOutput?.text || ''), plan.dynamicFollowup)
+    const allAgents = [...new Set([...(jsonParseSafe(roundRow.agents, []) as string[]), ...selected])]
+    db.run(`UPDATE creative_discussion_rounds SET stage='followup', agents=?, pending_agents=?
+      WHERE discussion_id=? AND round_number=?`, [JSON.stringify(allAgents), JSON.stringify(selected), meta.discussionId, meta.round])
+    const markerRow = db.prepare(`SELECT * FROM group_messages WHERE id=? AND user_id=?`).get(roundRow.marker_message_id, discussion.user_id) as any
+    const marker = markerRow ? groupRowToRecord(markerRow) : appendCreativeSystemMessage(discussion, `第${meta.round}轮 · 主持人点名继续`, meta.round)
+    console.log(`[creative-discussion] discussion=${meta.discussionId} round=${meta.round} state=followup agents=${selected.join(',')}`)
+    dispatchCreativeAgents(discussion, meta.round, 'followup', selected, marker)
+    return
+  }
+  finishCreativeRound(meta.discussionId, meta.round)
+}
+
+function finishCreativeRound(discussionId: string, round: number) {
+  const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(discussionId) as any
+  const roundRow = creativeRoundRecord(discussionId, round)
+  if (!discussion || discussion.status !== 'running' || !roundRow || roundRow.status !== 'running') return
+  const completedAt = groupNowIso()
+  const durationMs = Math.max(0, Date.now() - Date.parse(roundRow.started_at))
+  db.run(`UPDATE creative_discussion_rounds SET status='completed', completed_at=?, duration_ms=?, pending_agents='[]'
+    WHERE discussion_id=? AND round_number=?`, [completedAt, durationMs, discussionId, round])
+  appendCreativeSystemMessage(
+    discussion,
+    `第${round}轮完成 · ${durationMs}ms · prompt ${Number(roundRow.prompt_tokens) || 0} tokens`,
+    round,
+    { status: 'completed', duration_ms: durationMs, prompt_tokens: Number(roundRow.prompt_tokens) || 0 },
+  )
+  console.log(`[creative-discussion] discussion=${discussionId} round=${round} state=completed duration_ms=${durationMs} prompt_tokens=${Number(roundRow.prompt_tokens) || 0}`)
+  if (round >= CREATIVE_DISCUSSION_MAX_ROUNDS) finishCreativeDiscussion(discussionId)
+  else queueMicrotask(() => startCreativeRound(discussionId, round + 1))
+}
+
+function finishCreativeDiscussion(discussionId: string) {
+  const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(discussionId) as any
+  if (!discussion || discussion.status !== 'running') return
+  const completedAt = groupNowIso()
+  db.run(`UPDATE creative_discussions SET status='completed', current_round=?, completed_at=? WHERE id=?`, [
+    CREATIVE_DISCUSSION_MAX_ROUNDS, completedAt, discussionId,
+  ])
+  const refreshed = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(discussionId) as any
+  appendCreativeSystemMessage(
+    refreshed,
+    `创意讨论完成 · ${CREATIVE_DISCUSSION_MAX_ROUNDS}轮 · prompt ${Number(refreshed.total_prompt_tokens) || 0} tokens`,
+    CREATIVE_DISCUSSION_MAX_ROUNDS,
+    { status: 'completed', total_prompt_tokens: Number(refreshed.total_prompt_tokens) || 0 },
+  )
+  console.log(`[creative-discussion] discussion=${discussionId} state=completed rounds=${CREATIVE_DISCUSSION_MAX_ROUNDS} prompt_tokens=${Number(refreshed.total_prompt_tokens) || 0}`)
 }
 
 function groupContextLines(userId: string, conversationId: string, limit = 16) {
@@ -2317,6 +2628,7 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
     console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
     _agentTurnRoutes.remove(key, route.id)
     demoteAgentTurnDelivery(agentId, route)
+    if (route.creativeDiscussion) failCreativeDiscussion(route.creativeDiscussion.discussionId, 'AGENT_SEND_FAILED')
     if (isAgentWorkingInDb(agentId) && !_agentTurnRoutes.hasResponseTurn(key)) markAgentIdle(agentId)
     startNextAgentTurn(userId, conversationId, agentId)
   })
@@ -2893,7 +3205,9 @@ Bun.serve<ConnectorSocketData>({
     const agentMemoryMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/memory$/)
     if (agentMemoryMatch && isAuthed) {
       const agentId = decodeURIComponent(agentMemoryMatch[1])
-      if (!ROLE_AGENT_IDS.includes(agentId as typeof ROLE_AGENT_IDS[number])) {
+      // social/growth are retained as storage-only compatibility ids so existing
+      // private memories remain accessible after the creative roster migration.
+      if (!ROLE_AGENT_IDS.includes(agentId as typeof ROLE_AGENT_IDS[number]) && agentId !== 'social' && agentId !== 'growth') {
         return Response.json({ ok: false, error: 'unknown agent' }, { status: 404 })
       }
       if (req.method === 'GET') {
@@ -3050,6 +3364,29 @@ Bun.serve<ConnectorSocketData>({
       }
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/creative-discussions/current' && isAuthed) {
+      const defaultConversation = ensureUserDefaultConversation(currentUser!)
+      const conversationId = url.searchParams.get('conversation_id') || defaultConversation.id
+      if (!allowedGroupConversationsForSender('admin', currentUser!.id).has(conversationId)) {
+        return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
+      }
+      const discussion = db.prepare(`SELECT * FROM creative_discussions
+        WHERE user_id=? AND conversation_id=? ORDER BY started_at DESC LIMIT 1`).get(currentUser!.id, conversationId) as any
+      if (!discussion) return Response.json({ ok: true, discussion: null, rounds: [] })
+      const rounds = db.prepare(`SELECT round_number, title, status, stage, agents, pending_agents,
+        started_at, completed_at, duration_ms, prompt_tokens, prompt_tokens_source
+        FROM creative_discussion_rounds WHERE discussion_id=? ORDER BY round_number`).all(discussion.id) as any[]
+      return Response.json({
+        ok: true,
+        discussion,
+        rounds: rounds.map((round) => ({
+          ...round,
+          agents: jsonParseSafe(round.agents, []),
+          pending_agents: jsonParseSafe(round.pending_agents, []),
+        })),
+      })
+    }
+
     // Workgroup poll: GET /group/poll?since=<iso>&limit=120
     if (req.method === 'GET' && url.pathname === '/group/poll' && isAuthed) {
       const since = url.searchParams.get('since')
@@ -3113,6 +3450,29 @@ Bun.serve<ConnectorSocketData>({
 
         const mentions = normalizeGroupMentions(body.mentions, text)
         const conversationId = String(body.conversation_id || 'workgroup')
+        if (creativeConversation(currentUser!.id, conversationId)) {
+          if (!text.trim()) return Response.json({ ok: false, error: '创意讨论主题不能为空' }, { status: 400 })
+          const active = activeCreativeDiscussion(currentUser!.id, conversationId)
+          if (active) {
+            return Response.json({
+              ok: false,
+              error: 'CREATIVE_DISCUSSION_ALREADY_RUNNING',
+              discussion_id: active.id,
+              current_round: active.current_round,
+              max_rounds: CREATIVE_DISCUSSION_MAX_ROUNDS,
+            }, { status: 409 })
+          }
+          const delivery = { targets: [], mode: 'creative_discussion', dispatch_id: groupId('dsp'), delivered: [], failed: [] }
+          const record = appendGroupRecord({ ...body, sender_id: senderId }, mentions, delivery, currentUser!.id)
+          const discussion = startCreativeDiscussion(record)
+          return Response.json({
+            ok: true,
+            record,
+            targets: [],
+            observers: [],
+            discussion: { id: discussion.id, status: discussion.status, current_round: discussion.current_round, max_rounds: CREATIVE_DISCUSSION_MAX_ROUNDS },
+          })
+        }
         const targets = groupTargetsFor(senderId, mentions, hopCount, conversationId, currentUser!.id)
         const delivery = {
           targets,

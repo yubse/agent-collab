@@ -63,9 +63,9 @@
   --shadow:0 1px 3px rgba(26,23,20,0.06),0 10px 22px rgba(26,23,20,0.04);
   --warn:#dd8259; --good:#7c9d6b; --info:#7896b8; --mute:#b8b0a5;
   --error:#c4574d;
-  --actorA:#cdddec; --actorB:#dccfe8; --actorC:#cee0c5; --actorD:#f4d990; --pm:#e6dccd;
-  --actorA-soft:#e0ebf5; --actorB-soft:#eee5f5; --actorC-soft:#e3f0dd; --actorD-soft:#fbe9b4; --pm-soft:#f0e8d6;
-  --actorA-deep:#3a648c; --actorB-deep:#76548f; --actorC-deep:#4f7546; --actorD-deep:#9a6f1e;
+  --actorA:#dccfe8; --actorB:#cdddec; --actorC:#cee0c5; --actorD:#f4d990; --actorE:#b8d6cc; --actorF:#f7d4b8; --actorG:#f7d3d0; --pm:#e6dccd;
+  --actorA-soft:#eee5f5; --actorB-soft:#e0ebf5; --actorC-soft:#e3f0dd; --actorD-soft:#fbe9b4; --actorE-soft:#dcece7; --actorF-soft:#fae7d8; --actorG-soft:#fbe5e3; --pm-soft:#f0e8d6;
+  --actorA-deep:#76548f; --actorB-deep:#3a648c; --actorC-deep:#4f7546; --actorD-deep:#9a6f1e; --actorE-deep:#3f6f65; --actorF-deep:#9a5e31; --actorG-deep:#9a4b46;
   --app-bar-bg:rgba(243,237,228,0.86);
 }
 [data-ws-theme="dark"]{
@@ -76,9 +76,9 @@
   --shadow:0 1px 3px rgba(0,0,0,0.5),0 10px 22px rgba(0,0,0,0.28);
   --warn:#ec9f7e; --good:#a3c592; --info:#9ab5d3; --mute:#6a6258;
   --error:#d97a7a;
-  --actorA:#2f4a64; --actorB:#4b385c; --actorC:#304a2d; --actorD:#5a4a23; --pm:#3a342a;
-  --actorA-soft:#1f3346; --actorB-soft:#33243f; --actorC-soft:#20351e; --actorD-soft:#3d3217; --pm-soft:#2a241d;
-  --actorA-deep:#cdddec; --actorB-deep:#dccfe8; --actorC-deep:#cee0c5; --actorD-deep:#f4d990;
+  --actorA:#4b385c; --actorB:#2f4a64; --actorC:#304a2d; --actorD:#5a4a23; --actorE:#27483f; --actorF:#573923; --actorG:#57302d; --pm:#3a342a;
+  --actorA-soft:#33243f; --actorB-soft:#1f3346; --actorC-soft:#20351e; --actorD-soft:#3d3217; --actorE-soft:#1d352f; --actorF-soft:#3d291b; --actorG-soft:#3d2220; --pm-soft:#2a241d;
+  --actorA-deep:#dccfe8; --actorB-deep:#cdddec; --actorC-deep:#cee0c5; --actorD-deep:#f4d990; --actorE-deep:#b8d6cc; --actorF-deep:#f7d4b8; --actorG-deep:#f7d3d0;
   --app-bar-bg:rgba(22,19,15,0.86);
 }
 
@@ -2234,9 +2234,9 @@ button, textarea, input { font: inherit; }
               <span class="ws-mac-dot green"></span>
             </div>
             <div class="ws-chat-title-row">
-              <span class="ws-chat-title" id="groupChatTitle">工作群</span>
+              <span class="ws-chat-title" id="groupChatTitle">创意讨论群</span>
               <span class="ws-chat-divider">｜</span>
-              <span class="ws-chat-members" id="groupChatMembers">admin · 产品企划 · 创意设计 · 社媒运营 · 营销增长</span>
+              <span class="ws-chat-members" id="groupChatMembers">admin · 奇想创意家 · IP/品牌创意师 · 产品创意策划 · 内容传播策划 · 市场现实校准员 · 讨论主持人 · 创意总监</span>
             </div>
           </div>
           <div class="ws-chat-messages" data-ws-scroll="y" id="groupMessages">
@@ -2637,10 +2637,13 @@ const POLL_MS = 2500;
 
 // Map server roster.id ↔ design token id. Design system has tokens for
 // Runtime actor ids mapped to stable visual design tokens.
-const SERVER_TO_DESIGN_ID = { admin: 'pm', product: 'actorA', creative: 'actorB', social: 'actorC', growth: 'actorD' };
-const DESIGN_AGENT_ORDER = ['actorA', 'actorB', 'actorC', 'actorD'];
-const ROLE_AGENT_IDS = ['product', 'creative', 'social', 'growth'];
-const ROLE_DISPLAY_NAMES = { product: '产品企划', creative: '创意设计', social: '社媒运营', growth: '营销增长' };
+const SERVER_TO_DESIGN_ID = { admin: 'pm', creative: 'actorA', brand: 'actorB', product: 'actorC', content: 'actorD', market: 'actorE', moderator: 'actorF', director: 'actorG' };
+const DESIGN_AGENT_ORDER = ['actorA', 'actorB', 'actorC', 'actorD', 'actorE', 'actorF', 'actorG'];
+const ROLE_AGENT_IDS = ['creative', 'brand', 'product', 'content', 'market', 'moderator', 'director'];
+const ROLE_DISPLAY_NAMES = {
+  creative: '奇想创意家', brand: 'IP/品牌创意师', product: '产品创意策划', content: '内容传播策划',
+  market: '市场现实校准员', moderator: '讨论主持人', director: '创意总监',
+};
 
 // roster.color → status dot color (working). Falls back to --mute for idle.
 const COLOR_TO_VAR = {
@@ -2760,10 +2763,13 @@ function _usageFor(raw) {
 // drop in pollTasksV2 directly).
 const CHANNELS = {
   workgroup:  { type: 'group', convId: 'workgroup' },
-  'dm-product': { type: 'group', convId: 'dm-product' },
   'dm-creative': { type: 'group', convId: 'dm-creative' },
-  'dm-social': { type: 'group', convId: 'dm-social' },
-  'dm-growth': { type: 'group', convId: 'dm-growth' },
+  'dm-brand': { type: 'group', convId: 'dm-brand' },
+  'dm-product': { type: 'group', convId: 'dm-product' },
+  'dm-content': { type: 'group', convId: 'dm-content' },
+  'dm-market': { type: 'group', convId: 'dm-market' },
+  'dm-moderator': { type: 'group', convId: 'dm-moderator' },
+  'dm-director': { type: 'group', convId: 'dm-director' },
 };
 let currentChannel = 'workgroup';
 const channelState = {};
@@ -2775,7 +2781,7 @@ for (const k of Object.keys(CHANNELS)) channelState[k] = {
 };
 
 let groupConversations = [{
-  id: 'workgroup', name: '工作群', is_default: true,
+  id: 'workgroup', name: '创意讨论群', is_default: true,
   member_ids: ['admin', ...ROLE_AGENT_IDS],
 }];
 
@@ -2887,7 +2893,7 @@ function _styleForRole(roleId) {
 // syncActorIdentityCssVars, but emojis live in template literals so they need
 // re-rendering. Fallback const matches the original hardcoded set for first-paint.
 const _ROLE_EMOJI_FALLBACK = { pm: '👾', implementer: '🧭', reviewer: '🎬', system: '⚙' };
-const _ACTOR_EMOJI_FALLBACK = { admin: '👾', product: '🧭', creative: '🎬', social: '📣', growth: '🚀', system: '⚙' };
+const _ACTOR_EMOJI_FALLBACK = { admin: '👾', creative: '✨', brand: '🎭', product: '🧭', content: '📣', market: '🔎', moderator: '🎙️', director: '🎬', system: '⚙' };
 function _roleEmoji(roleId) {
   return _styleForRole(roleId)?.avatar_value || _ROLE_EMOJI_FALLBACK[roleId] || roleId;
 }
@@ -2939,18 +2945,24 @@ function syncActorIdentityCssVars() {
 // === AIC-63 cycle 4: identity panel (PM edits actor avatar + bg, per design) ===
 const IDENTITY_ACTOR_META = [
   { id: 'admin',  name: 'admin',  runtime: 'PM', isYou: true },
-  { id: 'product', name: '产品企划', runtime: 'Product Manager · Codex' },
-  { id: 'creative', name: '创意设计', runtime: 'Visual Storyteller · Codex' },
-  { id: 'social', name: '社媒运营', runtime: 'Social Media Strategist · Codex' },
-  { id: 'growth', name: '营销增长', runtime: 'Growth Hacker · Codex' },
+  { id: 'creative', name: '奇想创意家', runtime: 'Whimsy Injector · Codex' },
+  { id: 'brand', name: 'IP/品牌创意师', runtime: 'Brand Guardian · Codex' },
+  { id: 'product', name: '产品创意策划', runtime: 'Product Manager · Codex' },
+  { id: 'content', name: '内容传播策划', runtime: 'Social Media Strategist · Codex' },
+  { id: 'market', name: '市场现实校准员', runtime: 'Trend Researcher · Codex' },
+  { id: 'moderator', name: '讨论主持人', runtime: 'Agents Orchestrator · Codex' },
+  { id: 'director', name: '创意总监', runtime: 'Studio Producer · Codex' },
   { id: 'system', name: 'System', runtime: 'system · 不可指派' },
 ];
 const IDENTITY_SAMPLE = {
   admin:  '嗯，先存到这里，避免推错。',
-  product: '建议先明确目标用户与系列结构，再拆 SKU。',
-  creative: '我会先定义叙事主线，再展开 KV 与场景。',
-  social: '同一主题会按平台语境分别改写。',
-  growth: '先把假设、指标和止损线写进实验卡。',
+  creative: '我想把普通开箱变成一场意外的小型仪式。',
+  brand: '这个符号需要一眼能认出，并能持续沉淀为IP资产。',
+  product: '把创意落到商品形态和明确的购买理由上。',
+  content: '让用户有一句能跟拍、能模仿、能分享的话题钩子。',
+  market: '保留创意核，但先验证消费者是否愿意为它付费。',
+  moderator: '当前争议只有一个：新鲜感和理解成本如何平衡。',
+  director: '最终只留三个方向，并写清为什么留、为什么舍。',
   system: '🎉 AIC-63 已关闭',
 };
 let identityPending = {};   // { actor_id: { avatar_kind?, avatar_value?, bubble_bg? } }
@@ -2962,7 +2974,7 @@ const SETTINGS_THEMES = [
   { id: 'dark',   label: '深色',  icon: '🌙' },
   { id: 'system', label: '跟随系统', icon: '🌗' },
 ];
-let appSettingsUsageActor = 'product';
+let appSettingsUsageActor = 'creative';
 let currentProfile = null;
 let connectorDevices = [];
 let connectorPairingState = { status: 'idle', startingDeviceIds: [] };
@@ -4097,10 +4109,13 @@ function startPolling() {
 function parseMentions(text) {
   const m = [], lower = text.toLowerCase();
   const aliases = {
-    product: ['product', '产品', '产品企划'],
-    creative: ['creative', '创意', '创意设计'],
-    social: ['social', '社媒', '社媒运营'],
-    growth: ['growth', '增长', '营销增长'],
+    creative: ['creative', 'whimsy', '奇想', '奇想创意家'],
+    brand: ['brand', 'ip', '品牌', '品牌创意师', 'ip/品牌创意师'],
+    product: ['product', '产品', '产品策划', '产品创意策划'],
+    content: ['content', 'social', '内容', '传播', '内容传播策划'],
+    market: ['market', 'growth', '市场', '校准', '市场现实校准员'],
+    moderator: ['moderator', 'host', '主持', '主持人', '讨论主持人'],
+    director: ['director', '总监', '创意总监'],
     admin: ['admin'],
   };
   for (const [id, handles] of Object.entries(aliases)) {
@@ -4147,6 +4162,14 @@ async function sendCurrentMessage() {
     else body.mentions = parseMentions(text);
     if (replyTo) body.reply_to = replyTo.id;
     const sent = await apiJson('/group/send', { method: 'POST', body: JSON.stringify(body) });
+    if (!sent?.ok) {
+      if (sent?.error === 'CREATIVE_DISCUSSION_ALREADY_RUNNING') {
+        showWipToast(`当前创意讨论正在第 ${sent.current_round || '—'}/10 轮，请等待创意总监总结。`);
+      } else {
+        showWipToast(sent?.error || '消息发送失败');
+      }
+      return;
+    }
     const deliveryErrors = Object.values(sent?.record?.delivery?.errors || {});
     if (deliveryErrors.includes('CODEX_CONNECTOR_OFFLINE')) {
       showWipToast('你的 AI Studio Connector 当前未连接。');
@@ -4499,7 +4522,7 @@ function renderAgentStrip() {
   const strip = document.getElementById('agentStrip');
   if (!strip) return;
 
-  // Build agents in the four-role design order.
+  // Build agents in the seven-role creative discussion order.
   const agents = DESIGN_AGENT_ORDER.map(designId => {
     const serverId = Object.keys(SERVER_TO_DESIGN_ID).find(sid => SERVER_TO_DESIGN_ID[sid] === designId);
     return decorateAgent(serverId);
@@ -4594,9 +4617,7 @@ function renderAgentStrip() {
           </div>
         </div>
         <div style="display:flex; gap:8px;">
-          ${a.serverId === 'growth'
-            ? `<button class="ws-icon-btn" style="flex:1; border:1px solid var(--border); background:var(--surface-2); padding:8px 10px; border-radius:9px; color:var(--ink-3); cursor:default; opacity:0.75;" disabled title="由保活脚本拉起">⚓ 常驻</button>`
-            : `<button class="ws-icon-btn" style="flex:1; border:1px solid var(--border); background:${a.isOnlineRaw ? 'var(--surface-2)' : 'var(--good-soft, rgba(120,180,120,0.18))'}; padding:8px 10px; border-radius:9px; color:var(--ink);" data-action="${a.isOnlineRaw ? 'clock-out' : 'clock-in'}" data-agent="${a.serverId}">${a.isOnlineRaw ? '⏰ 下班' : '☀ 上班'}</button>`}
+          <button class="ws-icon-btn" style="flex:1; border:1px solid var(--border); background:${a.isOnlineRaw ? 'var(--surface-2)' : 'var(--good-soft, rgba(120,180,120,0.18))'}; padding:8px 10px; border-radius:9px; color:var(--ink);" data-action="${a.isOnlineRaw ? 'clock-out' : 'clock-in'}" data-agent="${a.serverId}">${a.isOnlineRaw ? '⏰ 下班' : '☀ 上班'}</button>
         </div>
       </div>` : ''}
     </div>
@@ -4610,7 +4631,7 @@ function renderGroupChatHeader() {
   if (!membersEl || !group) return;
   const ids = group.member_ids || [];
   membersEl.textContent = ids.map(id => displayName(id)).join(' · ');
-  if (titleEl) titleEl.textContent = group.name || '工作群';
+  if (titleEl) titleEl.textContent = group.name || '创意讨论群';
 }
 
 function renderGroupList() {
@@ -5018,10 +5039,13 @@ function renderDmMessages() {
 // Per-author reply marker accent (matches design's replyAccentByAuthor lookup).
 const REPLY_ACCENT_BY_SENDER = {
   admin:  'var(--warn)',
-  product: 'var(--actorA-deep)',
-  creative: 'var(--actorB-deep)',
-  social: 'var(--actorC-deep)',
-  growth: 'var(--actorD-deep)',
+  creative: 'var(--actorA-deep)',
+  brand: 'var(--actorB-deep)',
+  product: 'var(--actorC-deep)',
+  content: 'var(--actorD-deep)',
+  market: 'var(--actorE-deep)',
+  moderator: 'var(--actorF-deep)',
+  director: 'var(--actorG-deep)',
 };
 
 function renderDmMsg(m, prev) {
@@ -6468,8 +6492,8 @@ function renderSettingsPhaseEditor(tpl) {
   }
   const ROLE_DEFS = [
     { key: 'pm',     label: 'PM',      emoji: '👾' },
-    { key: 'implementer',   label: '产品企划', emoji: '🧭' },
-    { key: 'reviewer',     label: '创意设计', emoji: '🎬' },
+    { key: 'implementer',   label: '产品创意策划', emoji: '🧭' },
+    { key: 'reviewer',     label: '奇想创意家', emoji: '✨' },
     { key: 'system', label: 'System',  emoji: '⚙' },
   ];
   const isReserved = !!tpl.is_reserved;
@@ -6662,8 +6686,8 @@ function renderTypeCreateForm() {
 function renderPhaseCreateForm() {
   const ROLE_DEFS = [
     { key: 'pm',     label: 'PM',      emoji: '👾' },
-    { key: 'implementer',   label: '产品企划', emoji: '🧭' },
-    { key: 'reviewer',     label: '创意设计', emoji: '🎬' },
+    { key: 'implementer',   label: '产品创意策划', emoji: '🧭' },
+    { key: 'reviewer',     label: '奇想创意家', emoji: '✨' },
     { key: 'system', label: 'System',  emoji: '⚙' },
   ];
   const rolesSet = new Set(entityCreateForm.required_roles);
@@ -7413,10 +7437,13 @@ function scrollDmMessagesToBottom() {
 // Static candidate list (handles are what the user types after @, mapped to
 // real sender_ids by parseMentions when the message is sent).
 const MENTION_CANDIDATES = [
-  { handle: 'product', serverId: 'product' },
   { handle: 'creative', serverId: 'creative' },
-  { handle: 'social', serverId: 'social' },
-  { handle: 'growth', serverId: 'growth' },
+  { handle: 'brand', serverId: 'brand' },
+  { handle: 'product', serverId: 'product' },
+  { handle: 'content', serverId: 'content' },
+  { handle: 'market', serverId: 'market' },
+  { handle: 'moderator', serverId: 'moderator' },
+  { handle: 'director', serverId: 'director' },
 ];
 
 const mentionState = {

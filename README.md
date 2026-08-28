@@ -37,7 +37,8 @@ Issue tracker 范式，每个任务有类型和阶段流程。
 
 ### 工作群和私聊
 
-- **工作群**：所有 agent 看到同一个频道，按 @mention 路由响应
+- **创意讨论群（默认）**：服务端按固定 10 轮调度七个 Agent，`@` 用于观点协作与主持选人
+- **自建工作群**：群成员看到同一个频道，按 @mention 自由路由响应
 - **私聊**：每个 agent 一个独立 DM 窗口，一对一对话
 - Web 和 iOS 双端同步
 
@@ -97,7 +98,7 @@ bun run dev
 
 管理员密码登录与一次性 bootstrap API 仍保留用于运维。首次迁移后应移除 `AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD`；数据库只保存 Argon2id hash。
 
-默认四个 Agent 使用 `remote-codex`。共享人设保存在 Server，可用 `PRODUCT_PROMPT_PATH`、`CREATIVE_PROMPT_PATH`、`SOCIAL_PROMPT_PATH`、`GROWTH_PROMPT_PATH` 指向对应 `AGENTS.md`。开发时仍可显式使用 `PRODUCT_PROVIDER=codex` 或 `claude`。
+默认七个创意讨论 Agent 使用 `remote-codex`。共享人设保存在 Server，可用角色前缀加 `_PROMPT_PATH` 覆盖对应 `AGENTS.md`，例如 `CREATIVE_PROMPT_PATH`、`BRAND_PROMPT_PATH`、`PRODUCT_PROMPT_PATH`。开发时仍可显式把任一角色的 `_PROVIDER` 改为 `codex` 或 `claude`。
 
 开发模式可以直接运行 Helper：
 
@@ -142,7 +143,11 @@ Remote 模式下，Agent 的定义、Memory、Conversation 和 Workflow 全在 S
 
 ## 当前 Agent
 
-本分支预置四个独立角色：产品企划（`product`）、创意设计（`creative`）、社媒运营（`social`）和营销增长（`growth`）。每个角色使用自己的工作目录与 `AGENTS.md`，可在工作群中 @ 指定角色，也可建立独立工作群或直接私聊。
+默认“创意讨论群”由七个角色组成：奇想创意家（`creative`）、IP/品牌创意师（`brand`）、产品创意策划（`product`）、内容传播策划（`content`）、市场现实校准员（`market`）、讨论主持人（`moderator`）和创意总监（`director`）。每个人设只有约 6–10 行核心规则，降低首轮 Prompt 负担。
+
+默认群的一条用户主题会启动一次服务端控制的讨论，严格最多 10 轮：奇想发散 → IP/产品回应 → 传播挑战 → 两次市场校准 → 主持人动态选择 2–3 人争论与修正 → 创意总监输出 TOP3。Agent 的 `@` 在此模式中用于支持、反驳、补充和主持选人，不会触发额外的无限模型调用。每轮只注入原始主题、最多 3 条关键结论和上一轮最多 3 条必要消息，并持久化耗时及 prompt token。普通自建群仍保留自由 `@` 协作和私聊。
+
+公司品牌资料保存在外部 `knowledge/` Volume。当前创意讨论会读取《白熊百货创意角色优先级》，要求所有方案以既有角色为主角，并按品牌手册中的顺序、性格、关系和视觉识别进行创作；完整设定仍保留在知识库原文中，不会整篇注入每一轮 Prompt。
 
 添加或调整 Agent 时，需要同步更新 `server.ts` 的 roster/runtime、前端身份映射和对应工作目录的人设文件，详见 [TECHNICAL.md](TECHNICAL.md)。
 

@@ -19,6 +19,13 @@ export type AgentTurnRoute = {
   started: boolean
   /** Hop number of the assistant output produced by this turn. */
   hopCount: number
+  /** Present only for the server-controlled ten-round creative discussion. */
+  creativeDiscussion?: {
+    discussionId: string
+    round: number
+    stage: 'main' | 'followup'
+    promptTokensEstimate: number
+  }
 }
 
 export class AgentTurnRouteQueue {

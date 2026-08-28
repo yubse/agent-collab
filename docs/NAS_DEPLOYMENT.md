@@ -83,11 +83,23 @@ deploy/nas/nginx/ai-studio.conf.example
 ```text
 /volume1/AIStudio/agents/product/AGENTS.md
 /volume1/AIStudio/agents/creative/AGENTS.md
-/volume1/AIStudio/agents/social/AGENTS.md
-/volume1/AIStudio/agents/growth/AGENTS.md
+/volume1/AIStudio/agents/brand/AGENTS.md
+/volume1/AIStudio/agents/content/AGENTS.md
+/volume1/AIStudio/agents/market/AGENTS.md
+/volume1/AIStudio/agents/moderator/AGENTS.md
+/volume1/AIStudio/agents/director/AGENTS.md
 ```
 
 Agent prompt、Agent skills 和公司知识都来自外部 Volume。修改 `/volume1/AIStudio/agents` 或 `/volume1/AIStudio/knowledge` 后不需要重建 Server 镜像；如需让正在执行的上下文立即采用新内容，重启容器即可。
+
+创意讨论当前使用以下公司知识文件：
+
+```text
+/volume1/AIStudio/knowledge/company/白熊百货_Planet_Bear_品牌合作手册2026.md
+/volume1/AIStudio/knowledge/company/白熊百货_创意角色优先级.md
+```
+
+默认索引路径为 `/app/knowledge/company/白熊百货_创意角色优先级.md`。如需替换索引，可通过 `CREATIVE_ROLE_KNOWLEDGE_PATH` 指定容器内的其他文件。
 
 ## 4. Private GHCR 首次登录
 

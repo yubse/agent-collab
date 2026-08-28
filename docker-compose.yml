@@ -13,8 +13,11 @@ services:
       AICOLLAB_DATABASE_PATH: /data/chat.db
       PRODUCT_PROVIDER: remote-codex
       CREATIVE_PROVIDER: remote-codex
-      SOCIAL_PROVIDER: remote-codex
-      GROWTH_PROVIDER: remote-codex
+      BRAND_PROVIDER: remote-codex
+      CONTENT_PROVIDER: remote-codex
+      MARKET_PROVIDER: remote-codex
+      MODERATOR_PROVIDER: remote-codex
+      DIRECTOR_PROVIDER: remote-codex
     ports:
       # Synology Reverse Proxy/Nginx connects to this loopback port. Do not expose it on WAN.
       - "${AI_STUDIO_BIND_ADDRESS:-127.0.0.1}:${AI_STUDIO_INTERNAL_PORT:-3998}:3998"
