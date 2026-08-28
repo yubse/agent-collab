@@ -17,8 +17,9 @@ afterEach(() => { helper?.stop(); helper = null })
 function startHelper(
   claim: (claimToken: string, requestId: string | null) => Promise<{ bound: boolean; already_bound: boolean }> = async () => ({ bound: true, already_bound: false }),
   codexLogin: () => Promise<{ started: true; status: 'CODEX_AUTHENTICATING' }> = async () => ({ started: true, status: 'CODEX_AUTHENTICATING' }),
+  unbind: (deviceId: string) => Promise<{ unbound: true }> = async () => ({ unbound: true }),
 ) {
-  helper = new LocalHelperServer({ port: 0, allowedOrigin: origin, status: () => status, claim, codexLogin })
+  helper = new LocalHelperServer({ port: 0, allowedOrigin: origin, status: () => status, claim, unbind, codexLogin })
   helper.start()
   return `http://127.0.0.1:${helper.port}`
 }
@@ -55,11 +56,27 @@ test('test_local_api_only_binds_loopback', () => {
   expect(() => new LocalHelperServer({
     hostname: '0.0.0.0' as any, port: 0, allowedOrigin: origin, status: () => status,
     claim: async () => ({ bound: true, already_bound: false }),
+    unbind: async () => ({ unbound: true }),
     codexLogin: async () => ({ started: true, status: 'CODEX_AUTHENTICATING' }),
   }).start()).toThrow('LOCAL_HELPER_MUST_BIND_LOOPBACK')
   const base = startHelper()
   expect(helper!.hostname).toBe('127.0.0.1')
   expect(base).toStartWith('http://127.0.0.1:')
+})
+
+test('test_local_helper_unbind_clears_only_current_device', async () => {
+  let receivedDeviceId = ''
+  const base = startHelper(undefined, undefined, async (deviceId) => {
+    receivedDeviceId = deviceId
+    return { unbound: true }
+  })
+  const response = await fetch(`${base}/unbind`, {
+    method: 'POST', headers: { origin, 'content-type': 'application/json' },
+    body: JSON.stringify({ device_id: status.device.device_id }),
+  })
+  expect(response.status).toBe(200)
+  expect(await response.json()).toEqual({ ok: true, unbound: true })
+  expect(receivedDeviceId).toBe(status.device.device_id)
 })
 
 test('test_codex_login_does_not_expose_auth', async () => {

@@ -131,6 +131,15 @@ export function listDevices(db: Database, userId: string): ConnectorDevice[] {
     FROM connector_devices WHERE user_id=? ORDER BY created_at DESC`).all(userId) as ConnectorDevice[]
 }
 
+export function unbindDevice(db: Database, userId: string, deviceId: string): ConnectorDevice | null {
+  const cleanDeviceId = deviceId.trim()
+  if (!/^[A-Za-z0-9._:-]{6,128}$/.test(cleanDeviceId)) return null
+  const device = deviceById(db, cleanDeviceId)
+  if (!device || device.user_id !== userId) return null
+  const deleted = db.prepare(`DELETE FROM connector_devices WHERE id=? AND user_id=?`).run(cleanDeviceId, userId)
+  return deleted.changes === 1 ? device : null
+}
+
 export function setDeviceStatus(db: Database, deviceId: string, status: 'online' | 'offline'): void {
   const now = new Date().toISOString()
   db.run(`UPDATE connector_devices SET status=?, last_seen_at=?, updated_at=? WHERE id=?`, [status, now, now, deviceId])

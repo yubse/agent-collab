@@ -3019,7 +3019,7 @@ async function loadConnectorDevices() {
   try {
     const data = await apiJson('/api/connectors');
     connectorDevices = Array.isArray(data.devices) ? data.devices : [];
-    if (connectorPairingState.status !== 'idle') {
+    if (connectorPairingState.status === 'creating') {
       const previous = new Set(connectorPairingState.startingDeviceIds || []);
       const connected = connectorDevices.find(device => !previous.has(device.id) || device.status === 'online');
       if (connected) {
@@ -3084,7 +3084,11 @@ async function connectThisComputer() {
     const result = await response.json().catch(() => ({}));
     trace('local_helper_claim_response', { http_status: response.status, ok: response.ok });
     if (!response.ok || !result?.ok) {
-      const allowed = new Set(['CLAIM_TOKEN_REJECTED', 'DEVICE_CREDENTIAL_SAVE_FAILED']);
+      const allowed = new Set([
+        'CLAIM_TOKEN_REJECTED',
+        'DEVICE_CREDENTIAL_SAVE_FAILED',
+        'DEVICE_ALREADY_BOUND_TO_ANOTHER_USER',
+      ]);
       throw connectorClaimError(allowed.has(result?.error) ? result.error : 'CLAIM_TOKEN_REJECTED');
     }
     const deadline = Date.now() + 20_000;
@@ -3111,6 +3115,47 @@ async function connectThisComputer() {
     renderAppSettings();
   }
 }
+async function disconnectThisComputer() {
+  if (connectorPairingState.status === 'unbinding') return;
+  const deviceId = localHelperStatus.data?.device?.device_id;
+  const ownedDevice = connectorDevices.find(device => device.id === deviceId);
+  if (!localHelperStatus.available || !deviceId || !ownedDevice) {
+    connectorPairingState = { status: 'error', error: 'UNBIND_CURRENT_DEVICE_NOT_FOUND', startingDeviceIds: connectorDevices.map(device => device.id) };
+    renderAppSettings();
+    return;
+  }
+  connectorPairingState = { status: 'unbinding', startingDeviceIds: connectorDevices.map(device => device.id), deviceId };
+  renderAppSettings();
+  try {
+    const serverResponse = await fetch(`/api/connectors/${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
+    const serverResult = await serverResponse.json().catch(() => ({}));
+    if (!serverResponse.ok || !serverResult?.unbound) throw connectorClaimError('UNBIND_SERVER_FAILED');
+
+    const helperResponse = await fetch(`${LOCAL_HELPER_URL}/unbind`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: deviceId }),
+    });
+    const helperResult = await helperResponse.json().catch(() => ({}));
+    if (!helperResponse.ok || !helperResult?.unbound) throw connectorClaimError('DEVICE_CREDENTIAL_CLEAR_FAILED');
+
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      await Promise.all([loadConnectorDevices(), loadLocalHelperStatus()]);
+      const stillRegistered = connectorDevices.some(device => device.id === deviceId);
+      if (!stillRegistered && localHelperStatus.data?.device?.bound === false) {
+        connectorPairingState = { status: 'unbound', startingDeviceIds: connectorDevices.map(device => device.id) };
+        renderAppSettings();
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    throw connectorClaimError('UNBIND_INCOMPLETE');
+  } catch (e) {
+    connectorPairingState = { status: 'error', error: e?.code || e?.message || 'UNBIND_INCOMPLETE', startingDeviceIds: connectorDevices.map(device => device.id) };
+    renderAppSettings();
+  }
+}
 function connectorClaimError(code) {
   const error = new Error(code);
   error.code = code;
@@ -3122,9 +3167,14 @@ function connectorClaimErrorText(code) {
     LOCAL_HELPER_UNREACHABLE: '无法访问本机 AI Studio Helper',
     LOCAL_HELPER_CORS_FAILED: '浏览器被本机 Helper 的安全策略拒绝',
     CLAIM_TOKEN_REJECTED: '一次性连接请求无效或已过期',
+    DEVICE_ALREADY_BOUND_TO_ANOTHER_USER: '当前电脑已连接到另一个用户，请先解绑后再连接',
     DEVICE_CREDENTIAL_SAVE_FAILED: '设备凭据无法安全保存',
     WEBSOCKET_AUTH_FAILED: 'Connector WebSocket 身份验证失败',
     CONNECTOR_REGISTRY_OFFLINE: '设备已绑定，但 Connector 尚未在服务器上线',
+    UNBIND_CURRENT_DEVICE_NOT_FOUND: '当前用户没有可解绑的本机设备',
+    UNBIND_SERVER_FAILED: '服务器未能解绑当前设备',
+    DEVICE_CREDENTIAL_CLEAR_FAILED: '本机设备凭据清除失败',
+    UNBIND_INCOMPLETE: '设备解绑尚未完成，请稍后重试',
   }[code] || code || '连接失败';
 }
 function installLocalHelper() {
@@ -3242,7 +3292,8 @@ function renderAppSettings() {
       ? `<div style="padding:5px 0 10px;">
           <div style="font-size:10px;color:var(--ink-3);letter-spacing:.08em;">本机连接</div>
           <div style="margin-top:6px;font-size:13px;color:var(--good);font-weight:600;">● AI Studio Helper 已运行</div>
-          ${onlineDevice ? `<div style="margin-top:7px;color:var(--ink);">● ${esc(onlineDevice.device_name)} · 在线</div>` : `
+          ${onlineDevice ? `<div style="margin-top:7px;color:var(--ink);">● ${esc(onlineDevice.device_name)} · 在线</div>
+            <button data-action="connector-unbind" style="margin-top:10px;border:1px solid var(--border);background:var(--surface);color:var(--bad);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">解绑此电脑</button>` : `
             <div style="margin-top:6px;color:var(--ink-2);">尚未连接当前用户</div>
             <button data-action="connector-connect" style="margin-top:10px;border:none;background:var(--ink);color:var(--surface);border-radius:9px;padding:8px 14px;cursor:pointer;font:inherit;font-size:12px;font-weight:600;">连接此电脑</button>`}
           ${deviceRows}
@@ -3274,6 +3325,10 @@ function renderAppSettings() {
     </div>`;
     const stateMessage = connectorPairingState.status === 'creating'
       ? '<div style="margin-top:9px;color:var(--ink-2);">正在创建安全连接请求…</div>'
+      : connectorPairingState.status === 'unbinding'
+        ? '<div style="margin-top:9px;color:var(--ink-2);">正在安全解绑此电脑…</div>'
+        : connectorPairingState.status === 'unbound'
+          ? '<div style="margin-top:9px;color:var(--good);font-weight:600;">解绑成功，现在可以切换用户重新连接。</div>'
       : connectorPairingState.status === 'not-installed'
           ? `<div style="margin-top:9px;padding:10px 11px;border-radius:8px;background:var(--surface);border:1px solid var(--border);">
               <div style="color:var(--ink);font-weight:600;">未检测到 AI Studio Helper</div>
@@ -8301,6 +8356,8 @@ document.getElementById('appSettingsMask').addEventListener('click', e => {
     openIdentityModal();
   } else if (act === 'connector-connect') {
     connectThisComputer();
+  } else if (act === 'connector-unbind') {
+    disconnectThisComputer();
   } else if (act === 'helper-install') {
     installLocalHelper();
   } else if (act === 'codex-login') {

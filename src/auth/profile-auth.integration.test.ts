@@ -89,6 +89,32 @@ function completionBody(deepLink: string, deviceId: string, deviceName: string, 
   })
 }
 
+function openDeviceCredential(deviceCredential: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/connector`)
+    const timer = setTimeout(() => reject(new Error('device credential authentication timed out')), 5_000)
+    ws.addEventListener('open', () => ws.send(JSON.stringify({
+      type: 'hello', protocol_version: 1, device_token: deviceCredential, device_name: 'Profile Test Mac',
+    })))
+    ws.addEventListener('message', (event) => {
+      const message = JSON.parse(String(event.data))
+      if (message.type !== 'hello_ack') return
+      clearTimeout(timer)
+      if (message.status === 'ok') resolve(ws)
+      else reject(new Error(message.error || 'device credential rejected'))
+    })
+    ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error('device websocket failed')) })
+  })
+}
+
+function waitForSocketClose(ws: WebSocket): Promise<void> {
+  if (ws.readyState === WebSocket.CLOSED) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('device websocket did not close')), 5_000)
+    ws.addEventListener('close', () => { clearTimeout(timer); resolve() }, { once: true })
+  })
+}
+
 beforeAll(async () => {
   server = spawnServer()
   await waitForServer()
@@ -226,6 +252,43 @@ describe('Trusted LAN profile authentication', () => {
       body: completionBody(deepLink, 'dev_native-connector', 'Native Connector Mac'),
     }))
     expect(connectorCompletion.device_credential).toBeString()
+  })
+
+  test('test_user_a_unbinds_and_user_b_rebinds_same_device', async () => {
+    const deviceId = 'dev_profile-transfer'
+    const messageMarker = 'UNBIND_MUST_PRESERVE_MESSAGE'
+    const memoryMarker = 'UNBIND_MUST_PRESERVE_MEMORY'
+    await json(await api('/group/send', tinaCookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: tinaConversationId, text: messageMarker, mentions: [] }),
+    }))
+    await json(await api('/api/agents/product/memory', tinaCookie, {
+      method: 'PUT', body: JSON.stringify({ content: memoryMarker }),
+    }))
+
+    const tinaClaim = await json(await api('/api/connectors/claim/start', tinaCookie, { method: 'POST', body: '{}' }))
+    const tinaPair = await json(await api('/api/connectors/claim/complete', '', {
+      method: 'POST', body: completionBody(`aistudio://pair?token=${tinaClaim.claim_token}`, deviceId, 'Transfer Mac'),
+    }))
+    const oldSocket = await openDeviceCredential(tinaPair.device_credential)
+
+    expect((await api(`/api/connectors/${deviceId}`, liutingCookie, { method: 'DELETE' })).status).toBe(404)
+    const unbound = await json(await api(`/api/connectors/${deviceId}`, tinaCookie, { method: 'DELETE' }))
+    expect(unbound).toMatchObject({ ok: true, device_id: deviceId, unbound: true })
+    await waitForSocketClose(oldSocket)
+    await expect(openDeviceCredential(tinaPair.device_credential)).rejects.toThrow('invalid device token')
+    expect((await json(await api('/api/connectors', tinaCookie))).devices.some((device: any) => device.id === deviceId)).toBe(false)
+
+    const liutingClaim = await json(await api('/api/connectors/claim/start', liutingCookie, { method: 'POST', body: '{}' }))
+    await json(await api('/api/connectors/claim/complete', '', {
+      method: 'POST', body: completionBody(`aistudio://pair?token=${liutingClaim.claim_token}`, deviceId, 'Transfer Mac'),
+    }))
+    const liutingDevices = (await json(await api('/api/connectors', liutingCookie))).devices
+    expect(liutingDevices.some((device: any) => device.id === deviceId && device.user_id === liuting.id)).toBe(true)
+
+    const messages = (await json(await api(`/api/conversations/${encodeURIComponent(tinaConversationId)}/messages`, tinaCookie))).messages
+    expect(messages.some((message: any) => message.text === messageMarker)).toBe(true)
+    expect((await json(await api('/api/agents/product/memory', tinaCookie))).memory.content).toBe(memoryMarker)
+    expect((await json(await api('/api/conversations', tinaCookie))).conversations.some((item: any) => item.id === tinaConversationId)).toBe(true)
   })
 
   test('test_switch_profile_clears_old_session', async () => {

@@ -32,6 +32,14 @@ export class ConnectorRegistry {
     for (const listener of this.disconnectListeners) listener(connection)
   }
 
+  disconnect(deviceId: string, code = 4004, reason = 'device unbound'): boolean {
+    const connection = this.devices.get(deviceId)
+    if (!connection) return false
+    this.unregister(deviceId, connection.socket)
+    connection.socket.close?.(code, reason)
+    return true
+  }
+
   touch(deviceId: string): void {
     const connection = this.devices.get(deviceId)
     if (connection) connection.lastSeenAt = Date.now()
@@ -50,4 +58,3 @@ export class ConnectorRegistry {
     return () => this.disconnectListeners.delete(listener)
   }
 }
-

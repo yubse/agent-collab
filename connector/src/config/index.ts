@@ -125,3 +125,16 @@ export function saveDevice(config: ConnectorConfig, deviceToken: string, connect
   }, null, 2), { mode: 0o600 })
   chmodSync(deviceFile, 0o600)
 }
+
+export function clearDeviceCredential(config: ConnectorConfig): void {
+  const credentialsDir = path.join(config.appSupportDir, 'credentials')
+  const deviceFile = path.join(credentialsDir, 'device.json')
+  mkdirSync(credentialsDir, { recursive: true, mode: 0o700 })
+  writeFileSync(deviceFile, JSON.stringify({
+    server_url: config.serverUrl,
+    connector_ws_url: config.connectorWsUrl || undefined,
+    device_name: config.deviceName,
+    device_id: config.deviceId,
+  }, null, 2), { mode: 0o600 })
+  chmodSync(deviceFile, 0o600)
+}

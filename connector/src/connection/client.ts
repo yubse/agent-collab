@@ -26,22 +26,26 @@ export async function runConnector(
   deviceToken: string | (() => string),
   runner: ExecutionRunner,
   state: ConnectorStateStore,
-): Promise<never> {
+  signal?: AbortSignal,
+): Promise<void> {
   let delay = 1_000
-  while (true) {
+  while (!signal?.aborted) {
     try {
       const currentDeviceToken = typeof deviceToken === 'function' ? deviceToken() : deviceToken
       if (!currentDeviceToken) throw new Error('CONNECTOR_NOT_BOUND')
-      await connectOnce(config, currentDeviceToken, runner, state)
+      await connectOnce(config, currentDeviceToken, runner, state, signal)
       delay = 1_000
     } catch (error: any) {
+      if (signal?.aborted) break
       const message = error?.message || 'connection failed'
       state.setServer('SERVER_DISCONNECTED', message)
       console.error(`[connector] status=SERVER_DISCONNECTED error=${connectionErrorCode(message)} retry=${Math.round(delay / 1000)}s`)
     }
-    await Bun.sleep(delay)
+    if (signal?.aborted) break
+    await sleepUntil(delay, signal)
     delay = Math.min(delay * 2, 30_000)
   }
+  state.setServer('SERVER_DISCONNECTED')
 }
 
 export function connectOnce(
@@ -49,13 +53,20 @@ export function connectOnce(
   deviceToken: string,
   runner: ExecutionRunner,
   state: ConnectorStateStore,
+  signal?: AbortSignal,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new Error('CONNECTOR_ABORTED')); return }
     const ws = new WebSocket(resolveWebsocketUrl(config))
     let authenticated = false
     let settledOpen = false
     let heartbeat: ReturnType<typeof setInterval> | null = null
     const attachedRequests = new Set<string>()
+    const onAbort = () => {
+      ws.close(4004, 'device unbound')
+      if (!settledOpen) reject(new Error('CONNECTOR_ABORTED'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
     const connectTimer = setTimeout(() => {
       if (authenticated) return
       reject(new Error('CONNECT_TIMEOUT'))
@@ -120,10 +131,25 @@ export function connectOnce(
     ws.addEventListener('close', () => {
       clearTimeout(connectTimer)
       if (heartbeat) clearInterval(heartbeat)
+      signal?.removeEventListener('abort', onAbort)
       state.setServer('SERVER_DISCONNECTED')
       if (settledOpen) resolve()
       else reject(new Error('AI Studio Server closed the connection before authentication'))
     })
+  })
+}
+
+function sleepUntil(delay: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return Bun.sleep(delay)
+  if (signal.aborted) return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, delay)
+    signal.addEventListener('abort', done, { once: true })
+    function done() {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
   })
 }
 

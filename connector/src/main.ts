@@ -1,4 +1,4 @@
-import { loadConfig, saveDevice } from './config/index.ts'
+import { clearDeviceCredential, loadConfig, saveDevice } from './config/index.ts'
 import { LocalCodexExecutor } from './codex/executor.ts'
 import { CodexRuntimeManager } from './codex/runtime-manager.ts'
 import { ExecutionRunner } from './execution/runner.ts'
@@ -22,11 +22,20 @@ export async function main(): Promise<never> {
     executionTimeoutMs: config.executionTimeoutMs,
   }, undefined, runtime)
   const runner = new ExecutionRunner(executor, state)
-  let connectorStarted = false
+  let connectorController: AbortController | null = null
   const ensureConnector = () => {
-    if (connectorStarted || !deviceToken) return
-    connectorStarted = true
-    void runConnector(config, () => deviceToken || '', runner, state)
+    if (connectorController || !deviceToken) return
+    const controller = new AbortController()
+    connectorController = controller
+    void runConnector(config, () => deviceToken || '', runner, state, controller.signal)
+      .finally(() => { if (connectorController === controller) connectorController = null })
+  }
+
+  const stopConnector = () => {
+    const controller = connectorController
+    connectorController = null
+    controller?.abort()
+    state.setServer('SERVER_DISCONNECTED')
   }
 
   const completeClaim = async (claimToken: string, incomingRequestId: string | null = null): Promise<{ bound: boolean; already_bound: boolean }> => {
@@ -89,6 +98,19 @@ export async function main(): Promise<never> {
       }
     },
     claim: completeClaim,
+    unbind: async (deviceId) => {
+      if (deviceId !== config.deviceId) throw new Error('device_id mismatch')
+      stopConnector()
+      try {
+        clearDeviceCredential(config)
+      } catch {
+        throw new Error('DEVICE_CREDENTIAL_CLEAR_FAILED')
+      }
+      deviceToken = null
+      config.deviceToken = null
+      console.log(`[connector-unbind] device=${safeTraceId(config.deviceId) || 'unknown'} state=credential_cleared`)
+      return { unbound: true }
+    },
     codexLogin: () => runtime.login(),
     codexRestart: () => runtime.restart(),
   })

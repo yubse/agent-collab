@@ -47,6 +47,7 @@ import {
   createPairingRequest,
   listDevices,
   setDeviceStatus,
+  unbindDevice,
 } from './src/connector/pairing.ts'
 import { hasRequestAuth, isLocalRequestHost, requestAuthMode } from './src/auth.ts'
 // AIC-65: handleTodosRoutes import removed — iOS todo 跟 task 撞定位，整个 todo 模块退役
@@ -2842,6 +2843,16 @@ Bun.serve<ConnectorSocketData>({
 
     if (req.method === 'GET' && url.pathname === '/api/connectors' && isAuthed) {
       return Response.json({ ok: true, devices: listDevices(db, currentUser!.id) })
+    }
+
+    const connectorUnbindMatch = url.pathname.match(/^\/api\/connectors\/([^/]+)$/)
+    if (req.method === 'DELETE' && connectorUnbindMatch && isAuthed) {
+      const deviceId = decodeURIComponent(connectorUnbindMatch[1])
+      const removed = unbindDevice(db, currentUser!.id, deviceId)
+      if (!removed) return Response.json({ ok: false, error: 'device not found' }, { status: 404 })
+      const disconnected = connectorRegistry.disconnect(removed.id)
+      console.error(`[connector-unbind] user=${safeConnectorTraceId(currentUser!.id)} device=${safeConnectorTraceId(removed.id)} registry_disconnected=${disconnected}`)
+      return Response.json({ ok: true, device_id: removed.id, unbound: true })
     }
 
     if (req.method === 'POST' && url.pathname === '/api/connectors/pairing/start' && isAuthed) {

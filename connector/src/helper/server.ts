@@ -26,6 +26,7 @@ export type LocalHelperServerOptions = {
   allowedOrigin: string
   status: () => LocalHelperStatus
   claim: (claimToken: string, requestId: string | null) => Promise<{ bound: boolean; already_bound: boolean }>
+  unbind: (deviceId: string) => Promise<{ unbound: true }>
   codexLogin: () => Promise<{ started: true; status: 'CODEX_AUTHENTICATING' }>
   codexRestart?: () => Promise<void>
 }
@@ -95,6 +96,30 @@ export class LocalHelperServer {
         return Response.json({ ok: true, ...result }, { headers: this.corsHeaders(false) })
       } catch (error: any) {
         return Response.json({ ok: false, error: safeClaimError(error?.message) }, {
+          status: 400,
+          headers: this.corsHeaders(false),
+        })
+      }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/unbind') {
+      if (origin !== this.options.allowedOrigin) {
+        return Response.json({ ok: false, error: 'ORIGIN_REQUIRED' }, { status: 403 })
+      }
+      try {
+        const body = await request.json() as Record<string, unknown>
+        if ('user_id' in body || 'username' in body || 'password' in body || 'device_token' in body) {
+          return Response.json({ ok: false, error: 'IDENTITY_OR_CREDENTIAL_NOT_ACCEPTED' }, {
+            status: 400,
+            headers: this.corsHeaders(false),
+          })
+        }
+        const deviceId = typeof body.device_id === 'string' ? body.device_id.trim() : ''
+        if (!deviceId) throw new Error('device_id required')
+        const result = await this.options.unbind(deviceId)
+        return Response.json({ ok: true, ...result }, { headers: this.corsHeaders(false) })
+      } catch {
+        return Response.json({ ok: false, error: 'DEVICE_CREDENTIAL_CLEAR_FAILED' }, {
           status: 400,
           headers: this.corsHeaders(false),
         })
