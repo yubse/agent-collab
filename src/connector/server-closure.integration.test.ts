@@ -68,7 +68,7 @@ async function json(response: Response): Promise<any> {
   return value
 }
 
-type TestConnector = { ws: WebSocket; requests: any[]; token: string; close(): Promise<void> }
+type TestConnector = { ws: WebSocket; requests: any[]; cancellations: any[]; token: string; close(): Promise<void> }
 type ConnectorAnswer = string | ((request: any) => string | Promise<string>)
 
 async function pairConnector(cookie: string, name: string, answer: ConnectorAnswer): Promise<TestConnector> {
@@ -88,6 +88,7 @@ async function pairConnector(cookie: string, name: string, answer: ConnectorAnsw
 function openConnector(token: string, name: string, answer: ConnectorAnswer): Promise<TestConnector> {
   return new Promise((resolve, reject) => {
     const requests: any[] = []
+    const cancellations: any[] = []
     const ws = new WebSocket(`ws://127.0.0.1:${port}/connector`)
     const timer = setTimeout(() => reject(new Error(`connector ${name} did not authenticate`)), 5_000)
     ws.addEventListener('open', () => ws.send(JSON.stringify({
@@ -98,7 +99,7 @@ function openConnector(token: string, name: string, answer: ConnectorAnswer): Pr
       if (message.type === 'hello_ack' && message.status === 'ok') {
         clearTimeout(timer)
         resolve({
-          ws, requests, token,
+          ws, requests, cancellations, token,
           close: () => new Promise<void>((done) => {
             if (ws.readyState === WebSocket.CLOSED) return done()
             ws.addEventListener('close', () => done(), { once: true })
@@ -106,6 +107,7 @@ function openConnector(token: string, name: string, answer: ConnectorAnswer): Pr
           }),
         })
       }
+      if (message.type === 'cancel_request') cancellations.push(message)
       if (message.type === 'execution_request') {
         requests.push(message)
         ws.send(JSON.stringify({
@@ -115,6 +117,10 @@ function openConnector(token: string, name: string, answer: ConnectorAnswer): Pr
         const started = Date.now()
         void Promise.resolve(typeof answer === 'function' ? answer(message) : answer).then((content) => {
           const finished = Date.now()
+          ws.send(JSON.stringify({
+            type: 'execution_delta', request_id: message.request_id,
+            sequence: 1, delta: content, created_at: new Date(finished).toISOString(),
+          }))
           ws.send(JSON.stringify({
             type: 'execution_result', request_id: message.request_id,
             status: 'success', content, usage: { input_tokens: 123, output_tokens: 40 },
@@ -182,6 +188,114 @@ afterAll(async () => {
 })
 
 describe('Server → Connector → Conversation closure', () => {
+  test('D2 shared Channel isolates execution ownership and broadcasts one message stream', async () => {
+    const privateMarker = `PRIVATE_MEMORY_${Date.now()}`
+    await json(await api('/api/agents/content/memory', userACookie, {
+      method: 'PUT', body: JSON.stringify({ content: privateMarker }),
+    }))
+    const created = await json(await api('/api/channels', userACookie, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'D2 Shared', human_member_ids: [userB.id], agent_member_ids: ['content'],
+        user_id: userB.id, owner_user_id: userB.id, role: 'owner',
+      }),
+    }))
+    const channelId = created.channel.id
+    expect(created.channel.scope).toBe('shared')
+    expect(created.channel.owner_user_id).toBe(userA.id)
+    expect(created.channel.memberships.find((m: any) => m.member_id === userA.id).role).toBe('owner')
+    expect(created.channel.memberships.find((m: any) => m.member_id === userB.id).role).toBe('member')
+
+    const connectorA = await pairConnector(userACookie, 'D2 Connector A', async (request) => {
+      if (String(request.prompt).includes('D2_CANCEL_A')) { await Bun.sleep(300); return 'D2_LATE_A' }
+      await Bun.sleep(60); return 'D2_AGENT_A'
+    })
+    const connectorB = await pairConnector(userBCookie, 'D2 Connector B', async (request) => {
+      if (String(request.prompt).includes('D2_CANCEL_B')) { await Bun.sleep(300); return 'D2_LATE_B' }
+      await Bun.sleep(60); return 'D2_AGENT_B'
+    })
+
+    const humanA = `D2_HUMAN_A_${Date.now()}`
+    const humanSent = await json(await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: humanA, mentions: [] }),
+    }))
+    expect(humanSent.targets).toEqual([])
+    expect(humanSent.observers).toEqual([])
+    const bHistory = await json(await api(`/api/conversations/${channelId}/messages`, userBCookie))
+    const humanMessage = bHistory.messages.find((m: any) => m.text === humanA)
+    expect(humanMessage.sender_actor).toMatchObject({ type: 'human', id: userA.id, display_name: 'User A' })
+    const bRealtime = await json(await api(`/group/poll?conversation_id=${channelId}&stream_since=0`, userBCookie))
+    expect(bRealtime.execution_events.some((e: any) => e.type === 'message_created' && e.message_id === humanMessage.id)).toBe(true)
+
+    await json(await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: '@content from A', mentions: ['content'] }),
+    }))
+    await json(await api('/group/send', userBCookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: '@content from B', mentions: ['content'] }),
+    }))
+    const [agentA, agentB] = await Promise.all([
+      waitForMessage(userACookie, channelId, 'D2_AGENT_A'),
+      waitForMessage(userBCookie, channelId, 'D2_AGENT_B'),
+    ])
+    expect(agentA.execution_owner_user_id).toBe(userA.id)
+    expect(agentB.execution_owner_user_id).toBe(userB.id)
+    expect(agentA.sender_actor).toMatchObject({ type: 'agent', id: 'content' })
+    expect(connectorA.requests).toHaveLength(1)
+    expect(connectorB.requests).toHaveLength(1)
+    expect(connectorA.requests[0]).toMatchObject({ user_id: userA.id, conversation_id: channelId, agent_id: 'content' })
+    expect(connectorB.requests[0]).toMatchObject({ user_id: userB.id, conversation_id: channelId, agent_id: 'content' })
+    expect(String(connectorA.requests[0].prompt)).not.toContain(privateMarker)
+
+    const streamA = await json(await api(`/group/poll?conversation_id=${channelId}&stream_since=0`, userACookie))
+    const streamB = await json(await api(`/group/poll?conversation_id=${channelId}&stream_since=0`, userBCookie))
+    const normalized = (stream: any) => stream.execution_events
+      .filter((e: any) => ['execution_delta', 'execution_result'].includes(e.type))
+      .map((e: any) => [e.type, e.message_id, e.sequence || null])
+    expect(normalized(streamA)).toEqual(normalized(streamB))
+    expect(new Set([agentA.id, agentB.id]).size).toBe(2)
+
+    await json(await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: '@content D2_CANCEL_A', mentions: ['content'] }),
+    }))
+    while (connectorA.requests.length < 2) await Bun.sleep(5)
+    const memberStop = await json(await api('/group/stop', userBCookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId }),
+    }))
+    expect(memberStop.stopped).toBe(false)
+    expect(connectorA.cancellations).toHaveLength(0)
+    await json(await api('/group/stop', userACookie, { method: 'POST', body: JSON.stringify({ conversation_id: channelId }) }))
+    expect(connectorA.cancellations).toHaveLength(1)
+
+    await json(await api('/group/send', userBCookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: '@content D2_CANCEL_B', mentions: ['content'] }),
+    }))
+    while (connectorB.requests.length < 2) await Bun.sleep(5)
+    await json(await api('/group/stop', userACookie, { method: 'POST', body: JSON.stringify({ conversation_id: channelId }) }))
+    expect(connectorB.cancellations).toHaveLength(1)
+
+    expect((await api(`/api/conversations/${channelId}/messages`, adminCookie)).status).toBe(404)
+    expect((await api('/group/send', adminCookie, { method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: 'forged' }) })).status).toBe(400)
+    expect((await api(`/group/poll?conversation_id=${channelId}`, adminCookie)).status).toBe(404)
+    expect((await api(`/api/search?channels=${channelId}&q=D2`, adminCookie)).status).toBe(403)
+
+    const uploaded = await json(await api('/upload?name=d2.txt', userBCookie, { method: 'POST', body: 'D2 attachment' }))
+    await json(await api('/group/send', userBCookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: 'D2 attachment', files: [uploaded.filename], mentions: [] }),
+    }))
+    expect((await api(`/images/${uploaded.filename}`, userACookie)).status).toBe(200)
+
+    const removed = await api(`/api/channels/${channelId}/members/human/${userB.id}`, userACookie, { method: 'DELETE' })
+    expect(removed.status).toBe(200)
+    expect((await api(`/api/conversations/${channelId}/messages`, userBCookie)).status).toBe(404)
+    expect((await api(`/group/poll?conversation_id=${channelId}`, userBCookie)).status).toBe(404)
+    expect((await api(`/api/search?channels=${channelId}&q=D2`, userBCookie)).status).toBe(403)
+    expect((await api(`/group/stream?conversation_id=${channelId}`, userBCookie)).status).toBe(404)
+    expect((await api(`/images/${uploaded.filename}`, userBCookie)).status).toBe(404)
+    expect((await api('/seen', userBCookie, { method: 'POST', body: JSON.stringify({ channel: channelId, last_seen_id: humanMessage.id }) })).status).toBe(404)
+    await connectorA.close()
+    await connectorB.close()
+  }, 15_000)
+
   test('test_existing_credential_reconnects and preserves per-user execution closure', async () => {
     const convA = await freeConversation(userACookie, 'Connector closure A')
     const convB = await freeConversation(userBCookie, 'Connector closure B')
@@ -192,6 +306,10 @@ describe('Server → Connector → Conversation closure', () => {
       method: 'POST', body: JSON.stringify({ conversation_id: convA, text: '@content test A', mentions: ['content'] }),
     }))
     await waitForMessage(userACookie, convA, 'CONNECTOR_OK_A')
+    const streamA = await json(await api(`/group/poll?conversation_id=${encodeURIComponent(convA)}&stream_since=0`, userACookie))
+    const streamTypes = streamA.execution_events.map((event: any) => event.type)
+    expect(streamTypes).toContain('execution_delta')
+    expect(streamTypes.indexOf('execution_delta')).toBeLessThan(streamTypes.indexOf('execution_result'))
     expect(connectorA.requests).toHaveLength(1)
     expect(connectorA.requests[0]).toMatchObject({ user_id: userA.id, conversation_id: convA, agent_id: 'content' })
     expect(connectorB.requests).toHaveLength(0)
@@ -239,6 +357,58 @@ describe('Server → Connector → Conversation closure', () => {
     expect(response.record.delivery.failed).toContain('content')
     expect(response.record.delivery.errors.content).toBe('CODEX_CONNECTOR_OFFLINE')
   })
+
+  test('stops one conversation by request_id and ignores late connector output', async () => {
+    const stoppedConversation = await freeConversation(userACookie, 'Precise stop')
+    const unaffectedConversation = await freeConversation(userACookie, 'Unaffected run')
+    const connector = await pairConnector(userACookie, 'Precise Stop Connector', async (request) => {
+      if (request.conversation_id === stoppedConversation) {
+        await Bun.sleep(300)
+        return 'LATE_CANCELLED_RESULT'
+      }
+      return 'OTHER_CONVERSATION_OK'
+    })
+
+    await json(await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({
+        conversation_id: stoppedConversation, text: '@content stop this run', mentions: ['content'],
+      }),
+    }))
+    const requestDeadline = Date.now() + 2_000
+    while (!connector.requests.some((item) => item.conversation_id === stoppedConversation) && Date.now() < requestDeadline) {
+      await Bun.sleep(10)
+    }
+    const stoppedRequest = connector.requests.find((item) => item.conversation_id === stoppedConversation)
+    expect(stoppedRequest).toBeTruthy()
+
+    await json(await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({
+        conversation_id: unaffectedConversation, text: '@content keep this run', mentions: ['content'],
+      }),
+    }))
+    const stopResponse = await json(await api('/group/stop', userACookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: stoppedConversation }),
+    }))
+    expect(stopResponse).toMatchObject({ ok: true, status: 'stopped', stopped: true })
+    expect(connector.cancellations).toContainEqual(expect.objectContaining({
+      type: 'cancel_request', request_id: stoppedRequest.request_id, reason: 'user_cancel',
+    }))
+
+    await waitForMessage(userACookie, unaffectedConversation, 'OTHER_CONVERSATION_OK')
+    await Bun.sleep(350)
+    const stoppedMessages = (await json(await api(
+      `/api/conversations/${encodeURIComponent(stoppedConversation)}/messages`, userACookie,
+    ))).messages
+    expect(stoppedMessages.some((item: any) => item.text === 'LATE_CANCELLED_RESULT')).toBe(false)
+    expect(stoppedMessages.some((item: any) => item.text === '已停止')).toBe(true)
+    const stream = await json(await api(
+      `/group/poll?conversation_id=${encodeURIComponent(stoppedConversation)}&stream_since=0`, userACookie,
+    ))
+    expect(stream.execution_events.some((item: any) =>
+      item.type === 'execution_error' && item.error === 'CODEX_EXECUTION_CANCELLED')).toBe(true)
+    expect(connector.ws.readyState).toBe(WebSocket.OPEN)
+    await connector.close()
+  }, 10_000)
 
   test('creative discussion is capped at seven rounds with moderator-selected followups', async () => {
     const conversationId = await defaultConversation(userACookie)

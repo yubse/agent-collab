@@ -55,6 +55,18 @@ import { dangerousEndpointFor, hasRemoteControlConfirm, logDangerousOperation } 
 import { runMigrations, LEGACY_ADMIN_ID } from './src/db/migrations.ts'
 import { UserRepository } from './src/data/user-repository.ts'
 import {
+  activeChannelMembership,
+  canManageMembers,
+  canPostChannel,
+  canReadChannel,
+  canStopExecution,
+  channelRoleForUser,
+  listChannelMemberships,
+  removeChannelMembership,
+  upsertChannelMembership,
+} from './src/channels/access.ts'
+import { actorForNewMessage, resolveActor, resolvedActorForMessage, type ActorType, type ResolvedActor } from './src/actors/resolver.ts'
+import {
   CREATIVE_AGENTS,
   CREATIVE_AGENT_BY_ID,
   CREATIVE_AGENT_IDS,
@@ -502,6 +514,12 @@ type GroupRecord = {
   conversation_id: string
   sender_id: string
   sender_model: string | null
+  sender_actor_type: ActorType | null
+  sender_actor_id: string | null
+  execution_owner_user_id: string | null
+  trigger_message_id: string | null
+  trigger_actor_id: string | null
+  sender_actor: ResolvedActor | null
   text: string
   images: string[]
   files: any[]
@@ -604,6 +622,94 @@ function runtimeProviderKey(userId: string, conversationId: string, agentId: str
   return `${userId}:${conversationId}:${agentId}`
 }
 
+type BrowserExecutionEvent = {
+  type: 'execution_started' | 'execution_delta' | 'execution_result' | 'execution_error' | 'message_created'
+  event_id: number
+  message_id: string
+  conversation_id: string
+  agent_id?: string
+  created_at: string
+  delta?: string
+  content?: string
+  status?: 'success' | 'error'
+  error?: string
+}
+
+const browserExecutionEvents = new Map<string, BrowserExecutionEvent[]>()
+const browserExecutionActive = new Set<string>()
+const serverFirstDeltaRequests = new Set<string>()
+type BrowserExecutionSubscriber = {
+  userId: string
+  conversationId: string
+  controller: ReadableStreamDefaultController<Uint8Array>
+}
+const browserExecutionSubscribers = new Map<string, Set<BrowserExecutionSubscriber>>()
+let browserExecutionSequence = 0
+const streamEncoder = new TextEncoder()
+
+function executionStreamKey(userId: string, conversationId: string) {
+  const channel = db.prepare(`SELECT scope FROM group_conversations WHERE id=?`).get(conversationId) as any
+  if (channel?.scope === 'shared') return `channel:${conversationId}`
+  return `${userId}:${conversationId}`
+}
+
+function subscriberCanRead(subscriber: BrowserExecutionSubscriber): boolean {
+  const channel = db.prepare(`SELECT id FROM group_conversations WHERE id=?`).get(subscriber.conversationId)
+  return channel ? canReadChannel(db, subscriber.conversationId, subscriber.userId) : Boolean(dmAgentFor(subscriber.conversationId))
+}
+
+function disconnectUnauthorizedChannelSubscribers(conversationId: string) {
+  const key = `channel:${conversationId}`
+  const subscribers = browserExecutionSubscribers.get(key)
+  if (!subscribers) return
+  for (const subscriber of [...subscribers]) {
+    if (subscriberCanRead(subscriber)) continue
+    subscribers.delete(subscriber)
+    try { subscriber.controller.close() } catch {}
+  }
+  if (subscribers.size === 0) browserExecutionSubscribers.delete(key)
+}
+
+function publishBrowserExecutionEvent(
+  userId: string,
+  conversationId: string,
+  event: Omit<BrowserExecutionEvent, 'event_id' | 'conversation_id' | 'created_at'> & { created_at?: string },
+) {
+  const key = executionStreamKey(userId, conversationId)
+  const item: BrowserExecutionEvent = {
+    ...event,
+    event_id: ++browserExecutionSequence,
+    conversation_id: conversationId,
+    created_at: event.created_at || new Date().toISOString(),
+  }
+  const list = browserExecutionEvents.get(key) || []
+  list.push(item)
+  if (list.length > 2_000) list.splice(0, list.length - 2_000)
+  browserExecutionEvents.set(key, list)
+  const activeKey = `${key}:${event.message_id}`
+  if (event.type === 'execution_result' || event.type === 'execution_error') browserExecutionActive.delete(activeKey)
+  else if (event.type !== 'message_created') browserExecutionActive.add(activeKey)
+  const frame = streamEncoder.encode(`data: ${JSON.stringify(item)}\n\n`)
+  for (const subscriber of [...(browserExecutionSubscribers.get(key) || [])]) {
+    if (!subscriberCanRead(subscriber)) {
+      browserExecutionSubscribers.get(key)?.delete(subscriber)
+      try { subscriber.controller.close() } catch {}
+      continue
+    }
+    try { subscriber.controller.enqueue(frame) } catch { browserExecutionSubscribers.get(key)?.delete(subscriber) }
+  }
+  return item
+}
+
+function readBrowserExecutionEvents(userId: string, conversationId: string, since: number | null) {
+  const key = executionStreamKey(userId, conversationId)
+  const list = browserExecutionEvents.get(key) || []
+  const events = since === null
+    ? list.filter((item) => browserExecutionActive.has(`${key}:${item.message_id}`))
+    : list.filter((item) => item.event_id > since)
+  return { events, lastEventId: browserExecutionSequence }
+}
+
 function agentStateFilePath(userId: string, conversationId: string, agentId: string): string {
   const safe = (value: string) => value.replace(/[^A-Za-z0-9_.-]/g, '_')
   return path.join(RUNTIME_STATE_DIR, 'users', safe(userId), safe(conversationId), `agent_${safe(agentId)}.json`)
@@ -692,6 +798,15 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
   const key = runtimeProviderKey(userId, conversationId, agentId)
   const activeRoute = _agentTurnRoutes.current(key)
   let completedRoute: AgentTurnRoute | null = null
+  if (ev.type === 'delta' && ev.text && activeRoute && !activeRoute.observeOnly) {
+    publishBrowserExecutionEvent(activeRoute.userId, activeRoute.conversationId, {
+      type: 'execution_delta',
+      message_id: activeRoute.responseMessageId,
+      agent_id: agentId,
+      delta: ev.text,
+    })
+    return
+  }
   if ((ev.type === 'system_init' || ev.type === 'assistant') && activeRoute && !activeRoute.observeOnly) {
     if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId, { dispatch_id: activeRoute.dispatchId })
   } else if (ev.type === 'result') {
@@ -725,6 +840,13 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
     if (_dedupAgentReply(key, text)) return
     if (activeRoute.creativeDiscussion) {
       recordCreativeDiscussionOutput(activeRoute, agentId, text)
+      publishBrowserExecutionEvent(activeRoute.userId, conversationId, {
+        type: 'execution_result',
+        message_id: activeRoute.responseMessageId,
+        agent_id: agentId,
+        content: text,
+        status: 'success',
+      })
       return
     }
     try {
@@ -743,9 +865,13 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
       }
       const record = appendGroupRecord(
         {
+          id: activeRoute.responseMessageId,
           sender_id: agentId,
           conversation_id: conversationId,
           text,
+          execution_owner_user_id: activeRoute.userId,
+          trigger_message_id: activeRoute.recordId,
+          trigger_actor_id: (db.prepare(`SELECT sender_actor_id FROM group_messages WHERE id=?`).get(activeRoute.recordId) as any)?.sender_actor_id || activeRoute.userId,
           message_type: 'chat',
           source: 'provider_reply',
         },
@@ -753,6 +879,13 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
         delivery,
         activeRoute.userId,
       )
+      publishBrowserExecutionEvent(activeRoute.userId, conversationId, {
+        type: 'execution_result',
+        message_id: record.id,
+        agent_id: agentId,
+        content: text,
+        status: 'success',
+      })
       const executionRequestId = typeof ev.raw?.request_id === 'string'
         ? ev.raw.request_id.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
         : ''
@@ -850,6 +983,9 @@ type GroupConversationSummary = {
   created_at: string
   created_by: string
   is_default: boolean
+  scope: 'private' | 'shared'
+  owner_user_id: string
+  current_user_role: 'owner' | 'moderator' | 'member'
   member_ids: string[]
 }
 
@@ -858,35 +994,71 @@ function ensureUserDefaultConversation(user: AuthenticatedUser): GroupConversati
   if (existing) return groupConversationById(String(existing.id), user.id)!
   const id = user.id === LEGACY_ADMIN_ID ? 'workgroup' : `workgroup-${user.id.slice(4, 16)}`
   const now = groupNowIso()
-  db.run(`INSERT INTO group_conversations (id, name, created_at, created_by, is_default, user_id)
-    VALUES (?, '创意讨论群', ?, ?, 1, ?)`, [id, now, user.id, user.id])
+  db.run(`INSERT INTO group_conversations
+    (id, name, created_at, created_by, is_default, user_id, scope, owner_user_id, updated_at)
+    VALUES (?, '创意讨论群', ?, ?, 1, ?, 'private', ?, ?)`, [id, now, user.id, user.id, user.id, now])
+  upsertChannelMembership(db, { channelId: id, memberType: 'human', memberId: user.id, role: 'owner', now })
   saveConversationMembers(id, ['admin', ...ROLE_AGENT_IDS])
   return groupConversationById(id, user.id)!
 }
 
 function groupConversationById(id: string, userId: string): GroupConversationSummary | null {
-  const row = db.prepare(`SELECT id, name, created_at, created_by, is_default FROM group_conversations WHERE id=? AND user_id=?`).get(id, userId) as any
+  if (!canReadChannel(db, id, userId)) return null
+  const row = db.prepare(`SELECT id, name, created_at, created_by, is_default, scope,
+    COALESCE(owner_user_id, user_id) AS owner_user_id FROM group_conversations WHERE id=?`).get(id) as any
   if (!row) return null
-  const members = db.prepare(`SELECT member_id FROM group_conversation_members WHERE conversation_id=? ORDER BY member_id`).all(id) as any[]
+  let members = db.prepare(`SELECT member_id FROM channel_memberships
+    WHERE channel_id=? AND member_type='agent' AND status='active' ORDER BY member_id`).all(id) as any[]
+  if (members.length === 0 && row.scope === 'private') {
+    members = db.prepare(`SELECT member_id FROM group_conversation_members
+      WHERE conversation_id=? AND member_id!='admin' ORDER BY member_id`).all(id) as any[]
+  }
   return {
     id: row.id,
     name: row.name,
     created_at: row.created_at,
     created_by: row.created_by,
     is_default: !!row.is_default,
-    member_ids: members.map((m) => String(m.member_id)),
+    scope: row.scope,
+    owner_user_id: row.owner_user_id,
+    current_user_role: channelRoleForUser(db, id, userId)!,
+    member_ids: ['admin', ...members.map((m) => String(m.member_id))],
   }
 }
 
 function listGroupConversations(userId: string): GroupConversationSummary[] {
-  const rows = db.prepare(`SELECT id FROM group_conversations WHERE user_id=? ORDER BY is_default DESC, created_at ASC`).all(userId) as any[]
+  const rows = userRepo.listConversations(userId)
   return rows.map((row) => groupConversationById(String(row.id), userId)).filter(Boolean) as GroupConversationSummary[]
 }
 
+function channelMembershipPayload(channelId: string) {
+  return listChannelMemberships(db, channelId).map((membership) => ({
+    ...membership,
+    actor: resolveActor(db, membership.member_type, membership.member_id),
+  }))
+}
+
+function channelPayload(channelId: string, userId: string) {
+  const channel = groupConversationById(channelId, userId)
+  if (!channel) return null
+  return { ...channel, memberships: channelMembershipPayload(channelId) }
+}
+
+function channelMemberCandidates(tenantId: string) {
+  const humans = db.prepare(`SELECT id, display_name FROM users WHERE tenant_id=? ORDER BY display_name, id`)
+    .all(tenantId)
+  const agents = ROLE_AGENT_IDS.map((id) => resolveActor(db, 'agent', id)).filter(Boolean)
+  return { humans, agents }
+}
+
 function groupMemberIds(conversationId: string, userId: string): string[] {
-  return (db.prepare(`SELECT m.member_id FROM group_conversation_members m
-    JOIN group_conversations c ON c.id=m.conversation_id
-    WHERE m.conversation_id=? AND c.user_id=?`).all(conversationId, userId) as any[])
+  if (!canReadChannel(db, conversationId, userId)) return []
+  const channel = db.prepare(`SELECT scope FROM group_conversations WHERE id=?`).get(conversationId) as any
+  const current = (db.prepare(`SELECT member_id FROM channel_memberships
+    WHERE channel_id=? AND member_type='agent' AND status='active'`).all(conversationId) as any[])
+    .map((row) => String(row.member_id))
+  if (current.length || channel?.scope === 'shared') return ['admin', ...current]
+  return (db.prepare(`SELECT member_id FROM group_conversation_members WHERE conversation_id=?`).all(conversationId) as any[])
     .map((row) => String(row.member_id))
 }
 
@@ -906,6 +1078,16 @@ function saveConversationMembers(conversationId: string, memberIds: string[]) {
   db.run(`DELETE FROM group_conversation_members WHERE conversation_id=?`, [conversationId])
   for (const memberId of memberIds) {
     db.run(`INSERT INTO group_conversation_members (conversation_id, member_id, added_at) VALUES (?, ?, ?)`, [conversationId, memberId, now])
+  }
+  const channel = db.prepare(`SELECT COALESCE(owner_user_id, user_id) AS owner_user_id FROM group_conversations WHERE id=?`).get(conversationId) as any
+  if (channel?.owner_user_id) {
+    upsertChannelMembership(db, { channelId: conversationId, memberType: 'human', memberId: channel.owner_user_id, role: 'owner', now })
+  }
+  const requestedAgents = new Set(memberIds.filter((id) => id !== 'admin' && ROLE_AGENT_IDS.includes(id as CreativeAgentId)))
+  db.run(`UPDATE channel_memberships SET status='removed', left_at=?, updated_at=?
+    WHERE channel_id=? AND member_type='agent' AND status='active'`, [now, now, conversationId])
+  for (const agentId of requestedAgents) {
+    upsertChannelMembership(db, { channelId: conversationId, memberType: 'agent', memberId: agentId, role: 'member', now })
   }
 }
 
@@ -1442,9 +1624,15 @@ function notifyActorViaDM(actor_id: string, task: any, event: any) {
   const delivery = { mode: 'dm', targets: [actor_id], dispatch_id: dispatchId, delivered: [], failed: [] }
   const meta = { task_id: task.id, event_id: event.id, event_type: event.meta?.event_type }
   db.run(
-    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner, user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [recordId, ts, `dm-${actor_id}`, 'system', null, text, '[]', '[]', '[]', null, null, 'task_notify', JSON.stringify(delivery), JSON.stringify(meta), 'system_notification', task.id, null, actor_id, task.user_id],
+    `INSERT INTO group_messages
+      (id, ts, conversation_id, sender_id, sender_model, sender_actor_type, sender_actor_id,
+       execution_owner_user_id, trigger_message_id, trigger_actor_id,
+       text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta,
+       message_type, task_id, parent_task_id, owner, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [recordId, ts, `dm-${actor_id}`, 'system', null, 'system', 'system', null, null, null,
+      text, '[]', '[]', '[]', null, null, 'task_notify', JSON.stringify(delivery), JSON.stringify(meta),
+      'system_notification', task.id, null, actor_id, task.user_id],
   )
   // Tmux injection for agents only (admin is human, no agent session for DM)
   if (actor_id !== 'admin') {
@@ -1453,6 +1641,9 @@ function notifyActorViaDM(actor_id: string, task: any, event: any) {
       user_id: task.user_id,
       conversation_id: `dm-${actor_id}`,
       sender_id: 'system', sender_model: null,
+      sender_actor_type: 'system', sender_actor_id: 'system',
+      execution_owner_user_id: null, trigger_message_id: null, trigger_actor_id: null,
+      sender_actor: resolveActor(db, 'system', 'system'),
       text, images: [], files: [], mentions: [],
       parent_msg_id: null, reply_to: null,
       source: 'task_notify', delivery, meta,
@@ -1729,7 +1920,11 @@ function groupTargetsFor(senderId: string, mentions: string[], hopCount: number,
   const sender = GROUP_ROSTER_BY_ID.get(senderId)
   const replyable = groupAgentIds(conversationId, userId).filter((id) => groupAgentAutoReply(id))
   if (!sender?.can_reply) {
-    const effective = mentions.length ? mentions : replyable
+    const scope = (db.prepare(`SELECT scope FROM group_conversations WHERE id=?`).get(conversationId) as any)?.scope
+    // Shared Channels are Human-first rooms: a plain Human message must not
+    // implicitly invoke every Agent. Existing private groups keep their legacy
+    // default responder behaviour.
+    const effective = mentions.length ? mentions : scope === 'shared' ? [] : replyable
     if (effective.includes(GROUP_ALL_TOKEN)) return replyable
     return effective.filter((id) => replyable.includes(id))
   }
@@ -1738,6 +1933,8 @@ function groupTargetsFor(senderId: string, mentions: string[], hopCount: number,
 }
 
 function groupObserverTargetsFor(senderId: string, responseTargets: string[], conversationId: string, userId: string) {
+  const scope = (db.prepare(`SELECT scope FROM group_conversations WHERE id=?`).get(conversationId) as any)?.scope
+  if (scope === 'shared') return []
   const sender = GROUP_ROSTER_BY_ID.get(senderId)
   const responseSet = new Set(responseTargets)
   return groupAgentIds(conversationId, userId).filter((id) => {
@@ -1963,13 +2160,18 @@ function groupMembersPayload(userId?: string) {
 }
 
 function groupRowToRecord(row: any): GroupRecord {
-  return {
+  const record = {
     id: row.id,
     user_id: row.user_id,
     ts: row.ts,
     conversation_id: row.conversation_id || 'workgroup',
     sender_id: row.sender_id,
     sender_model: row.sender_model || null,
+    sender_actor_type: row.sender_actor_type || null,
+    sender_actor_id: row.sender_actor_id || null,
+    execution_owner_user_id: row.execution_owner_user_id || null,
+    trigger_message_id: row.trigger_message_id || null,
+    trigger_actor_id: row.trigger_actor_id || null,
     text: row.text,
     images: jsonParseSafe(row.images, []),
     files: jsonParseSafe(row.files, []),
@@ -1983,19 +2185,32 @@ function groupRowToRecord(row: any): GroupRecord {
     task_id: row.task_id || null,
     parent_task_id: row.parent_task_id || null,
     owner: row.owner || null,
-  }
+  } as Omit<GroupRecord, 'sender_actor'>
+  return { ...record, sender_actor: resolvedActorForMessage(db, record) }
 }
 
 function readGroupRecords(userId: string, since: string | null, limit: number, conversationId?: string, beforeId?: string | null) {
   const safeLimit = Math.min(Math.max(limit || 120, 1), 500)
+  const persistedChannel = conversationId
+    ? db.prepare(`SELECT id FROM group_conversations WHERE id=?`).get(conversationId)
+    : null
+  if (persistedChannel && !canReadChannel(db, conversationId!, userId)) return []
   let rows: any[]
   // AIC-90: before_id 历史分页 — 取 ts < anchor.ts (按 ts DESC) limit 条 + reverse 让最早在头
   if (beforeId) {
-    const anchor = db.prepare(`SELECT ts FROM group_messages WHERE id = ? AND user_id=?`).get(beforeId, userId) as any
+    const anchor = persistedChannel
+      ? db.prepare(`SELECT ts FROM group_messages WHERE id=? AND conversation_id=?`).get(beforeId, conversationId) as any
+      : db.prepare(`SELECT ts FROM group_messages WHERE id=? AND user_id=?`).get(beforeId, userId) as any
     if (!anchor) return []
-    rows = conversationId
-      ? (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id = ? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(userId, conversationId, anchor.ts, safeLimit) as any[]).reverse()
+    rows = persistedChannel
+      ? (db.prepare(`SELECT * FROM group_messages WHERE conversation_id=? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(conversationId, anchor.ts, safeLimit) as any[]).reverse()
+      : conversationId
+      ? (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id=? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(userId, conversationId, anchor.ts, safeLimit) as any[]).reverse()
       : (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(userId, anchor.ts, safeLimit) as any[]).reverse()
+  } else if (persistedChannel) {
+    rows = since
+      ? db.prepare(`SELECT * FROM group_messages WHERE conversation_id=? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(conversationId, since, safeLimit) as any[]
+      : (db.prepare(`SELECT * FROM group_messages WHERE conversation_id=? ORDER BY ts DESC LIMIT ?`).all(conversationId, safeLimit) as any[]).reverse()
   } else if (conversationId) {
     rows = since
       ? db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id = ? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(userId, conversationId, since, safeLimit) as any[]
@@ -2115,13 +2330,28 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
   let taskId = String(input.task_id || '').trim() || null
   if (messageType === 'task' && !taskId) taskId = groupId('task')
   const ts = groupNowIso()
+  // Human identity always comes from the authenticated/server-owned userId. Caller
+  // supplied actor/user fields are deliberately ignored for browser-originated posts.
+  const actor = actorForNewMessage(senderId, userId)
   const record: GroupRecord = {
-    id: groupId('grp'),
+    id: String(input.id || '').trim() || groupId('grp'),
     user_id: userId,
     ts,
     conversation_id: String(input.conversation_id || 'workgroup'),
     sender_id: senderId,
     sender_model: input.model || member.model || null,
+    sender_actor_type: actor?.type || null,
+    sender_actor_id: actor?.id || null,
+    execution_owner_user_id: senderId !== 'admin' && senderId !== 'system'
+      ? String(input.execution_owner_user_id || userId)
+      : null,
+    trigger_message_id: senderId !== 'admin' && senderId !== 'system'
+      ? String(input.trigger_message_id || '').trim() || null
+      : null,
+    trigger_actor_id: senderId !== 'admin' && senderId !== 'system'
+      ? String(input.trigger_actor_id || '').trim() || null
+      : null,
+    sender_actor: actor ? resolveActor(db, actor.type, actor.id) : null,
     text,
     images,
     files,
@@ -2137,14 +2367,23 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
     owner: String(input.owner || '').trim() || (delivery.targets?.[0] || null),
   }
   db.run(
-    `INSERT INTO group_messages (id, ts, conversation_id, sender_id, sender_model, text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta, message_type, task_id, parent_task_id, owner, user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO group_messages
+      (id, ts, conversation_id, sender_id, sender_model, sender_actor_type, sender_actor_id,
+       execution_owner_user_id, trigger_message_id, trigger_actor_id,
+       text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta,
+       message_type, task_id, parent_task_id, owner, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       record.id,
       record.ts,
       record.conversation_id,
       record.sender_id,
       record.sender_model,
+      record.sender_actor_type,
+      record.sender_actor_id,
+      record.execution_owner_user_id,
+      record.trigger_message_id,
+      record.trigger_actor_id,
       record.text,
       JSON.stringify(record.images),
       JSON.stringify(record.files),
@@ -2161,6 +2400,11 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
       record.user_id,
     ],
   )
+  publishBrowserExecutionEvent(userId, record.conversation_id, {
+    type: 'message_created',
+    message_id: record.id,
+    agent_id: record.sender_actor_type === 'agent' ? record.sender_actor_id || undefined : undefined,
+  })
   // AIC-51: previously agent post → markAgentIdle as a "round done" heuristic.
   // Removed because it fires mid-round when the agent sends a progress message
   // while still working, falsely flipping state to idle before Stop hook /
@@ -2251,6 +2495,58 @@ function failCreativeDiscussion(discussionId: string, reason: string) {
   appendCreativeSystemMessage(discussion, `⚠ 创意讨论在第${discussion.current_round}轮停止：${safeReason}`, discussion.current_round, { status: 'failed' })
 }
 
+async function stopConversationRun(userId: string, conversationId: string) {
+  let cancelledRequests = 0
+  let stoppedRoutes = 0
+  const ownPrefix = `${userId}:${conversationId}:`
+  const channelMarker = `:${conversationId}:`
+  const persistedChannel = db.prepare(`SELECT id FROM group_conversations WHERE id=?`).get(conversationId)
+  const interruptions: Promise<unknown>[] = []
+  for (const [key, provider] of AGENT_PROVIDERS) {
+    if (persistedChannel) {
+      if (!key.includes(channelMarker)) continue
+      const executionOwnerUserId = key.slice(0, key.indexOf(channelMarker))
+      if (!canStopExecution(db, conversationId, userId, executionOwnerUserId)) continue
+    } else if (!key.startsWith(ownPrefix)) continue
+    const routes = _agentTurnRoutes.clear(key)
+    if (!routes.length) continue
+    stoppedRoutes += routes.length
+    const active = routes[0]
+    const agentId = key.slice(key.lastIndexOf(':') + 1)
+    for (const route of routes) {
+      if (route.observeOnly) continue
+      publishBrowserExecutionEvent(userId, conversationId, {
+        type: 'execution_error',
+        message_id: route.responseMessageId,
+        agent_id: agentId,
+        status: 'error',
+        error: 'CODEX_EXECUTION_CANCELLED',
+      })
+    }
+    if (active?.started) {
+      interruptions.push(provider.interrupt().then((cancelled) => { if (cancelled) cancelledRequests += 1 }))
+    }
+    if (isAgentWorkingInDb(agentId)) markAgentIdle(agentId)
+  }
+
+  const discussion = activeCreativeDiscussion(userId, conversationId)
+  if (discussion) {
+    const now = groupNowIso()
+    db.run(`UPDATE creative_discussions SET status='stopped', completed_at=?, error='USER_CANCELLED' WHERE id=?`, [now, discussion.id])
+    db.run(`UPDATE creative_discussion_rounds SET status='stopped', completed_at=?, pending_agents='[]'
+      WHERE discussion_id=? AND status='running'`, [now, discussion.id])
+  }
+  await Promise.allSettled(interruptions)
+  if (stoppedRoutes || discussion) {
+    appendGroupRecord({
+      sender_id: 'system', conversation_id: conversationId, text: '已停止',
+      source: 'user_cancel', message_type: 'system_notification',
+      meta: { stopped_routes: stoppedRoutes, cancelled_requests: cancelledRequests },
+    }, [], { mode: 'system', targets: [], delivered: [], failed: [] }, userId)
+  }
+  return { stopped: Boolean(stoppedRoutes || discussion), stoppedRoutes, cancelledRequests }
+}
+
 function dispatchCreativeAgent(discussion: any, round: number, stage: 'main' | 'followup', agentId: CreativeAgentId, marker: GroupRecord): boolean {
   if (AGENT_RUNTIMES[agentId]?.provider === 'remote-codex' && !connectorRegistry.isUserOnline(discussion.user_id)) {
     failCreativeDiscussion(discussion.id, 'CODEX_CONNECTOR_OFFLINE')
@@ -2283,6 +2579,7 @@ function dispatchCreativeAgent(discussion: any, round: number, stage: 'main' | '
     dispatchId: marker.delivery.dispatch_id,
     recordId: marker.id,
     prompt,
+    responseMessageId: groupId('grp'),
     started: false,
     hopCount: 0,
     creativeDiscussion: { discussionId: discussion.id, round, stage, promptTokensEstimate },
@@ -2351,9 +2648,13 @@ function recordCreativeDiscussionOutput(route: AgentTurnRoute, agentId: string, 
   let messageId = existing?.message_id || null
   if (!messageId && !isSkipCreativeResponse(nextText)) {
     const record = appendGroupRecord({
+      id: route.responseMessageId,
       sender_id: agentId,
       conversation_id: discussion.conversation_id,
       text: nextText,
+      execution_owner_user_id: route.userId,
+      trigger_message_id: route.recordId,
+      trigger_actor_id: (db.prepare(`SELECT sender_actor_id FROM group_messages WHERE id=?`).get(route.recordId) as any)?.sender_actor_id || route.userId,
       source: 'creative_discussion',
       message_type: 'chat',
       meta: { creative_discussion_id: discussion.id, creative_round: meta.round, creative_stage: meta.stage },
@@ -2562,7 +2863,7 @@ function assertGroupConversationAllowed(senderId: string, conversationId: string
   const normalizedConversationId = String(conversationId || '').trim()
   if (!normalizedConversationId) throw new Error('conversation_id required')
   const allowed = allowedGroupConversationsForSender(senderId, userId)
-  if (!allowed.has(normalizedConversationId)) {
+  if (!allowed.has(normalizedConversationId) || (senderId === 'admin' && !dmAgentFor(normalizedConversationId) && !canPostChannel(db, normalizedConversationId, userId))) {
     throw new Error(`sender ${senderId} cannot post to ${normalizedConversationId}`)
   }
 }
@@ -2611,7 +2912,11 @@ function buildBridgePrompt(record: GroupRecord, recipient: string, hopCount: num
       if (existsSync(candidate)) { sharedDefinition = readFileSync(candidate, 'utf8').trim(); break }
     } catch {}
   }
-  const privateMemory = userRepo.memory(record.user_id, recipient)?.content?.trim() || ''
+  const channelScope = (db.prepare(`SELECT scope FROM group_conversations WHERE id=?`).get(record.conversation_id) as any)?.scope
+  // Shared Channels must never inherit the triggering Human's private Agent Memory.
+  const privateMemory = channelScope === 'shared'
+    ? ''
+    : userRepo.memory(record.user_id, recipient)?.content?.trim() || ''
   const recentContext = readGroupRecords(record.user_id, null, 12, record.conversation_id)
     .filter((item) => item.id !== record.id)
     .map((item) => {
@@ -2664,6 +2969,11 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
     startNextAgentTurn(userId, conversationId, agentId)
     return
   }
+  publishBrowserExecutionEvent(route.userId, route.conversationId, {
+    type: 'execution_started',
+    message_id: route.responseMessageId,
+    agent_id: agentId,
+  })
   provider.send(route.prompt).catch((e: any) => {
     console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
     _agentTurnRoutes.remove(key, route.id)
@@ -2717,6 +3027,7 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
       dispatchId: record.delivery.dispatch_id,
       recordId: record.id,
       prompt: text,
+      responseMessageId: groupId('grp'),
       started: false,
       hopCount: hopCount + 1,
     })
@@ -3117,7 +3428,11 @@ Bun.serve<ConnectorSocketData>({
     if (req.method === 'GET' && url.pathname.startsWith('/images/')) {
       const filename = decodeURIComponent(url.pathname.slice(8))
       const owner = db.prepare(`SELECT user_id FROM uploaded_assets WHERE filename=?`).get(filename) as any
-      if (owner && owner.user_id !== currentUser!.id) return new Response('not found', { status: 404 })
+      const candidates = db.prepare(`SELECT DISTINCT conversation_id FROM group_messages
+        WHERE images LIKE ? OR files LIKE ?`).all(`%"${filename}"%`, `%"${filename}"%`) as any[]
+      const attachedAccess = candidates.some((row) => canReadChannel(db, String(row.conversation_id), currentUser!.id))
+      if (candidates.length > 0 && !attachedAccess) return new Response('not found', { status: 404 })
+      if (owner && owner.user_id !== currentUser!.id && !attachedAccess) return new Response('not found', { status: 404 })
       if (!owner && currentUser!.id !== LEGACY_ADMIN_ID) return new Response('not found', { status: 404 })
       const filePath = resolveStoredMediaPath(filename)
       const file = Bun.file(filePath)
@@ -3233,13 +3548,140 @@ Bun.serve<ConnectorSocketData>({
       return Response.json({ ok: true, conversations: userRepo.listConversations(currentUser!.id) })
     }
 
+    // D2 shared Channels. Human identity and creator/owner always come from the
+    // authenticated Session; body identity fields have no effect.
+    if (req.method === 'GET' && url.pathname === '/api/channels' && isAuthed) {
+      ensureUserDefaultConversation(currentUser!)
+      return Response.json({
+        ok: true,
+        channels: userRepo.listConversations(currentUser!.id)
+          .map((item) => channelPayload(String(item.id), currentUser!.id))
+          .filter(Boolean),
+        member_candidates: channelMemberCandidates(currentUser!.tenant_id),
+      })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/channels' && isAuthed) {
+      try {
+        const body = await readOptionalJsonObject(req)
+        const name = String(body.name || '').trim().slice(0, 60)
+        if (!name) return Response.json({ ok: false, error: 'channel name required' }, { status: 400 })
+        const requestedHumans: string[] = Array.isArray(body.human_member_ids) ? body.human_member_ids.map(String) : []
+        const requestedAgents: string[] = Array.isArray(body.agent_member_ids) ? body.agent_member_ids.map(String) : []
+        const humanIds = [...new Set([currentUser!.id, ...requestedHumans])]
+        const validHumans = db.prepare(`SELECT id FROM users WHERE tenant_id=? AND id IN (${humanIds.map(() => '?').join(',')})`)
+          .all(currentUser!.tenant_id, ...humanIds) as any[]
+        if (validHumans.length !== humanIds.length) return Response.json({ ok: false, error: 'unknown human member' }, { status: 400 })
+        const agentIds = [...new Set(requestedAgents.filter((id) => ROLE_AGENT_IDS.includes(id as CreativeAgentId)))]
+        if (agentIds.length !== new Set(requestedAgents).size) return Response.json({ ok: false, error: 'unknown agent member' }, { status: 400 })
+        const id = `channel-${randomBytes(8).toString('hex')}`
+        const now = groupNowIso()
+        db.run('BEGIN IMMEDIATE')
+        try {
+          db.run(`INSERT INTO group_conversations
+            (id,name,created_at,created_by,is_default,user_id,scope,owner_user_id,updated_at)
+            VALUES (?,?,?,?,0,?,'shared',?,?)`, [id, name, now, currentUser!.id, currentUser!.id, currentUser!.id, now])
+          for (const humanId of humanIds) {
+            upsertChannelMembership(db, {
+              channelId: id, memberType: 'human', memberId: humanId,
+              role: humanId === currentUser!.id ? 'owner' : 'member', now,
+            })
+          }
+          for (const agentId of agentIds) {
+            upsertChannelMembership(db, { channelId: id, memberType: 'agent', memberId: agentId, role: 'member', now })
+          }
+          db.run('COMMIT')
+        } catch (error) {
+          try { db.run('ROLLBACK') } catch {}
+          throw error
+        }
+        return Response.json({ ok: true, channel: channelPayload(id, currentUser!.id) }, { status: 201 })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'unable to create channel' }, { status: 400 })
+      }
+    }
+
+    const channelMatch = url.pathname.match(/^\/api\/channels\/([^/]+)$/)
+    if (req.method === 'GET' && channelMatch && isAuthed) {
+      const channelId = decodeURIComponent(channelMatch[1])
+      const channel = channelPayload(channelId, currentUser!.id)
+      return channel
+        ? Response.json({ ok: true, channel })
+        : Response.json({ ok: false, error: 'channel not found' }, { status: 404 })
+    }
+
+    const channelMembersMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/members$/)
+    if (req.method === 'GET' && channelMembersMatch && isAuthed) {
+      const channelId = decodeURIComponent(channelMembersMatch[1])
+      if (!canReadChannel(db, channelId, currentUser!.id)) {
+        return Response.json({ ok: false, error: 'channel not found' }, { status: 404 })
+      }
+      return Response.json({ ok: true, members: channelMembershipPayload(channelId) })
+    }
+
+    if (req.method === 'POST' && channelMembersMatch && isAuthed) {
+      const channelId = decodeURIComponent(channelMembersMatch[1])
+      try {
+        const body = await readOptionalJsonObject(req)
+        const memberType = body.member_type === 'human' ? 'human' : body.member_type === 'agent' ? 'agent' : null
+        const memberId = String(body.member_id || '').trim()
+        const requestedRole = body.role === 'owner' || body.role === 'moderator' || body.role === 'member' ? body.role : 'member'
+        const targetRole = memberType === 'agent' ? 'member' : requestedRole
+        if (!memberType || !memberId) return Response.json({ ok: false, error: 'member_type and member_id required' }, { status: 400 })
+        const existing = activeChannelMembership(db, channelId, memberType, memberId)
+        const actorRole = channelRoleForUser(db, channelId, currentUser!.id)
+        if (actorRole === 'moderator' && existing && existing.role !== 'member') {
+          return Response.json({ ok: false, error: 'member management forbidden' }, { status: 403 })
+        }
+        if (!canManageMembers(db, channelId, currentUser!.id, targetRole)) {
+          return Response.json({ ok: false, error: 'member management forbidden' }, { status: 403 })
+        }
+        if (memberType === 'human') {
+          const user = db.prepare(`SELECT id FROM users WHERE id=? AND tenant_id=?`).get(memberId, currentUser!.tenant_id)
+          if (!user) return Response.json({ ok: false, error: 'unknown human member' }, { status: 400 })
+        } else if (!ROLE_AGENT_IDS.includes(memberId as CreativeAgentId)) {
+          return Response.json({ ok: false, error: 'unknown agent member' }, { status: 400 })
+        }
+        if (existing?.member_type === 'human' && existing.role === 'owner' && targetRole !== 'owner') {
+          const owners = Number((db.prepare(`SELECT COUNT(*) AS n FROM channel_memberships
+            WHERE channel_id=? AND member_type='human' AND role='owner' AND status='active'`).get(channelId) as any)?.n || 0)
+          if (owners <= 1) return Response.json({ ok: false, error: 'LAST_OWNER' }, { status: 409 })
+        }
+        upsertChannelMembership(db, { channelId, memberType, memberId, role: targetRole })
+        return Response.json({ ok: true, member: activeChannelMembership(db, channelId, memberType, memberId) }, { status: 201 })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'unable to add member' }, { status: 400 })
+      }
+    }
+
+    const channelMemberDeleteMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/members\/(human|agent)\/([^/]+)$/)
+    if (req.method === 'DELETE' && channelMemberDeleteMatch && isAuthed) {
+      const channelId = decodeURIComponent(channelMemberDeleteMatch[1])
+      const memberType = channelMemberDeleteMatch[2] as 'human' | 'agent'
+      const memberId = decodeURIComponent(channelMemberDeleteMatch[3])
+      const removed = removeChannelMembership(db, {
+        channelId, memberType, memberId, actorUserId: currentUser!.id,
+      })
+      if (!removed.removed) {
+        const status = removed.error === 'NOT_FOUND' ? 404 : removed.error === 'FORBIDDEN' ? 403 : 409
+        return Response.json({ ok: false, error: removed.error }, { status })
+      }
+      if (memberType === 'human') disconnectUnauthorizedChannelSubscribers(channelId)
+      return Response.json({ ok: true, removed: true })
+    }
+
     const conversationMessagesMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/)
     if (req.method === 'GET' && conversationMessagesMatch && isAuthed) {
       const conversationId = decodeURIComponent(conversationMessagesMatch[1])
-      if (!userRepo.getConversation(currentUser!.id, conversationId) && !dmAgentFor(conversationId)) {
+      if ((!dmAgentFor(conversationId) && !canReadChannel(db, conversationId, currentUser!.id))
+          || (!userRepo.getConversation(currentUser!.id, conversationId) && !dmAgentFor(conversationId))) {
         return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
       }
-      return Response.json({ ok: true, messages: userRepo.listMessages(currentUser!.id, conversationId) })
+      const messages = userRepo.listMessages(currentUser!.id, conversationId).map((message) => ({
+        ...message,
+        sender_actor: resolvedActorForMessage(db, message),
+      }))
+      return Response.json({ ok: true, messages })
     }
 
     const agentMemoryMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/memory$/)
@@ -3341,7 +3783,10 @@ Bun.serve<ConnectorSocketData>({
         const now = groupNowIso()
         db.run(`BEGIN IMMEDIATE`)
         try {
-          db.run(`INSERT INTO group_conversations (id, name, created_at, created_by, is_default, user_id) VALUES (?, ?, ?, ?, 0, ?)`, [id, name, now, currentUser!.id, currentUser!.id])
+          db.run(`INSERT INTO group_conversations
+            (id, name, created_at, created_by, is_default, user_id, scope, owner_user_id, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, 'private', ?, ?)`, [id, name, now, currentUser!.id, currentUser!.id, currentUser!.id, now])
+          upsertChannelMembership(db, { channelId: id, memberType: 'human', memberId: currentUser!.id, role: 'owner', now })
           saveConversationMembers(id, memberIds)
           db.run(`COMMIT`)
         } catch (e) {
@@ -3360,6 +3805,9 @@ Bun.serve<ConnectorSocketData>({
         const groupIdValue = decodeURIComponent(groupManageMatch[1])
         const existing = groupConversationById(groupIdValue, currentUser!.id)
         if (!existing) return Response.json({ ok: false, error: '群不存在' }, { status: 404 })
+        if (!canManageMembers(db, groupIdValue, currentUser!.id, 'member')) {
+          return Response.json({ ok: false, error: 'channel member management forbidden' }, { status: 403 })
+        }
         const body = await req.json() as any
         const name = String(body.name ?? existing.name).trim().slice(0, 60)
         if (!name) return Response.json({ ok: false, error: '群名称不能为空' }, { status: 400 })
@@ -3367,7 +3815,7 @@ Bun.serve<ConnectorSocketData>({
         if (memberIds.length < 2) return Response.json({ ok: false, error: '请至少选择一个 agent' }, { status: 400 })
         db.run(`BEGIN IMMEDIATE`)
         try {
-          db.run(`UPDATE group_conversations SET name=? WHERE id=?`, [name, groupIdValue])
+          db.run(`UPDATE group_conversations SET name=?, updated_at=? WHERE id=?`, [name, groupNowIso(), groupIdValue])
           saveConversationMembers(groupIdValue, memberIds)
           db.run(`COMMIT`)
         } catch (e) {
@@ -3407,7 +3855,7 @@ Bun.serve<ConnectorSocketData>({
     if (req.method === 'GET' && url.pathname === '/api/creative-discussions/current' && isAuthed) {
       const defaultConversation = ensureUserDefaultConversation(currentUser!)
       const conversationId = url.searchParams.get('conversation_id') || defaultConversation.id
-      if (!allowedGroupConversationsForSender('admin', currentUser!.id).has(conversationId)) {
+      if (!canReadChannel(db, conversationId, currentUser!.id)) {
         return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
       }
       const discussion = db.prepare(`SELECT * FROM creative_discussions
@@ -3431,6 +3879,59 @@ Bun.serve<ConnectorSocketData>({
       })
     }
 
+    if (req.method === 'GET' && url.pathname === '/group/stream' && isAuthed) {
+      const defaultConversation = ensureUserDefaultConversation(currentUser!)
+      const conversationId = url.searchParams.get('conversation_id') || defaultConversation.id
+      if (!dmAgentFor(conversationId) && !canReadChannel(db, conversationId, currentUser!.id)) {
+        return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
+      }
+      const key = executionStreamKey(currentUser!.id, conversationId)
+      let subscriberRef: BrowserExecutionSubscriber | null = null
+      let heartbeat: ReturnType<typeof setInterval> | null = null
+      const cleanup = () => {
+        if (subscriberRef) browserExecutionSubscribers.get(key)?.delete(subscriberRef)
+        if (heartbeat) clearInterval(heartbeat)
+        req.signal.removeEventListener('abort', cleanup)
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          subscriberRef = { userId: currentUser!.id, conversationId, controller }
+          const subscribers = browserExecutionSubscribers.get(key) || new Set()
+          subscribers.add(subscriberRef)
+          browserExecutionSubscribers.set(key, subscribers)
+          controller.enqueue(streamEncoder.encode(': connected\n\n'))
+          for (const event of readBrowserExecutionEvents(currentUser!.id, conversationId, null).events) {
+            controller.enqueue(streamEncoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+          }
+          heartbeat = setInterval(() => {
+            try { controller.enqueue(streamEncoder.encode(': heartbeat\n\n')) } catch { cleanup() }
+          }, 15_000)
+          req.signal.addEventListener('abort', cleanup, { once: true })
+        },
+        cancel: cleanup,
+      })
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache, no-store',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        },
+      })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/stream-trace' && isAuthed) {
+      const body = await readOptionalJsonObject(req)
+      const stage = String(body.stage || '').replace(/[^a-z_]/g, '').slice(0, 40)
+      const allowed = new Set(['browser_first_delta', 'first_render', 'execution_result'])
+      if (!allowed.has(stage)) return Response.json({ ok: false, error: 'invalid stage' }, { status: 400 })
+      const messageId = safeConnectorTraceId(body.message_id)
+      const at = Number.isFinite(Date.parse(String(body.at || ''))) ? new Date(String(body.at)).toISOString() : new Date().toISOString()
+      const elapsed = Number.isFinite(Number(body.elapsed_ms)) ? Math.max(0, Math.round(Number(body.elapsed_ms))) : null
+      console.log(`[stream] message=${messageId} stage=${stage} at=${at}${elapsed === null ? '' : ` elapsed_ms=${elapsed}`}`)
+      return Response.json({ ok: true })
+    }
+
     // Workgroup poll: GET /group/poll?since=<iso>&limit=120
     if (req.method === 'GET' && url.pathname === '/group/poll' && isAuthed) {
       const since = url.searchParams.get('since')
@@ -3438,10 +3939,17 @@ Bun.serve<ConnectorSocketData>({
       const limit = parseInt(url.searchParams.get('limit') || '120')
       const defaultConversation = ensureUserDefaultConversation(currentUser!)
       const conversationId = url.searchParams.get('conversation_id') || defaultConversation.id
-      if (!allowedGroupConversationsForSender('admin', currentUser!.id).has(conversationId)) {
+      if (!dmAgentFor(conversationId) && !canReadChannel(db, conversationId, currentUser!.id)) {
         return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
       }
       const records = readGroupRecords(currentUser!.id, since, limit, conversationId, beforeId)
+      const streamSinceRaw = url.searchParams.get('stream_since')
+      const streamSince = streamSinceRaw === null ? null : Number.parseInt(streamSinceRaw, 10)
+      const stream = readBrowserExecutionEvents(
+        currentUser!.id,
+        conversationId,
+        Number.isFinite(streamSince) ? streamSince : null,
+      )
       // AIC-90: 历史分页返 cursor (= 最早一条 id, client 下次传 before_id 用) + has_more
       // 兼容老 caller (不传 before_id 行为不变, cursor=null has_more=false)
       const isHistoryFetch = !!beforeId
@@ -3450,14 +3958,33 @@ Bun.serve<ConnectorSocketData>({
       return Response.json({
         ok: true,
         records,
+        execution_events: stream.events,
+        last_stream_id: stream.lastEventId,
         count: records.length,
         last_ts: records.at(-1)?.ts || since || null,
         cursor,
         has_more: hasMore,
         roster: GROUP_ROSTER,
         members: groupMembersPayload(currentUser!.id),
+        channel_memberships: dmAgentFor(conversationId) ? [] : channelMembershipPayload(conversationId),
         status: groupStatusSnapshot(currentUser!.id),
       })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/group/stop' && isAuthed) {
+      try {
+        const body = await readOptionalJsonObject(req)
+        const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
+        if (!dmAgentFor(conversationId)
+            && (!canReadChannel(db, conversationId, currentUser!.id)
+              || !canStopExecution(db, conversationId, currentUser!.id, currentUser!.id))) {
+          return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
+        }
+        const result = await stopConversationRun(currentUser!.id, conversationId)
+        return Response.json({ ok: true, status: 'stopped', conversation_id: conversationId, ...result })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'stop failed' }, { status: 400 })
+      }
     }
 
     // Workgroup send: POST /group/send
@@ -3636,6 +4163,9 @@ Bun.serve<ConnectorSocketData>({
         if (!actorId || !channel || !lastSeenId) {
           return Response.json({ ok: false, error: 'actor_id, channel, last_seen_id required' }, { status: 400 })
         }
+        if (!dmAgentFor(channel) && !canReadChannel(db, channel, currentUser!.id)) {
+          return Response.json({ ok: false, error: 'channel not found' }, { status: 404 })
+        }
         const now = groupNowIso()
         db.run(
           `INSERT INTO actor_channel_seen (user_id, actor_id, channel, last_seen_id, updated_at) VALUES (?, ?, ?, ?, ?)
@@ -3652,7 +4182,10 @@ Bun.serve<ConnectorSocketData>({
       const actorId = 'admin'
       const rows = db.prepare(`SELECT channel, last_seen_id, updated_at FROM actor_channel_seen WHERE user_id=? AND actor_id = ?`).all(currentUser!.id, actorId) as any[]
       const channels: Record<string, { last_seen_id: string; updated_at: string }> = {}
-      for (const r of rows) channels[r.channel] = { last_seen_id: r.last_seen_id, updated_at: r.updated_at }
+      for (const r of rows) {
+        if (!dmAgentFor(r.channel) && !canReadChannel(db, r.channel, currentUser!.id)) continue
+        channels[r.channel] = { last_seen_id: r.last_seen_id, updated_at: r.updated_at }
+      }
       return Response.json({ ok: true, actor_id: actorId, channels })
     }
 
@@ -4685,8 +5218,20 @@ Bun.serve<ConnectorSocketData>({
         const groupChs = channels.filter(c => !c.startsWith('task:'))
         const includeGroup = channels.length === 0 || groupChs.length > 0
         if (includeGroup) {
-          const conds: string[] = [`user_id=?`, `text LIKE ? ESCAPE '\\'`, `(message_type IS NULL OR message_type != 'system_notification')`]
-          const params: any[] = [currentUser!.id, likePattern]
+          const accessibleChannels = userRepo.listConversations(currentUser!.id).map((item) => String(item.id))
+          for (const requested of groupChs) {
+            if (!dmAgentFor(requested) && !accessibleChannels.includes(requested)) {
+              return Response.json({ ok: false, error: 'channel not found' }, { status: 403 })
+            }
+          }
+          const accessParts: string[] = [`(user_id=? AND conversation_id LIKE 'dm-%')`]
+          const params: any[] = [currentUser!.id]
+          if (accessibleChannels.length) {
+            accessParts.push(`conversation_id IN (${accessibleChannels.map(() => '?').join(',')})`)
+            params.push(...accessibleChannels)
+          }
+          const conds: string[] = [`(${accessParts.join(' OR ')})`, `text LIKE ? ESCAPE '\\'`, `(message_type IS NULL OR message_type != 'system_notification')`]
+          params.push(likePattern)
           if (groupChs.length > 0) {
             conds.push(`conversation_id IN (${groupChs.map(() => '?').join(',')})`)
             params.push(...groupChs)
@@ -4787,9 +5332,16 @@ Bun.serve<ConnectorSocketData>({
           }
         } else {
           // workgroup / dm-agent1 / dm-agent2 → group_messages
-          const grpRow = db.prepare(`SELECT id, ts FROM group_messages WHERE id=? AND conversation_id=? AND user_id=?`).get(messageId, channel, currentUser!.id) as any
+          if (!dmAgentFor(channel) && !canReadChannel(db, channel, currentUser!.id)) {
+            return Response.json({ ok: false, channel, message_id: messageId, found: false }, { status: 403 })
+          }
+          const grpRow = dmAgentFor(channel)
+            ? db.prepare(`SELECT id, ts FROM group_messages WHERE id=? AND conversation_id=? AND user_id=?`).get(messageId, channel, currentUser!.id) as any
+            : db.prepare(`SELECT id, ts FROM group_messages WHERE id=? AND conversation_id=?`).get(messageId, channel) as any
           if (grpRow) {
-            const next = db.prepare(`SELECT id FROM group_messages WHERE conversation_id=? AND user_id=? AND ts > ? ORDER BY ts ASC LIMIT 1`).get(channel, currentUser!.id, grpRow.ts) as any
+            const next = dmAgentFor(channel)
+              ? db.prepare(`SELECT id FROM group_messages WHERE conversation_id=? AND user_id=? AND ts > ? ORDER BY ts ASC LIMIT 1`).get(channel, currentUser!.id, grpRow.ts) as any
+              : db.prepare(`SELECT id FROM group_messages WHERE conversation_id=? AND ts > ? ORDER BY ts ASC LIMIT 1`).get(channel, grpRow.ts) as any
             result = { found: true, source_table: 'group_messages', timestamp: grpRow.ts, before_id: next?.id ?? null }
           }
         }
@@ -5138,6 +5690,15 @@ Bun.serve<ConnectorSocketData>({
         }
         if (parsed.type === 'execution_ack') {
           connectorDispatcher.handleAck(ws.data.deviceId, ws.data.userId, parsed)
+          return
+        }
+        if (parsed.type === 'execution_delta') {
+          const accepted = connectorDispatcher.handleDelta(ws.data.deviceId, ws.data.userId, parsed)
+          if (accepted && !serverFirstDeltaRequests.has(parsed.request_id)) {
+            serverFirstDeltaRequests.add(parsed.request_id)
+            console.log(`[stream] request=${safeConnectorTraceId(parsed.request_id)} stage=server_first_delta at=${new Date().toISOString()}`)
+            if (serverFirstDeltaRequests.size > 5_000) serverFirstDeltaRequests.delete(serverFirstDeltaRequests.values().next().value!)
+          }
           return
         }
         if (parsed.type === 'execution_result') {

@@ -24,6 +24,8 @@ bun run start -- --pair-token '<development-token>'
 
 `AI_STUDIO_PAIRING_TOKEN`, `AI_STUDIO_DEVICE_NAME`, `CODEX_BINARY_PATH`, and `AI_STUDIO_CODEX_CWD` may also be supplied in development. Set `USE_SYSTEM_CODEX=1` to use that system binary. Formal mode instead copies `AI_STUDIO_BUNDLED_CODEX_PATH` into the user-managed Runtime location and uses a dedicated local `CODEX_HOME`. `AI_STUDIO_WEB_ORIGIN` controls the one allowed CORS Origin and defaults to the Server origin. `CONNECTOR_WS_URL` optionally overrides the WebSocket endpoint and supports `ws://` and `wss://`. The current Profile Selector is a Trusted LAN MVP: anyone able to select 文一、Tina or 刘婷 can initiate a claim for that Profile. Device-bound Passwordless Login is intentionally deferred.
 
+Codex proxy selection is automatic: `AI_STUDIO_PROXY_URL` takes priority, then existing `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, then the active macOS HTTP, HTTPS, or SOCKS system proxy, and finally direct access. `NO_PROXY` preserves existing entries and always includes `localhost`, `127.0.0.1`, and the configured AI Studio Server host. Helper logs only the selected proxy source and type; proxy URLs and credentials are never logged.
+
 ### macOS development installation
 
 ```bash

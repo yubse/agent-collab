@@ -4,6 +4,11 @@ import { homedir, hostname } from 'os'
 import { randomUUID } from 'crypto'
 import { loadConnectorTimeouts } from '../../../src/connector/timeouts.ts'
 import { pairingTokenFromLaunchArgs, safeConnectorWebsocketUrl } from '../pairing/service.ts'
+import {
+  resolveCodexProxyEnvironment,
+  type ProxySource,
+  type ProxyType,
+} from '../network/proxy.ts'
 
 type SavedDevice = {
   server_url?: string
@@ -52,6 +57,9 @@ export type ConnectorConfig = {
   connectTimeoutMs: number
   executionTimeoutMs: number
   codexWorkerCount: number
+  codexProxyEnvironment: Record<string, string>
+  codexProxySource: ProxySource
+  codexProxyType: ProxyType
 }
 
 export function parseCodexWorkerCount(value: string | undefined): number {
@@ -82,6 +90,7 @@ export function loadConfig(): ConnectorConfig {
   const connectorWsUrl = process.env.CONNECTOR_WS_URL
     || (saved.connector_ws_url ? safeConnectorWebsocketUrl(serverUrl, saved.connector_ws_url) : null)
   const webOrigin = process.env.AI_STUDIO_WEB_ORIGIN || installed.web_origin || new URL(serverUrl).origin
+  const proxy = resolveCodexProxyEnvironment(serverUrl)
   const deviceId = process.env.AI_STUDIO_DEVICE_ID || saved.device_id || `dev_${randomUUID()}`
   mkdirSync(credentialsDir, { recursive: true, mode: 0o700 })
   if (!existsSync(deviceFile)) {
@@ -117,6 +126,9 @@ export function loadConfig(): ConnectorConfig {
     connectTimeoutMs: timeouts.connectTimeoutMs,
     executionTimeoutMs: timeouts.executionTimeoutMs,
     codexWorkerCount: parseCodexWorkerCount(process.env.AI_STUDIO_CODEX_WORKERS),
+    codexProxyEnvironment: proxy.environment,
+    codexProxySource: proxy.source,
+    codexProxyType: proxy.type,
   }
 }
 

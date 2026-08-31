@@ -15,6 +15,7 @@ export class RemoteCodexProvider implements AgentProvider {
   private eventCb: ((event: AgentEvent) => void | Promise<void>) | null = null
   private errorCb: ((error: AgentError) => void) | null = null
   private active = false
+  private activeRequestId: string | null = null
 
   constructor(
     private dispatcher: ConnectorDispatcher,
@@ -32,12 +33,16 @@ export class RemoteCodexProvider implements AgentProvider {
     if (this.active) throw new Error('remote provider already has an active turn')
     this.active = true
     try {
+      let sawFirstDelta = false
       const result = await this.dispatcher.dispatch({
         user_id: this.context.userId,
         conversation_id: this.context.conversationId,
         agent_id: this.context.agentId,
         prompt: text,
-      })
+      }, { onRequest: (requestId) => { this.activeRequestId = requestId }, onDelta: (delta) => {
+        if (!sawFirstDelta) sawFirstDelta = true
+        void this.eventCb?.({ type: 'delta', text: delta.delta, raw: delta })
+      } })
       if (result.content?.trim()) await this.eventCb?.({ type: 'assistant', text: result.content, raw: result })
       // Mark the turn free before emitting `result`: the server's result handler
       // immediately starts the next queued route on this same provider.
@@ -49,9 +54,12 @@ export class RemoteCodexProvider implements AgentProvider {
       throw error
     } finally {
       this.active = false
+      this.activeRequestId = null
     }
   }
 
-  async interrupt(): Promise<boolean> { return false }
+  async interrupt(): Promise<boolean> {
+    return this.activeRequestId ? this.dispatcher.cancel(this.activeRequestId) : false
+  }
   async close(): Promise<void> {}
 }

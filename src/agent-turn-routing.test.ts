@@ -12,6 +12,7 @@ describe('AgentTurnRouteQueue', () => {
       dispatchId: 'dispatch-normal',
       recordId: 'record-normal',
       prompt: 'normal prompt',
+      responseMessageId: 'message-normal',
       started: false,
       hopCount: 1,
     })
@@ -23,6 +24,7 @@ describe('AgentTurnRouteQueue', () => {
       dispatchId: 'dispatch-observe',
       recordId: 'record-observe',
       prompt: 'observe prompt',
+      responseMessageId: 'message-observe',
       started: false,
       hopCount: 2,
     })
@@ -48,6 +50,7 @@ describe('AgentTurnRouteQueue', () => {
         dispatchId: `dispatch-${id}`,
         recordId: `record-${id}`,
         prompt: `${id} prompt`,
+        responseMessageId: `message-${id}`,
         started: false,
         hopCount: 1,
       })
@@ -68,6 +71,7 @@ describe('AgentTurnRouteQueue', () => {
       dispatchId: 'dispatch-observe',
       recordId: 'record-observe',
       prompt: 'observe prompt',
+      responseMessageId: 'message-observe',
       started: false,
       hopCount: 1,
     })
@@ -80,6 +84,7 @@ describe('AgentTurnRouteQueue', () => {
       dispatchId: 'dispatch-normal',
       recordId: 'record-normal',
       prompt: 'normal prompt',
+      responseMessageId: 'message-normal',
       started: false,
       hopCount: 1,
     })

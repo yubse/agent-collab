@@ -58,16 +58,29 @@ function setup(account: any = null) {
     managedCodexPath: managed, bundledCodexPath: bundled, useSystemCodex: false,
     stateDir: path.join(root, 'state'), connectTimeoutMs: 15_000, executionTimeoutMs: 300_000,
     codexWorkerCount: 3,
+    codexProxyEnvironment: {
+      HTTP_PROXY: 'http://proxy.test:8080',
+      HTTPS_PROXY: 'http://proxy.test:8080',
+      ALL_PROXY: 'http://proxy.test:8080',
+      NO_PROXY: 'localhost,127.0.0.1',
+    },
+    codexProxySource: 'environment',
+    codexProxyType: 'http',
   }
   let opened = ''
   let providerCreations = 0
+  let providerEnvironment: Record<string, string | undefined> = {}
   const manager = new CodexRuntimeManager(config, new ConnectorStateStore(), {
     version: (binary) => existsSync(binary) ? 'codex-cli test-1' : null,
-    provider: () => { providerCreations += 1; return provider as any },
+    provider: (_binary, env) => { providerCreations += 1; providerEnvironment = env; return provider as any },
     openUrl: async (url) => { opened = url },
   })
   managers.push(manager)
-  return { manager, provider, config, opened: () => opened, providerCreations: () => providerCreations }
+  return {
+    manager, provider, config, opened: () => opened,
+    providerCreations: () => providerCreations,
+    providerEnvironment: () => providerEnvironment,
+  }
 }
 
 describe('CodexRuntimeManager', () => {
@@ -80,11 +93,16 @@ describe('CodexRuntimeManager', () => {
   })
 
   test('test_runtime_manager_starts_runtime', async () => {
-    const { manager, provider } = setup({ type: 'chatgpt' })
+    const { manager, provider, providerEnvironment } = setup({ type: 'chatgpt' })
     await manager.start()
     expect(provider.warmups).toBe(1)
     expect(manager.isAlive).toBe(true)
     expect(manager.snapshot().status).toBe('CODEX_READY')
+    expect(providerEnvironment()).toMatchObject({
+      CODEX_HOME: expect.any(String),
+      HTTPS_PROXY: 'http://proxy.test:8080',
+      ALL_PROXY: 'http://proxy.test:8080',
+    })
   })
 
   test('test_runtime_reused_between_requests', async () => {

@@ -476,6 +476,25 @@ button, textarea, input { font: inherit; }
   margin-top: 4px; font-size: 13.5px; line-height: 1.55; color: var(--ink);
   white-space: pre-wrap; word-break: break-word;
 }
+.ws-msg-comment[data-stream-status="typing"] .ws-msg-text::after,
+.ws-dm-msg-row[data-stream-status="typing"] .ws-dm-msg-body::after {
+  content: '';
+  display: inline-block;
+  width: 2px; height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.12em;
+  background: currentColor;
+  animation: ws-stream-caret 720ms steps(1, end) infinite;
+}
+.ws-msg-stream-status {
+  display: inline-block;
+  margin-top: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9.5px;
+  color: var(--ink-3);
+}
+.ws-msg-stream-status.failed { color: var(--error); }
+@keyframes ws-stream-caret { 50% { opacity: 0; } }
 .ws-msg-system {
   display: flex; align-items: center; gap: 10px; padding: 2px 0;
 }
@@ -531,6 +550,7 @@ button, textarea, input { font: inherit; }
 }
 .ws-send-btn:hover { filter: brightness(.92); }
 .ws-send-btn:disabled { opacity: .35; cursor: not-allowed; }
+.ws-send-btn.is-stop { background: var(--error); color: #fff; min-width: 74px; }
 .ws-composer-pending {
   display: flex; flex-wrap: wrap; gap: 6px;
 }
@@ -2162,10 +2182,12 @@ button, textarea, input { font: inherit; }
 .ws-dm-msg-bubble.from-pm .md-body blockquote { border-left-color: rgba(255,255,255,0.4); color: rgba(255,250,243,0.78); }
 .ws-dm-msg-bubble.from-pm .md-body a { color: #b8d4ff; }
 </style>
+<link rel="stylesheet" href="/web/workgroup-v2/app.css">
 
 <!-- AIC-78: markdown rendering — marked.js parse + DOMPurify sanitize. CDN, ~50KB total. -->
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
+<script src="/web/workgroup-v2/typewriter-buffer.js"></script>
 </head>
 <body>
 
@@ -2200,6 +2222,15 @@ button, textarea, input { font: inherit; }
   <div class="ws-workspace-shell">
   <!-- === WORKSTATION SIDEBAR === -->
   <aside class="ws-container ws-workstation-sidebar">
+    <div class="studio-sidebar-brand">
+      <div class="studio-logo">AI</div>
+      <div><strong>AI Studio</strong><span>Team workspace</span></div>
+      <button class="studio-icon-button" id="sidebarSettingsBtn" title="设置"><span class="material-symbols-rounded">settings</span></button>
+    </div>
+    <div class="studio-profile">
+      <span class="studio-avatar" id="sidebarProfileAvatar">—</span>
+      <span><strong id="sidebarProfileName">加载中…</strong><small>当前用户</small></span>
+    </div>
     <section class="ws-group-switcher" aria-label="工作群列表">
       <div class="ws-group-switcher-head">
         <div class="ws-section-label">群聊 · GROUPS</div>
@@ -2208,6 +2239,14 @@ button, textarea, input { font: inherit; }
       <div class="ws-group-list" id="groupList">
         <!-- rendered by renderGroupList() -->
       </div>
+    </section>
+    <section class="studio-sidebar-section">
+      <div class="studio-sidebar-label">私聊</div>
+      <div id="sidebarDmList" class="studio-sidebar-links"></div>
+    </section>
+    <section class="studio-sidebar-section">
+      <div class="studio-sidebar-label">工作</div>
+      <button class="studio-sidebar-link" data-sidebar-view="tasks"><span class="material-symbols-rounded">task_alt</span><span>我的任务</span></button>
     </section>
     <div class="ws-sidebar-divider"></div>
     <div class="ws-workstation-head">
@@ -2228,15 +2267,15 @@ button, textarea, input { font: inherit; }
       <div class="ws-chat-panel">
         <div class="ws-chat-card">
           <div class="ws-chat-header">
-            <div class="ws-mac-dots" aria-hidden="true">
-              <span class="ws-mac-dot red"></span>
-              <span class="ws-mac-dot yellow"></span>
-              <span class="ws-mac-dot green"></span>
-            </div>
             <div class="ws-chat-title-row">
               <span class="ws-chat-title" id="groupChatTitle">创意讨论群</span>
-              <span class="ws-chat-divider">｜</span>
               <span class="ws-chat-members" id="groupChatMembers">admin · 创想家A · 创想家B · 创想家C · 创想家D · 市场现实校准员 · 讨论主持人 · 创意总监</span>
+            </div>
+            <div class="studio-channel-actions">
+              <button class="studio-header-stop" id="headerStopButton" style="display:none">■ 停止</button>
+              <button class="studio-icon-button" id="channelMembersToggle" title="成员"><span class="material-symbols-rounded">group</span></button>
+              <button class="studio-icon-button" id="channelSearchButton" title="搜索"><span class="material-symbols-rounded">search</span></button>
+              <button class="studio-icon-button" id="channelMoreButton" title="更多"><span class="material-symbols-rounded">more_horiz</span></button>
             </div>
           </div>
           <div class="ws-chat-messages" data-ws-scroll="y" id="groupMessages">
@@ -2251,7 +2290,7 @@ button, textarea, input { font: inherit; }
                 <button class="ws-composer-btn" id="btnAttachFile" title="附件">📎</button>
                 <input type="file" id="fileInput" multiple style="display:none">
                 <span style="flex:1"></span>
-                <span class="ws-composer-hint">⌘↵ 发送</span>
+                <span class="ws-composer-hint">Enter 发送 · Shift+Enter 换行</span>
                 <button class="ws-send-btn" id="sendBtn" disabled>发送</button>
               </div>
             </div>
@@ -2296,7 +2335,7 @@ button, textarea, input { font: inherit; }
                   <button class="ws-composer-btn" id="dmBtnAttachFile" title="附件">📎</button>
                   <input type="file" id="dmFileInput" multiple style="display:none">
                   <span style="flex:1"></span>
-                  <span class="ws-composer-hint">⌘↵ 发送</span>
+                  <span class="ws-composer-hint">Enter 发送 · Shift+Enter 换行</span>
                   <button class="ws-send-btn" id="dmSendBtn" disabled>发送</button>
                 </div>
               </div>
@@ -2332,6 +2371,10 @@ button, textarea, input { font: inherit; }
       </div>
     </div>
   </main>
+  <aside class="studio-members-panel" id="membersPanel">
+    <div class="studio-members-head"><strong>Members</strong><button class="studio-icon-button" id="membersPanelClose" title="关闭"><span class="material-symbols-rounded">close</span></button></div>
+    <div id="membersPanelContent" class="studio-members-content"></div>
+  </aside>
   </div>
 
   <!-- === CREATE / EDIT WORKGROUP modal === -->
@@ -2340,7 +2383,7 @@ button, textarea, input { font: inherit; }
       <div class="ws-modal-head">
         <div>
           <div class="ws-modal-title" id="groupManageTitle">新建工作群</div>
-          <div class="ws-modal-sub">选择这个群里可以收到消息的 agent</div>
+          <div class="ws-modal-sub">共享群可同时加入真实用户和 Agent</div>
         </div>
         <span style="flex:1"></span>
         <button class="ws-modal-close" id="groupManageClose" aria-label="关闭">✕</button>
@@ -2353,10 +2396,18 @@ button, textarea, input { font: inherit; }
           </div>
           <input type="text" class="ws-input" id="groupNameInput" maxlength="60" placeholder="例如：产品讨论组">
         </label>
+        <label class="ws-field">
+          <div class="ws-field-label"><span class="ws-field-name">Type</span></div>
+          <select class="ws-input" id="groupChannelType"><option value="shared">Shared</option><option value="private">Private</option></select>
+        </label>
+        <div id="groupHumanSection" style="display:none;">
+          <div class="ws-field-label" style="margin:12px 0 8px;"><span class="ws-field-name">Human 成员</span></div>
+          <div class="ws-group-member-options" id="groupHumanOptions"></div>
+        </div>
         <div>
           <div class="ws-field-label" style="margin-bottom:8px;">
             <span class="ws-field-name">群成员</span>
-            <span style="font-size:11px;color:var(--ink-3);">admin 会自动加入</span>
+            <span style="font-size:11px;color:var(--ink-3);">Agent 成员</span>
           </div>
           <div class="ws-group-member-options" id="groupMemberOptions"></div>
         </div>
@@ -2779,13 +2830,266 @@ const channelState = {};
 // 用 — `cursor` 仍是新消息 poll 用的（since/since_id），不要混用。
 for (const k of Object.keys(CHANNELS)) channelState[k] = {
   messages: [], cursor: null,
+  streamCursor: null,
   oldestId: null, canLoadMore: true, loadingMore: false, lastError: null,
 };
+
+// Frontend-only execution stream presentation. The transport already delivers
+// execution_delta / execution_result events; this layer never fabricates text
+// from a final response. A message enters the typewriter only after its first
+// real delta, and each message_id owns an independent 20ms timer/buffer.
+let _typewriterRevision = 0;
+const _executionEventIds = new Set();
+const _streamTrace = new Map();
+const _runningExecutions = new Map();
+const _stoppedExecutionMessages = new Set();
+let _executionStreamSource = null;
+let _executionStreamChannel = null;
+const _typewriter = new window.AIStudioTypewriterBuffer({
+  tickMs: 20,
+  onUpdate: (streamState, reason) => _renderTypewriterUpdate(streamState, reason),
+});
+
+function _clientChannelForConversation(conversationId) {
+  const raw = String(conversationId || '');
+  if (CHANNELS[raw]) return raw;
+  return Object.keys(CHANNELS).find(ch => CHANNELS[ch]?.convId === raw) || raw || currentChannel;
+}
+
+function _isExecutionStreamEvent(event) {
+  const type = String(event?.type || event?.event || '');
+  return type === 'message_created' || type === 'execution_started' || type === 'execution_delta' || type === 'execution_result' || type === 'execution_error';
+}
+
+function _executionMessageId(event) {
+  return String(event?.message_id || event?.messageId || event?.payload?.message_id || '').trim();
+}
+
+function _executionEventKey(event) {
+  const id = event?.event_id ?? event?.id ?? null;
+  const seq = event?.sequence ?? event?.seq ?? event?.offset ?? null;
+  const messageId = _executionMessageId(event);
+  if (id !== null && id !== undefined) return `id:${id}`;
+  if (messageId && seq !== null && seq !== undefined) return `${messageId}:seq:${seq}`;
+  return null;
+}
+
+function _runningSet(channelId) {
+  let set = _runningExecutions.get(channelId);
+  if (!set) { set = new Set(); _runningExecutions.set(channelId, set); }
+  return set;
+}
+
+function _conversationRunning(channelId = currentChannel) {
+  return (_runningExecutions.get(channelId)?.size || 0) > 0;
+}
+
+function _markExecutionRunning(channelId, messageId) {
+  _runningSet(channelId).add(messageId);
+  updateSendBtn();
+}
+
+function _markExecutionFinished(channelId, messageId) {
+  _runningExecutions.get(channelId)?.delete(messageId);
+  updateSendBtn();
+}
+
+function _sendStreamTrace(stage, messageId, elapsedMs) {
+  fetch('/api/stream-trace', {
+    method: 'POST', credentials: 'include', keepalive: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stage, message_id: messageId, at: new Date().toISOString(), elapsed_ms: Math.round(elapsedMs) }),
+  }).catch(() => {});
+}
+
+function _ensureExecutionStream(channelId) {
+  const cfg = CHANNELS[channelId];
+  if (!cfg || typeof EventSource !== 'function') return;
+  if (_executionStreamSource && _executionStreamChannel === channelId) return;
+  if (_executionStreamSource) _executionStreamSource.close();
+  _executionStreamChannel = channelId;
+  _executionStreamSource = new EventSource(`/group/stream?conversation_id=${encodeURIComponent(cfg.convId)}`);
+  _executionStreamSource.onmessage = event => {
+    try { _consumeExecutionEvents([JSON.parse(event.data)]); }
+    catch (error) { console.warn('[stream] invalid server event', error); }
+  };
+  _executionStreamSource.onerror = () => {
+    // EventSource reconnects automatically; /group/poll remains the fallback.
+  };
+}
+
+function handleExecutionDelta(event) {
+  const payload = event?.payload || event || {};
+  const messageId = _executionMessageId(payload);
+  const delta = payload.delta ?? payload.text_delta ?? payload.content_delta;
+  if (!messageId || typeof delta !== 'string' || !delta) return false;
+  if (_stoppedExecutionMessages.has(messageId)) return false;
+  const eventKey = _executionEventKey(payload);
+  if (eventKey && _executionEventIds.has(eventKey)) return false;
+  if (eventKey) {
+    _executionEventIds.add(eventKey);
+    if (_executionEventIds.size > 5000) _executionEventIds.delete(_executionEventIds.values().next().value);
+  }
+  const trace = _streamTrace.get(messageId) || { startedAt: performance.now(), browserDelta: false, rendered: false };
+  if (!trace.browserDelta) {
+    trace.browserDelta = true;
+    const elapsed = Math.round(performance.now() - trace.startedAt);
+    console.info(`[stream] message=${messageId} stage=browser_first_delta at=${new Date().toISOString()} elapsed_ms=${elapsed}`);
+    _sendStreamTrace('browser_first_delta', messageId, elapsed);
+  }
+  _streamTrace.set(messageId, trace);
+  return _typewriter.pushDelta({
+    messageId,
+    delta,
+    eventKey,
+    channelId: _clientChannelForConversation(payload.conversation_id || payload.channel),
+    senderId: payload.agent_id || payload.sender_id,
+    createdAt: payload.created_at || payload.ts,
+  });
+}
+
+function handleExecutionStarted(event) {
+  const payload = event?.payload || event || {};
+  const messageId = _executionMessageId(payload);
+  if (!messageId) return false;
+  const channelId = _clientChannelForConversation(payload.conversation_id || payload.channel);
+  _stoppedExecutionMessages.delete(messageId);
+  if (!_streamTrace.has(messageId)) _streamTrace.set(messageId, { startedAt: performance.now(), browserDelta: false, rendered: false });
+  _markExecutionRunning(channelId, messageId);
+  return _typewriter.begin({
+    messageId,
+    channelId,
+    senderId: payload.agent_id || payload.sender_id,
+    createdAt: payload.created_at || payload.ts,
+  });
+}
+
+function handleExecutionResult(event) {
+  const payload = event?.payload || event || {};
+  const messageId = _executionMessageId(payload);
+  if (!messageId) return false;
+  const channelId = _clientChannelForConversation(payload.conversation_id || payload.channel);
+  _markExecutionFinished(channelId, messageId);
+  if (_stoppedExecutionMessages.has(messageId)) return false;
+  console.info(`[stream] message=${messageId} stage=execution_result at=${new Date().toISOString()}`);
+  _sendStreamTrace('execution_result', messageId, Math.round(performance.now() - (_streamTrace.get(messageId)?.startedAt || performance.now())));
+  return _typewriter.finish({
+    messageId,
+    status: payload.status || (payload.type === 'execution_error' ? 'error' : 'success'),
+    content: payload.content ?? payload.text,
+    error: payload.error,
+  });
+}
+
+function _consumeExecutionEvents(events) {
+  for (const event of (Array.isArray(events) ? events : [])) {
+    if (!_isExecutionStreamEvent(event)) continue;
+    const type = String(event.type || event.event);
+    if (type === 'message_created') {
+      const channelId = _clientChannelForConversation(event.conversation_id || event.channel);
+      const cs = channelState[channelId];
+      if (cs) { cs.cursor = null; pollGroup(channelId).then(() => { if (currentChannel === channelId) render(); }); }
+    } else if (type === 'execution_started') handleExecutionStarted(event);
+    else if (type === 'execution_delta') handleExecutionDelta(event);
+    else handleExecutionResult(event);
+  }
+}
+
+// Keep the ingress transport decoupled from presentation. Existing live code can
+// call these functions directly or dispatch the corresponding DOM event.
+window.handleExecutionDelta = handleExecutionDelta;
+window.handleExecutionResult = handleExecutionResult;
+window.handleExecutionStarted = handleExecutionStarted;
+window.addEventListener('aistudio:execution_started', event => handleExecutionStarted(event.detail));
+window.addEventListener('aistudio:execution_delta', event => handleExecutionDelta(event.detail));
+window.addEventListener('aistudio:execution_result', event => handleExecutionResult(event.detail));
+window.addEventListener('aistudio:execution_error', event => handleExecutionResult({ ...event.detail, type: 'execution_error', status: 'error' }));
+
+function _typewriterMessagesForChannel(channelId, savedMessages) {
+  const merged = [...savedMessages];
+  const ids = new Set(savedMessages.map(message => message.id));
+  for (const streamState of _typewriter.list(channelId)) {
+    if (ids.has(streamState.id)) continue;
+    merged.push({
+      id: streamState.id,
+      sender_id: streamState.senderId,
+      conversation_id: channelId,
+      text: '',
+      ts: streamState.createdAt,
+      message_type: 'chat',
+      source: 'execution_stream',
+    });
+  }
+  merged.sort((a, b) => String(a.ts || a.timestamp || '').localeCompare(String(b.ts || b.timestamp || '')));
+  return merged;
+}
+
+function _typewriterStatusHtml(streamState) {
+  if (!streamState) return '';
+  if (streamState.failed && /CANCELLED|STOPPED|USER_CANCEL/i.test(streamState.error || '')) {
+    return '<span class="ws-msg-stream-status">已停止</span>';
+  }
+  if (streamState.failed) return `<span class="ws-msg-stream-status failed">生成失败${streamState.error ? ` · ${esc(streamState.error)}` : ''}</span>`;
+  if (!streamState.completed) return `<span class="ws-msg-stream-status">${streamState.displayedText ? 'Working' : '正在思考…'}</span>`;
+  return '';
+}
+
+function _findMessageNode(container, messageId) {
+  if (!container) return null;
+  return [...container.querySelectorAll('[data-msg-id]')].find(node => node.dataset.msgId === messageId) || null;
+}
+
+function _renderTypewriterUpdate(streamState, reason) {
+  if (reason !== 'tick') _typewriterRevision += 1;
+  const isCurrent = streamState.channelId === currentChannel;
+  if (!isCurrent) return;
+  const groupContainer = document.getElementById('groupMessages');
+  const dmContainer = document.getElementById('dmMessages');
+  let row = _findMessageNode(groupContainer, streamState.id) || _findMessageNode(dmContainer, streamState.id);
+  if (!row) {
+    if (state.view === 'group') { _msgsSignature = ''; renderMessages(); }
+    else if (state.view === 'dm') { _dmMsgsSignature = ''; renderDmMessages(); }
+    row = _findMessageNode(groupContainer, streamState.id) || _findMessageNode(dmContainer, streamState.id);
+  }
+  if (!row) return;
+  row.dataset.streamStatus = streamState.failed ? 'failed' : streamState.completed ? 'completed' : 'typing';
+  const body = row.querySelector('.ws-msg-text, .ws-dm-msg-body');
+  if (body) body.innerHTML = mdRender(streamState.displayedText);
+  if (reason === 'tick' && streamState.displayedText) {
+    const trace = _streamTrace.get(streamState.id);
+    if (trace && !trace.rendered) {
+      trace.rendered = true;
+      const elapsed = Math.round(performance.now() - trace.startedAt);
+      console.info(`[stream] message=${streamState.id} stage=first_render at=${new Date().toISOString()} elapsed_ms=${elapsed}`);
+      _sendStreamTrace('first_render', streamState.id, elapsed);
+    }
+  }
+  const previousStatus = row.querySelector('.ws-msg-stream-status');
+  if (previousStatus) previousStatus.remove();
+  const statusHtml = _typewriterStatusHtml(streamState);
+  if (statusHtml && body) body.insertAdjacentHTML('afterend', statusHtml);
+  const scrollEl = state.view === 'group' ? groupContainer : dmContainer;
+  const shouldStick = state.view === 'group' ? _msgsStuckBottom : _dmMsgsStuckBottom;
+  if (scrollEl && shouldStick) scrollEl.scrollTop = scrollEl.scrollHeight;
+
+  // Once the final persisted row exists and the real delta buffer is drained,
+  // release the transient state. The next render uses the saved full message and
+  // a page refresh therefore never replays the animation.
+  if (streamState.completed && streamState.persisted) {
+    setTimeout(() => {
+      if (_typewriter.get(streamState.id)?.completed && _typewriter.get(streamState.id)?.persisted) {
+        _typewriter.remove(streamState.id);
+        _typewriterRevision += 1;
+      }
+    }, 250);
+  }
+}
 
 let groupConversations = [{
   id: 'workgroup', name: '创意讨论群', is_default: true,
   member_ids: ['admin', ...ROLE_AGENT_IDS],
 }];
+let channelMemberCandidates = { humans: [], agents: [] };
 
 function ensureGroupChannel(group) {
   if (!group?.id) return;
@@ -2793,6 +3097,7 @@ function ensureGroupChannel(group) {
   if (!channelState[group.id]) {
     channelState[group.id] = {
       messages: [], cursor: null,
+      streamCursor: null,
       oldestId: null, canLoadMore: true, loadingMore: false, lastError: null,
     };
   }
@@ -2805,9 +3110,10 @@ function activeGroupInfo() {
 }
 
 async function loadGroups() {
-  const data = await apiJson('/groups');
-  if (!data?.ok || !Array.isArray(data.groups)) return;
-  groupConversations = data.groups;
+  const data = await apiJson('/api/channels');
+  if (!data?.ok || !Array.isArray(data.channels)) return;
+  groupConversations = data.channels;
+  channelMemberCandidates = data.member_candidates || channelMemberCandidates;
   groupConversations.forEach(ensureGroupChannel);
   if (!groupConversations.some(g => g.id === state.activeGroup)) {
     state.activeGroup = groupConversations.find(g => g.is_default)?.id || groupConversations[0]?.id || 'workgroup';
@@ -3642,8 +3948,24 @@ function _persistMentionNotifiedIds() {
 // composition kills focus AND leaves raw pinyin in the input — the snapshot/
 // restore dance can't replay the browser's IME engine state.
 let _imeComposing = false;
+let _imeEndedAt = 0;
 document.addEventListener('compositionstart', () => { _imeComposing = true; });
-document.addEventListener('compositionend',   () => { _imeComposing = false; });
+document.addEventListener('compositionend',   () => {
+  _imeComposing = false;
+  _imeEndedAt = Date.now();
+});
+
+function isComposerImeEvent(event) {
+  return event.isComposing || event.keyCode === 229 || _imeComposing || Date.now() - _imeEndedAt < 80;
+}
+
+function shouldSendComposerOnEnter(event) {
+  if (event.key !== 'Enter' || event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) return false;
+  // Some browsers clear isComposing before dispatching the Enter keydown that
+  // confirms a Chinese candidate. The short post-composition guard covers it.
+  if (isComposerImeEvent(event)) return false;
+  return true;
+}
 
 // Create-task modal state
 let tv2Categories = [];            // server categories (also called tags here)
@@ -3767,15 +4089,31 @@ async function pollGroup(ch) {
   const cfg = CHANNELS[ch];
   const params = new URLSearchParams({ conversation_id: cfg.convId, limit: '120' });
   if (cs.cursor) params.set('since', cs.cursor);
+  if (cs.streamCursor !== null) params.set('stream_since', String(cs.streamCursor));
   const data = await apiJson(`/group/poll?${params}`);
   if (!data?.ok) return;
+  const rawRecords = Array.isArray(data.records) ? data.records : [];
+  const embeddedEvents = rawRecords.filter(_isExecutionStreamEvent);
+  _consumeExecutionEvents([
+    ...(Array.isArray(data.execution_events) ? data.execution_events : []),
+    ...(Array.isArray(data.stream_events) ? data.stream_events : []),
+    ...(Array.isArray(data.events) ? data.events : []),
+    ...embeddedEvents,
+  ]);
+  if (Number.isFinite(Number(data.last_stream_id))) cs.streamCursor = Number(data.last_stream_id);
+  const records = rawRecords.filter(record => !_isExecutionStreamEvent(record));
   const wasFirstBatch = !cs.cursor;
-  if (wasFirstBatch) cs.messages = data.records;
-  else if (data.records.length) {
+  if (wasFirstBatch) cs.messages = records;
+  else if (records.length) {
     const ids = new Set(cs.messages.map(m => m.id));
-    for (const r of data.records) if (!ids.has(r.id)) cs.messages.push(r);
+    for (const r of records) if (!ids.has(r.id)) cs.messages.push(r);
   }
-  if (data.records.length) cs.cursor = data.records.at(-1).ts;
+  for (const record of records) {
+    if (_typewriter.get(record.id)) _typewriter.markPersisted(record.id, record);
+  }
+  // Stream envelopes may be the only records in a poll batch. Advance from the
+  // server's last_ts in that case so the same delta is not requested forever.
+  if (rawRecords.length) cs.cursor = rawRecords.at(-1).ts || data.last_ts || cs.cursor;
   else if (!cs.cursor && data.last_ts) cs.cursor = data.last_ts;
   // AIC-92: 首批载入时 pin oldestId 给 loadOlder 用 (records 是 chronological ASC,
   // [0] 就是最早一条). 后续 poll 拉新消息不动 oldestId — loadOlder 才推它往前。
@@ -3797,6 +4135,7 @@ async function pollGroup(ch) {
 async function poll() {
   const cfg = CHANNELS[currentChannel];
   if (!cfg) return;
+  _ensureExecutionStream(currentChannel);
   if (cfg.type === 'group') await pollGroup(currentChannel);
   // User is on currentChannel right now — mark its messages as seen so unread
   // badges don't false-positive while you're reading.
@@ -4144,6 +4483,7 @@ function activeComposer() {
 }
 
 async function sendCurrentMessage() {
+  if (_conversationRunning()) return;
   const { ta } = activeComposer();
   if (!ta) return;
   const text = ta.value.trim();
@@ -4180,6 +4520,33 @@ async function sendCurrentMessage() {
   clearReply();
   await poll();
   scrollMessagesToBottom();
+}
+
+async function stopCurrentConversation() {
+  const cfg = CHANNELS[currentChannel];
+  if (!cfg || !_conversationRunning()) return;
+  const activeIds = [...(_runningExecutions.get(currentChannel) || [])];
+
+  // Restore the composer immediately. The network request only confirms the
+  // exact server-side cancellation; it must not keep the input locked.
+  _runningExecutions.set(currentChannel, new Set());
+  for (const messageId of activeIds) {
+    _stoppedExecutionMessages.add(messageId);
+    _typewriter.stop({ messageId, error: 'CODEX_EXECUTION_CANCELLED' });
+  }
+  updateSendBtn();
+  showWipToast('已停止');
+
+  const result = await apiJson('/group/stop', {
+    method: 'POST',
+    body: JSON.stringify({ conversation_id: cfg.convId }),
+  });
+  if (!result?.ok) showWipToast(result?.error || '停止失败');
+  await poll();
+}
+
+function handleComposerAction() {
+  return _conversationRunning() ? stopCurrentConversation() : sendCurrentMessage();
 }
 
 function setReply(id, senderName, content) {
@@ -4504,6 +4871,8 @@ function render() {
 
   renderAgentStrip();
   renderGroupList();
+  renderWorkspaceSidebar();
+  renderMembersPanel();
   if (state.view === 'group') {
     renderGroupChatHeader();
     renderMessages();
@@ -4631,29 +5000,84 @@ function renderGroupChatHeader() {
   const titleEl = document.getElementById('groupChatTitle');
   const group = activeGroupInfo();
   if (!membersEl || !group) return;
-  const ids = group.member_ids || [];
-  membersEl.textContent = ids.map(id => displayName(id)).join(' · ');
-  if (titleEl) titleEl.textContent = group.name || '创意讨论群';
+  const channelMembers = group.memberships || [];
+  const humans = channelMembers.filter(m => m.member_type === 'human').length;
+  const agents = channelMembers.filter(m => m.member_type === 'agent').length;
+  membersEl.textContent = group.scope === 'shared'
+    ? `${humans} Humans · ${agents} Agents · Shared channel`
+    : 'Private workspace';
+  if (titleEl) titleEl.textContent = `${group.scope === 'shared' ? '# ' : ''}${group.name || '创意讨论群'}`;
 }
 
 function renderGroupList() {
   const el = document.getElementById('groupList');
   if (!el) return;
-  el.innerHTML = groupConversations.map(group => {
-    const agentNames = (group.member_ids || []).filter(id => id !== 'admin').map(id => displayName(id));
+  const renderSection = (title, groups, shared) => `<div class="studio-channel-section">
+    <div class="studio-channel-section-title"><span class="studio-sidebar-label">${title}</span>${shared ? '<span></span>' : ''}</div>
+    ${groups.map(group => {
+    const memberNames = group.memberships?.map(m => m.actor?.display_name || displayName(m.member_id))
+      || (group.member_ids || []).filter(id => id !== 'admin').map(id => displayName(id));
     const unread = unreadCounts[group.id] || 0;
     return `<div class="ws-group-row">
       <button class="ws-group-select ${state.view === 'group' && state.activeGroup === group.id ? 'active' : ''}" data-group-id="${esc(group.id)}" title="打开 ${esc(group.name)}">
-        <span class="ws-group-icon">${group.is_default ? '👥' : '💬'}</span>
+        <span class="ws-group-icon">${group.scope === 'shared' ? '🌐' : group.is_default ? '👥' : '💬'}</span>
         <span class="ws-group-copy">
           <span class="ws-group-name">${esc(group.name)}</span>
-          <span class="ws-group-members-preview">${esc(agentNames.join(' · ') || '仅 admin')}</span>
+          <span class="ws-group-members-preview">${esc((group.scope === 'shared' ? '共享 · ' : '私有 · ') + (memberNames.join(' · ') || '仅自己'))}</span>
         </span>
         ${unread ? `<span class="ws-group-unread">${unread > 99 ? '99+' : unread}</span>` : ''}
       </button>
-      <button class="ws-group-edit" data-group-edit="${esc(group.id)}" title="编辑群成员" aria-label="编辑 ${esc(group.name)}">•••</button>
+      ${group.current_user_role === 'owner' || group.current_user_role === 'moderator'
+        ? `<button class="ws-group-edit" data-group-edit="${esc(group.id)}" title="编辑群成员" aria-label="编辑 ${esc(group.name)}">•••</button>` : ''}
     </div>`;
+    }).join('')}</div>`;
+  const shared = groupConversations.filter(group => group.scope === 'shared');
+  const privateGroups = groupConversations.filter(group => group.scope !== 'shared');
+  el.innerHTML = renderSection('共享频道', shared, true) + renderSection('私人空间', privateGroups, false);
+}
+
+function renderWorkspaceSidebar() {
+  const name = currentProfile?.display_name || '加载中…';
+  const nameEl = document.getElementById('sidebarProfileName');
+  const avatarEl = document.getElementById('sidebarProfileAvatar');
+  if (nameEl) nameEl.textContent = name;
+  if (avatarEl) avatarEl.textContent = name.trim().slice(0, 1) || '—';
+  const dmEl = document.getElementById('sidebarDmList');
+  if (dmEl) dmEl.innerHTML = ROLE_AGENT_IDS.map(id => {
+    const unread = unreadCounts[`dm-${id}`] || 0;
+    return `<button class="studio-sidebar-link ${state.view === 'dm' && state.activeDm === `dm-${id}` ? 'active' : ''}" data-sidebar-dm="dm-${esc(id)}">
+      <span class="studio-avatar">${_actorAvatarHtml(id, 'ws-msg-avatar-text')}</span><span style="flex:1">${esc(displayName(id))}</span>${unread ? `<span class="ws-group-unread">${unread}</span>` : ''}
+    </button>`;
   }).join('');
+  document.querySelectorAll('[data-sidebar-view]').forEach(button => button.classList.toggle('active', button.dataset.sidebarView === state.view));
+}
+
+function renderMembersPanel() {
+  const content = document.getElementById('membersPanelContent');
+  if (!content) return;
+  if (state.view !== 'group') {
+    content.innerHTML = '<div class="studio-member-section-title">当前视图没有 Channel 成员</div>';
+    return;
+  }
+  const group = activeGroupInfo();
+  const memberships = group?.memberships || [];
+  const people = memberships.filter(m => m.member_type === 'human');
+  const agents = memberships.filter(m => m.member_type === 'agent');
+  const row = (membership, agent) => {
+    const actor = membership.actor || {};
+    const id = membership.member_id;
+    const label = actor.display_name || displayName(id);
+    const status = agent ? (agentStatus[id]?.is_typing ? 'Working' : ['online','active','working','busy'].includes(String(agentStatus[id]?.state || '').toLowerCase()) ? 'Idle' : 'Offline') : 'Human';
+    return `<div class="studio-member-row">
+      <span class="studio-avatar">${agent ? _actorAvatarHtml(id, 'ws-msg-avatar-text') : esc(label.slice(0,1))}</span>
+      <span class="studio-member-copy"><strong>${esc(label)}</strong><small>${esc(status)}</small></span>
+      ${agent ? '<span class="studio-agent-badge">Agent</span>' : membership.role !== 'member' ? `<span class="studio-role-badge">${esc(membership.role)}</span>` : ''}
+      ${agent ? `<span class="studio-status-dot ${status === 'Working' ? 'working' : status === 'Idle' ? 'idle' : ''}"></span>` : ''}
+    </div>`;
+  };
+  content.innerHTML = `<section class="studio-member-section"><div class="studio-member-section-title">PEOPLE · ${people.length}</div>${people.map(m => row(m,false)).join('') || '<div class="studio-member-row">暂无 Human</div>'}</section>
+    <section class="studio-member-section"><div class="studio-member-section-title">AGENTS · ${agents.length}</div>${agents.map(m => row(m,true)).join('') || '<div class="studio-member-row">暂无 Agent</div>'}</section>
+    ${(group?.current_user_role === 'owner' || group?.current_user_role === 'moderator') ? `<button class="studio-sidebar-link" data-members-manage="${esc(group.id)}"><span class="material-symbols-rounded">manage_accounts</span>管理成员</button>` : ''}`;
 }
 
 function setActiveGroup(groupId) {
@@ -4670,6 +5094,30 @@ function setActiveGroup(groupId) {
 }
 
 let groupManageEditingId = null;
+
+function selectedMemberships(group, type) {
+  return (group?.memberships || []).filter(m => m.member_type === type && m.status !== 'removed');
+}
+
+function renderGroupHumanOptions(group = null) {
+  const el = document.getElementById('groupHumanOptions');
+  if (!el) return;
+  const selected = new Map(selectedMemberships(group, 'human').map(m => [m.member_id, m]));
+  el.innerHTML = (channelMemberCandidates.humans || []).map(human => {
+    const membership = selected.get(human.id);
+    const isSelf = human.id === currentProfile?.id;
+    return `<label class="ws-group-member-option">
+      <input type="checkbox" data-human-id="${esc(human.id)}" ${membership || isSelf ? 'checked' : ''} ${isSelf ? 'disabled' : ''}>
+      <span class="ws-group-member-avatar">${esc((human.display_name || '?').slice(0,1))}</span>
+      <span style="flex:1"><span class="ws-group-member-name">${esc(human.display_name || human.id)}</span><span class="ws-group-member-sub">Human</span></span>
+      <select data-human-role="${esc(human.id)}" ${isSelf ? 'disabled' : ''}>
+        <option value="member" ${membership?.role === 'member' ? 'selected' : ''}>member</option>
+        <option value="moderator" ${membership?.role === 'moderator' ? 'selected' : ''}>moderator</option>
+        <option value="owner" ${membership?.role === 'owner' ? 'selected' : ''}>owner</option>
+      </select>
+    </label>`;
+  }).join('');
+}
 
 function renderGroupMemberOptions(selectedIds = []) {
   const el = document.getElementById('groupMemberOptions');
@@ -4692,8 +5140,17 @@ function openGroupManage(groupId = null) {
   document.getElementById('groupManageTitle').textContent = group ? '编辑工作群' : '新建工作群';
   document.getElementById('groupManageSubmit').textContent = group ? '保存修改' : '创建群聊';
   document.getElementById('groupNameInput').value = group?.name || '';
+  const isShared = group?.scope === 'shared';
+  const showShared = group ? isShared : true;
+  const sharedToggle = document.getElementById('groupChannelType');
+  sharedToggle.value = showShared ? 'shared' : 'private';
+  sharedToggle.disabled = !!group;
+  document.getElementById('groupHumanSection').style.display = showShared ? '' : 'none';
   document.getElementById('groupManageError').style.display = 'none';
-  renderGroupMemberOptions(group?.member_ids || roster.filter(m => m.kind === 'agent').map(m => m.id));
+  renderGroupMemberOptions(group?.memberships
+    ? selectedMemberships(group, 'agent').map(m => m.member_id)
+    : group?.member_ids || roster.filter(m => m.kind === 'agent').map(m => m.id));
+  renderGroupHumanOptions(group);
   document.getElementById('groupManageMask').classList.add('open');
   setTimeout(() => document.getElementById('groupNameInput').focus(), 0);
 }
@@ -4711,20 +5168,39 @@ async function submitGroupManage() {
     errorEl.textContent = '请输入群名称'; errorEl.style.display = '';
     return;
   }
-  if (!memberIds.length) {
-    errorEl.textContent = '请至少选择一个 agent'; errorEl.style.display = '';
-    return;
-  }
+  const shared = document.getElementById('groupChannelType').value === 'shared';
   const submit = document.getElementById('groupManageSubmit');
   submit.disabled = true;
   try {
-    const path = groupManageEditingId ? `/groups/${encodeURIComponent(groupManageEditingId)}` : '/groups';
-    const data = await apiJson(path, {
-      method: groupManageEditingId ? 'PUT' : 'POST',
-      body: JSON.stringify({ name, member_ids: memberIds }),
-    });
+    const group = groupManageEditingId ? groupConversations.find(g => g.id === groupManageEditingId) : null;
+    let data;
+    if (!groupManageEditingId && shared) {
+      const humanIds = [...document.querySelectorAll('#groupHumanOptions input[data-human-id]:checked')].map(input => input.dataset.humanId);
+      data = await apiJson('/api/channels', { method: 'POST', body: JSON.stringify({ name, human_member_ids: humanIds, agent_member_ids: memberIds }) });
+    } else if (group?.scope === 'shared') {
+      const desired = [];
+      for (const input of document.querySelectorAll('#groupHumanOptions input[data-human-id]:checked')) {
+        desired.push({ member_type: 'human', member_id: input.dataset.humanId, role: document.querySelector(`[data-human-role="${CSS.escape(input.dataset.humanId)}"]`)?.value || 'member' });
+      }
+      for (const id of memberIds) desired.push({ member_type: 'agent', member_id: id, role: 'member' });
+      const existing = group.memberships || [];
+      for (const member of desired) {
+        const old = existing.find(m => m.member_type === member.member_type && m.member_id === member.member_id);
+        if (!old || old.role !== member.role) await apiJson(`/api/channels/${encodeURIComponent(group.id)}/members`, { method:'POST', body:JSON.stringify(member) });
+      }
+      for (const old of existing) {
+        if (old.member_type === 'human' && old.member_id === currentProfile?.id) continue;
+        if (!desired.some(m => m.member_type === old.member_type && m.member_id === old.member_id)) {
+          await apiJson(`/api/channels/${encodeURIComponent(group.id)}/members/${old.member_type}/${encodeURIComponent(old.member_id)}`, { method:'DELETE' });
+        }
+      }
+      data = { ok: true, channel: group };
+    } else {
+      const path = groupManageEditingId ? `/groups/${encodeURIComponent(groupManageEditingId)}` : '/groups';
+      data = await apiJson(path, { method: groupManageEditingId ? 'PUT' : 'POST', body: JSON.stringify({ name, member_ids: memberIds }) });
+    }
     if (!data?.ok) throw new Error(data?.error || '保存失败');
-    const nextGroupId = data.group?.id || groupManageEditingId || 'workgroup';
+    const nextGroupId = data.channel?.id || data.group?.id || groupManageEditingId || 'workgroup';
     closeGroupManage();
     await loadGroups();
     setActiveGroup(nextGroupId);
@@ -4756,7 +5232,8 @@ function renderMessages() {
   const el = document.getElementById('groupMessages');
   if (!el) return;
   if (_wouldClobberSelection(el)) return;
-  const msgs = channelState[currentChannel]?.messages || [];
+  const savedMessages = channelState[currentChannel]?.messages || [];
+  const msgs = _typewriterMessagesForChannel(currentChannel, savedMessages);
 
   // Same sig-cache as renderDmMessages — skip re-render when msgs unchanged so
   // browsing history isn't disturbed by the 2.5s poll's empty re-render churn.
@@ -4764,7 +5241,7 @@ function renderMessages() {
   const cs = channelState[currentChannel] || {};
   // Same expandedThinking-in-sig fix as renderDmMessages — see comment there.
   // AIC-92: include loadingMore/canLoadMore + oldestId so sentinel state flips re-render.
-  const sig = `${currentChannel}|${msgs.length}|${last?.id || ''}|${last?.ts || ''}|t:${[...expandedThinking].sort().join(',')}|lm:${cs.loadingMore?1:0}|cm:${cs.canLoadMore?1:0}|o:${cs.oldestId || ''}`;
+  const sig = `${currentChannel}|${msgs.length}|${last?.id || ''}|${last?.ts || ''}|tw:${_typewriterRevision}|t:${[...expandedThinking].sort().join(',')}|lm:${cs.loadingMore?1:0}|cm:${cs.canLoadMore?1:0}|o:${cs.oldestId || ''}`;
   if (sig === _msgsSignature && _msgsLastChannel === currentChannel) return;
   _msgsSignature = sig;
 
@@ -4828,7 +5305,8 @@ function renderMessages() {
 }
 
 function renderGroupMsg(m) {
-  const isSystem = m.sender_id === 'system' || m.message_type === 'system_notification';
+  const actor = m.sender_actor || null;
+  const isSystem = actor?.type === 'system' || m.sender_id === 'system' || m.message_type === 'system_notification';
   if (isSystem) {
     const icon = m.text?.match(/^\s*([\p{Extended_Pictographic}⚙⏭✅⚠🔔])/u)?.[1] || '⚙';
     const cleanText = (m.text || '').replace(/^\s*[\p{Extended_Pictographic}⚙⏭✅⚠🔔]\s*/u, '');
@@ -4843,10 +5321,14 @@ function renderGroupMsg(m) {
   }
   // Comment-style message
   // AIC-63 cycle 2: avatar via _actorAvatarHtml — handles emoji/image/text uniformly.
-  const r = roster.find(x => x.id === m.sender_id) || members[m.sender_id];
-  const designId = SERVER_TO_DESIGN_ID[m.sender_id] || 'pm';
-  const author = displayName(m.sender_id);
-  const taskRef = (m.text || '').match(/\[task\s*\/\s*([A-Z]+-\d+)/i)?.[1] || '';
+  const actorId = actor?.id || m.sender_actor_id || m.sender_id;
+  const isHuman = actor?.type === 'human' || m.sender_actor_type === 'human';
+  const designId = isHuman ? 'pm' : SERVER_TO_DESIGN_ID[actorId] || 'pm';
+  const author = actor?.display_name || (isHuman && actorId === currentProfile?.id ? currentProfile.display_name : displayName(actorId));
+  const streamState = _typewriter.get(m.id);
+  const visibleText = streamState ? streamState.displayedText : (m.text || '');
+  const streamStatus = streamState ? (streamState.failed ? 'failed' : streamState.completed ? 'completed' : 'typing') : '';
+  const taskRef = visibleText.match(/\[task\s*\/\s*([A-Z]+-\d+)/i)?.[1] || '';
 
   // Attachments
   const images = (m.images || []).map(fn =>
@@ -4859,17 +5341,19 @@ function renderGroupMsg(m) {
     ? `<div class="ws-msg-attachment">${images}${files}</div>` : '';
 
   return `
-    <div class="ws-msg-comment" data-msg-id="${esc(m.id)}">
+    <div class="ws-msg-comment" data-msg-id="${esc(m.id)}"${streamStatus ? ` data-stream-status="${streamStatus}"` : ''}>
       <div class="ws-msg-avatar" style="background:var(--${designId});">
-        ${_actorAvatarHtml(m.sender_id, 'ws-msg-avatar-text')}
+        ${isHuman ? `<span class="ws-msg-avatar-text">${esc((author || '?').slice(0,1))}</span>` : _actorAvatarHtml(actorId, 'ws-msg-avatar-text')}
       </div>
       <div class="ws-msg-body">
         <div class="ws-msg-head">
           <span class="ws-msg-author">${esc(author)}</span>
+          ${!isHuman ? '<span class="studio-agent-badge">Agent</span>' : ''}
           <span class="ws-msg-time">${esc(formatTime(m.ts || m.timestamp))}</span>
           ${taskRef ? `<span class="ws-msg-ref">↪ ${esc(taskRef)}</span>` : ''}
         </div>
-        ${m.text ? `<div class="ws-msg-text">${mdRender(m.text)}</div>` : ''}
+        ${(visibleText || streamState) ? `<div class="ws-msg-text">${mdRender(visibleText)}</div>` : ''}
+        ${_typewriterStatusHtml(streamState)}
         ${attachments}
       </div>
     </div>`;
@@ -4964,7 +5448,8 @@ function renderDmMessages() {
   const el = document.getElementById('dmMessages');
   if (!el) return;
   if (_wouldClobberSelection(el)) return;
-  const msgs = channelState[currentChannel]?.messages || [];
+  const savedMessages = channelState[currentChannel]?.messages || [];
+  const msgs = _typewriterMessagesForChannel(currentChannel, savedMessages);
 
   // PM bug 2026-06-19: poll runs every 2.5s and called this regardless of whether
   // the messages array actually changed — so the user browsing history saw
@@ -4978,7 +5463,7 @@ function renderDmMessages() {
   // re-painted — clicks looked dead. Include set's content in the sig so
   // user-driven UI state changes invalidate the cache.
   // AIC-92: include loadingMore/canLoadMore + oldestId so sentinel state flips re-render.
-  const sig = `${currentChannel}|${msgs.length}|${last?.id || ''}|${last?.ts || ''}|t:${[...expandedThinking].sort().join(',')}|lm:${cs.loadingMore?1:0}|cm:${cs.canLoadMore?1:0}|o:${cs.oldestId || ''}`;
+  const sig = `${currentChannel}|${msgs.length}|${last?.id || ''}|${last?.ts || ''}|tw:${_typewriterRevision}|t:${[...expandedThinking].sort().join(',')}|lm:${cs.loadingMore?1:0}|cm:${cs.canLoadMore?1:0}|o:${cs.oldestId || ''}`;
   if (sig === _dmMsgsSignature && _dmMsgsLastChannel === currentChannel) return;
   _dmMsgsSignature = sig;
 
@@ -5060,7 +5545,9 @@ function renderDmMsg(m, prev) {
   }
 
   const isFromPm = senderId === 'admin';
-  const body = m.text || m.content || '';
+  const streamState = _typewriter.get(m.id);
+  const body = streamState ? streamState.displayedText : (m.text || m.content || '');
+  const streamStatus = streamState ? (streamState.failed ? 'failed' : streamState.completed ? 'completed' : 'typing') : '';
   const prevSenderId = prev ? (prev.sender_id || prev.sender) : null;
   const prevIsSystem = prev ? (prevSenderId === 'system' || prev.message_type === 'system_notification') : true;
   const showAvatar = !isFromPm && (prevSenderId !== senderId || prevIsSystem);
@@ -5104,6 +5591,7 @@ function renderDmMsg(m, prev) {
   const bubbleHtml = `<div class="ws-dm-msg-bubble ${isFromPm ? 'from-pm' : 'from-agent'}">
     ${replyBlock}
     <div class="ws-dm-msg-body">${mdRender(body)}</div>
+    ${_typewriterStatusHtml(streamState)}
     ${time ? `<div class="ws-dm-msg-time">${esc(time)}</div>` : ''}
     ${images}${files}
   </div>`;
@@ -5116,7 +5604,7 @@ function renderDmMsg(m, prev) {
     actionsHtml = `<div class="ws-dm-msg-actions">${replyBtn}</div>`;
   }
 
-  return `<div class="ws-dm-msg-row ${isFromPm ? 'from-pm' : ''}" data-msg-id="${esc(m.id)}">
+  return `<div class="ws-dm-msg-row ${isFromPm ? 'from-pm' : ''}" data-msg-id="${esc(m.id)}"${streamStatus ? ` data-stream-status="${streamStatus}"` : ''}>
     ${avatarHtml}
     <div class="ws-dm-msg-col ${isFromPm ? 'from-pm' : 'from-agent'}">
       ${bubbleHtml}
@@ -7425,7 +7913,13 @@ function renderComposerPending() {
 function updateSendBtn() {
   const { ta, btn } = activeComposer();
   if (!ta || !btn) return;
-  btn.disabled = !ta.value.trim() && !pendingFiles.length;
+  const running = _conversationRunning();
+  btn.classList.toggle('is-stop', running);
+  btn.dataset.mode = running ? 'stop' : 'send';
+  btn.textContent = running ? '■ 停止' : '发送';
+  btn.disabled = running ? false : (!ta.value.trim() && !pendingFiles.length);
+  const headerStop = document.getElementById('headerStopButton');
+  if (headerStop) headerStop.style.display = state.view === 'group' && running ? '' : 'none';
 }
 
 function scrollDmMessagesToBottom() {
@@ -8364,6 +8858,10 @@ document.getElementById('btnCreateGroup').addEventListener('click', () => openGr
 document.getElementById('groupManageClose').addEventListener('click', closeGroupManage);
 document.getElementById('groupManageCancel').addEventListener('click', closeGroupManage);
 document.getElementById('groupManageSubmit').addEventListener('click', submitGroupManage);
+document.getElementById('groupChannelType').addEventListener('change', event => {
+  document.getElementById('groupHumanSection').style.display = event.target.value === 'shared' ? '' : 'none';
+  renderGroupHumanOptions(groupManageEditingId ? groupConversations.find(group => group.id === groupManageEditingId) : null);
+});
 document.getElementById('groupManageMask').addEventListener('click', e => {
   if (e.target.id === 'groupManageMask') closeGroupManage();
 });
@@ -8373,6 +8871,21 @@ document.querySelectorAll('#navTabs .ws-nav-tab').forEach(btn => {
 // AIC-68: single ⚙ SETTINGS button (replaced themeBtn + identityBtn)
 // cycle 2: bind to openAppSettings (not legacy openSettingsModal for task workflow_templates)
 document.getElementById('appSettingsBtn').addEventListener('click', openAppSettings);
+document.getElementById('sidebarSettingsBtn').addEventListener('click', openAppSettings);
+document.getElementById('channelSearchButton').addEventListener('click', () => document.getElementById('wsSearchTriggerBtn').click());
+document.getElementById('channelMembersToggle').addEventListener('click', () => document.getElementById('membersPanel').classList.toggle('open'));
+document.getElementById('headerStopButton').addEventListener('click', stopCurrentConversation);
+document.getElementById('membersPanelClose').addEventListener('click', () => document.getElementById('membersPanel').classList.remove('open'));
+document.querySelector('.ws-workstation-sidebar').addEventListener('click', event => {
+  const viewButton = event.target.closest('[data-sidebar-view]');
+  if (viewButton) setView(viewButton.dataset.sidebarView);
+  const dmButton = event.target.closest('[data-sidebar-dm]');
+  if (dmButton) setActiveDm(dmButton.dataset.sidebarDm);
+});
+document.getElementById('membersPanelContent').addEventListener('click', event => {
+  const button = event.target.closest('[data-members-manage]');
+  if (button) openGroupManage(button.dataset.membersManage);
+});
 // App-settings panel delegation (theme seg / open-identity / shortcuts)
 document.getElementById('appSettingsMask').addEventListener('click', e => {
   const btn = e.target.closest('[data-action]');
@@ -9160,7 +9673,7 @@ document.getElementById('composerInput').addEventListener('click', updateMention
 document.getElementById('composerInput').addEventListener('keydown', e => {
   // IME composition: never intercept. ArrowDown/Enter/Tab while picking a Chinese
   // candidate would otherwise commit a stale @mention and eat the user's pinyin.
-  if (e.isComposing || e.keyCode === 229) return;
+  if (isComposerImeEvent(e)) return;
   // Mention menu navigation takes priority over normal text input keys.
   if (mentionState.open) {
     if (e.key === 'ArrowDown') {
@@ -9181,7 +9694,7 @@ document.getElementById('composerInput').addEventListener('keydown', e => {
     }
     if (e.key === 'Escape') { e.preventDefault(); closeMentionMenu(); return; }
   }
-  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+  if (shouldSendComposerOnEnter(e)) {
     e.preventDefault();
     sendCurrentMessage();
   }
@@ -9190,7 +9703,7 @@ document.getElementById('composerInput').addEventListener('blur', () => {
   // Delay so a click on a menu item registers before the menu disappears.
   setTimeout(closeMentionMenu, 150);
 });
-document.getElementById('sendBtn').addEventListener('click', sendCurrentMessage);
+document.getElementById('sendBtn').addEventListener('click', handleComposerAction);
 
 document.getElementById('mentionMenu').addEventListener('mousedown', e => {
   // mousedown (not click) so the textarea keeps focus and the blur-close path
@@ -9255,13 +9768,12 @@ document.getElementById('dmComposerInput').addEventListener('input', e => {
   autoresizeTextarea(e.target);
 });
 document.getElementById('dmComposerInput').addEventListener('keydown', e => {
-  if (e.isComposing || e.keyCode === 229) return;
-  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+  if (shouldSendComposerOnEnter(e)) {
     e.preventDefault();
     sendCurrentMessage();
   }
 });
-document.getElementById('dmSendBtn').addEventListener('click', sendCurrentMessage);
+document.getElementById('dmSendBtn').addEventListener('click', handleComposerAction);
 document.getElementById('dmBtnAttachFile').addEventListener('click', () => {
   document.getElementById('dmFileInput').click();
 });

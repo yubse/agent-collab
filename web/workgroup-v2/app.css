@@ -1,0 +1,88 @@
+/* AI Studio workspace shell — Buzz-inspired information density, original brand. */
+:root { --studio-sidebar: 248px; --studio-members: 264px; }
+body { background: var(--surface); }
+.ws-app-bar { display: none; }
+.ws-workspace-shell {
+  max-width: none; margin: 0; padding: 0; gap: 0;
+  grid-template-columns: var(--studio-sidebar) minmax(0,1fr) var(--studio-members);
+  background: var(--surface); height: 100vh;
+}
+.ws-workstation-sidebar {
+  border: 0; border-right: 1px solid var(--border); border-radius: 0; box-shadow: none;
+  padding: 14px 10px; background: var(--surface-2); overflow-y: auto;
+}
+.studio-sidebar-brand { display:flex; align-items:center; gap:10px; padding:4px 7px 14px; }
+.studio-sidebar-brand > div:nth-child(2) { min-width:0; flex:1; }
+.studio-sidebar-brand strong { display:block; font-size:14px; letter-spacing:-.01em; }
+.studio-sidebar-brand span { display:block; margin-top:2px; color:var(--ink-3); font-size:10px; }
+.studio-logo { width:30px; height:30px; border-radius:8px; display:grid; place-items:center; background:var(--warn); color:white; font:700 11px 'JetBrains Mono',monospace; }
+.studio-icon-button { width:30px; height:30px; border:0; border-radius:7px; background:transparent; color:var(--ink-3); display:grid; place-items:center; cursor:pointer; }
+.studio-icon-button:hover { background:var(--surface-3); color:var(--ink); }
+.studio-icon-button .material-symbols-rounded { font-size:18px; }
+.studio-profile { display:flex; align-items:center; gap:9px; padding:8px; margin-bottom:16px; border-radius:8px; background:var(--surface); border:1px solid var(--border-2); }
+.studio-profile > span:nth-child(2) { min-width:0; }
+.studio-profile strong,.studio-profile small { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.studio-profile strong { font-size:12px; }.studio-profile small { font-size:9px; color:var(--ink-3); margin-top:2px; }
+.studio-avatar { width:28px; height:28px; flex:none; border-radius:50%; display:grid; place-items:center; background:var(--pm); font-size:12px; font-weight:700; }
+.ws-group-switcher { margin-bottom:14px; }
+.ws-section-label,.studio-sidebar-label { font:600 10px 'JetBrains Mono',monospace; letter-spacing:.09em; text-transform:uppercase; color:var(--ink-3); }
+.ws-group-switcher-head { padding:0 7px; margin-bottom:5px; }
+.ws-group-list { gap:1px; }
+.ws-group-row { grid-template-columns:minmax(0,1fr) 24px; gap:1px; }
+.ws-group-select { padding:7px 8px; border:0; border-radius:7px; }
+.ws-group-select.active { background:var(--surface-3); box-shadow:none; }
+.ws-group-name { font-size:12.5px; font-weight:500; }
+.ws-group-members-preview { display:none; }
+.ws-group-edit { opacity:0; }.ws-group-row:hover .ws-group-edit { opacity:1; }
+.studio-channel-section { margin-bottom:13px; }
+.studio-channel-section-title { display:flex; align-items:center; justify-content:space-between; padding:0 7px 4px; }
+.studio-sidebar-section { margin:4px 0 14px; }
+.studio-sidebar-label { padding:0 7px 5px; }
+.studio-sidebar-links { display:flex; flex-direction:column; gap:1px; }
+.studio-sidebar-link { width:100%; border:0; background:transparent; color:var(--ink-2); border-radius:7px; padding:7px 8px; display:flex; align-items:center; gap:9px; text-align:left; cursor:pointer; font-size:12.5px; }
+.studio-sidebar-link:hover,.studio-sidebar-link.active { background:var(--surface-3); color:var(--ink); }
+.studio-sidebar-link .material-symbols-rounded { font-size:17px; }
+.ws-workstation-head,.ws-strip,.ws-sidebar-divider { display:none; }
+.ws-workspace-shell > main { background:var(--surface); }
+.ws-chat-panel,.ws-chat-card { height:100%; }
+.ws-chat-card { border:0; border-radius:0; box-shadow:none; }
+.ws-chat-header { height:64px; flex:none; padding:10px 18px; flex-direction:row; align-items:center; justify-content:space-between; gap:14px; border-bottom:1px solid var(--border); }
+.ws-chat-title-row { display:flex; flex-direction:column; align-items:flex-start; gap:2px; min-width:0; }
+.ws-chat-title { font-size:15px; }.ws-chat-members { font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:60vw; }
+.studio-channel-actions { display:flex; align-items:center; gap:2px; flex:none; }
+.studio-header-stop { border:0; border-radius:7px; padding:6px 9px; background:var(--error); color:white; font-size:11px; cursor:pointer; }
+.ws-chat-messages { padding:16px 22px 20px; gap:4px; }
+.ws-msg-comment { padding:5px 8px; gap:10px; border-radius:6px; }
+.ws-msg-comment:hover { background:var(--surface-2); }
+.ws-msg-avatar { width:32px; height:32px; border-radius:50%; }
+.ws-msg-author { font-size:13px; }.ws-msg-text { margin-top:2px; font-size:13.5px; line-height:1.48; }
+.ws-msg-comment[data-stream-status="typing"] { background:color-mix(in srgb,var(--surface-2) 70%,transparent); }
+.ws-msg-comment[data-stream-status="typing"] .ws-msg-stream-status::before { content:'● '; color:var(--good); }
+.ws-composer-wrap { padding:10px 18px 14px; border-top:0; }
+.ws-composer { border-radius:8px; padding:7px 9px; background:var(--surface); box-shadow:0 0 0 1px var(--border); }
+.ws-composer:focus-within { box-shadow:0 0 0 1px var(--ink-3); }
+.ws-composer textarea { min-height:34px; max-height:120px; padding:3px 2px; }
+.studio-members-panel { min-width:0; border-left:1px solid var(--border); background:var(--surface-2); display:flex; flex-direction:column; overflow:hidden; }
+.studio-members-head { height:64px; flex:none; display:flex; align-items:center; justify-content:space-between; padding:0 14px; border-bottom:1px solid var(--border); font-size:13px; }
+.studio-members-head #membersPanelClose { display:none; }
+.studio-members-content { flex:1; overflow-y:auto; padding:14px 10px; }
+.studio-member-section { margin-bottom:20px; }
+.studio-member-section-title { padding:0 6px 7px; font:600 9px 'JetBrains Mono',monospace; letter-spacing:.1em; color:var(--ink-3); }
+.studio-member-row { display:flex; align-items:center; gap:9px; padding:6px; border-radius:7px; }
+.studio-member-row:hover { background:var(--surface-3); }
+.studio-member-copy { min-width:0; flex:1; }.studio-member-copy strong { display:block; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }.studio-member-copy small { display:block; margin-top:2px; font-size:9px; color:var(--ink-3); }
+.studio-role-badge,.studio-agent-badge { flex:none; font:600 8px 'JetBrains Mono',monospace; padding:2px 5px; border-radius:4px; background:var(--surface-3); color:var(--ink-3); text-transform:uppercase; }
+.studio-agent-badge { color:var(--actorB-deep); background:var(--actorB-soft); }
+.studio-status-dot { width:7px; height:7px; border-radius:50%; background:var(--mute); }.studio-status-dot.working { background:var(--warn); }.studio-status-dot.idle { background:var(--good); }
+.ws-modal { border-radius:10px !important; }.ws-group-member-options { grid-template-columns:1fr; gap:5px; }.ws-group-member-option { border-radius:7px; padding:8px 10px; }
+@media (max-width:1100px) {
+  .ws-workspace-shell { grid-template-columns:220px minmax(0,1fr); }
+  .studio-members-panel { position:fixed; z-index:45; top:0; bottom:0; right:0; width:280px; box-shadow:-10px 0 30px rgba(0,0,0,.12); transform:translateX(100%); transition:transform .18s ease; }
+  .studio-members-panel.open { transform:translateX(0); }.studio-members-head #membersPanelClose { display:grid; }
+}
+@media (max-width:720px) {
+  .ws-workspace-shell { grid-template-columns:1fr; }
+  .ws-workstation-sidebar { display:none; }
+  .ws-chat-messages { padding:12px 10px; }.ws-composer-wrap { padding:8px 10px 10px; }
+  .ws-chat-members { max-width:55vw; }.ws-composer-hint { display:none; }
+}

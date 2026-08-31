@@ -67,4 +67,31 @@ describe('ExecutionRunner', () => {
     const result = await runner.run(timedRequest)
     expect(result).toMatchObject({ status: 'error', error: 'CODEX_EXECUTION_TIMEOUT' })
   })
+
+  test('cancels only the requested execution and drops later deltas', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const cancelled: string[] = []
+    const deltas: string[] = []
+    const runner = new ExecutionRunner({
+      execute: async (_input, hooks) => {
+        hooks?.onDelta?.('before', new Date().toISOString())
+        await gate
+        hooks?.onDelta?.('late', new Date().toISOString())
+        return { content: 'late result', usage: null }
+      },
+      cancel: async (requestId) => { cancelled.push(requestId); return true },
+    }, new ConnectorStateStore(), () => {})
+    const current = { ...request, request_id: 'req_cancel_exact' }
+    runner.receive(current)
+    runner.acknowledge(current.request_id)
+    const resultPromise = runner.start(current, { onDelta: (delta) => deltas.push(delta) })
+    await Bun.sleep(0)
+    expect(await runner.cancel(current.request_id)).toBe(true)
+    release()
+
+    expect(await resultPromise).toMatchObject({ status: 'error', error: 'CODEX_EXECUTION_CANCELLED' })
+    expect(cancelled).toEqual(['req_cancel_exact'])
+    expect(deltas).toEqual(['before'])
+  })
 })

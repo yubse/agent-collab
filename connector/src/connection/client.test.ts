@@ -28,6 +28,9 @@ function config(port: number, connectTimeoutMs = 1_000): ConnectorConfig {
     connectTimeoutMs,
     executionTimeoutMs: 300_000,
     codexWorkerCount: 3,
+    codexProxyEnvironment: {},
+    codexProxySource: 'direct',
+    codexProxyType: 'direct',
   }
 }
 
@@ -60,8 +63,9 @@ describe('Connector WebSocket execution lifecycle', () => {
       },
     })
     const runner = new ExecutionRunner({
-      execute: async () => {
+      execute: async (_request, hooks) => {
         modelCalls += 1
+        hooks?.onDelta?.('CON', new Date().toISOString())
         await Bun.sleep(1_200)
         return { content: 'CONNECTOR_OK', usage: null }
       },
@@ -72,7 +76,9 @@ describe('Connector WebSocket execution lifecycle', () => {
       expect(observed.filter((type) => type === 'execution_ack')).toHaveLength(2)
       expect(observed.filter((type) => type === 'heartbeat').length).toBeGreaterThanOrEqual(1)
       expect(observed.filter((type) => type === 'execution_result')).toHaveLength(1)
+      expect(observed.filter((type) => type === 'execution_delta')).toHaveLength(1)
       expect(observed.indexOf('execution_ack')).toBeLessThan(observed.indexOf('execution_result'))
+      expect(observed.indexOf('execution_delta')).toBeLessThan(observed.indexOf('execution_result'))
       expect(modelCalls).toBe(1)
     } finally {
       server.stop(true)
@@ -95,4 +101,51 @@ describe('Connector WebSocket execution lifecycle', () => {
       server.stop(true)
     }
   })
+
+  test('receives cancel_request without closing the Helper or app-server', async () => {
+    const observed: any[] = []
+    const server = Bun.serve({
+      port: 0,
+      fetch(req, bunServer) {
+        if (bunServer.upgrade(req)) return undefined
+        return new Response('upgrade required', { status: 426 })
+      },
+      websocket: {
+        message(ws, data) {
+          const message = JSON.parse(String(data))
+          observed.push(message)
+          if (message.type === 'hello') {
+            ws.send(JSON.stringify({ type: 'hello_ack', status: 'ok', heartbeat_interval: 30 }))
+            ws.send(JSON.stringify({
+              type: 'execution_request', request_id: 'req_cancel', user_id: 'user-a',
+              conversation_id: 'conv-a', agent_id: 'social', prompt: 'cancel',
+              created_at: new Date().toISOString(),
+            }))
+          }
+          if (message.type === 'execution_ack') {
+            ws.send(JSON.stringify({ type: 'cancel_request', request_id: 'req_cancel', reason: 'user_cancel' }))
+          }
+          if (message.type === 'execution_result') ws.close()
+        },
+      },
+    })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const cancelled: string[] = []
+    const runner = new ExecutionRunner({
+      execute: async () => { await gate; return { content: 'late', usage: null } },
+      cancel: async (requestId) => { cancelled.push(requestId); release(); return true },
+    }, new ConnectorStateStore(), () => {})
+
+    try {
+      await connectOnce(config(server.port), 'test-token', runner, new ConnectorStateStore())
+      expect(cancelled).toEqual(['req_cancel'])
+      expect(observed.find((item) => item.type === 'execution_result')).toMatchObject({
+        request_id: 'req_cancel', status: 'error', error: 'CODEX_EXECUTION_CANCELLED',
+      })
+      expect(observed.filter((item) => item.type === 'hello')).toHaveLength(1)
+    } finally {
+      server.stop(true)
+    }
+  }, 5_000)
 })

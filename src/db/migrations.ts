@@ -3,6 +3,13 @@ import type { Database } from 'bun:sqlite'
 export const DEFAULT_TENANT_ID = 'tenant_default'
 export const LEGACY_ADMIN_ID = 'usr_legacy_admin'
 
+// D1 migration needs a stable snapshot of ids that have historically appeared as
+// Agent senders. This is migration data, not a second Agent-definition registry.
+const HISTORICAL_AGENT_IDS = [
+  'creative', 'brand', 'product', 'content', 'market', 'moderator', 'director',
+  'agent1', 'agent2', 'social', 'growth',
+] as const
+
 type Migration = {
   version: number
   name: string
@@ -157,6 +164,81 @@ const MIGRATIONS: Migration[] = [
     up(db) {
       addColumn(db, 'connector_devices', 'platform TEXT')
       addColumn(db, 'connector_devices', 'connector_version TEXT')
+    },
+  },
+  {
+    version: 6,
+    name: 'channel_membership_and_message_actors',
+    up(db) {
+      const now = new Date().toISOString()
+      addColumn(db, 'group_conversations', `scope TEXT NOT NULL DEFAULT 'private' CHECK (scope IN ('private', 'shared'))`)
+      addColumn(db, 'group_conversations', 'owner_user_id TEXT')
+      addColumn(db, 'group_conversations', `updated_at TEXT NOT NULL DEFAULT ''`)
+      db.run(`UPDATE group_conversations
+        SET scope='private',
+            owner_user_id=COALESCE(NULLIF(owner_user_id, ''), user_id),
+            updated_at=CASE WHEN updated_at='' THEN COALESCE(NULLIF(created_at, ''), ?) ELSE updated_at END`, [now])
+
+      db.run(`CREATE TABLE IF NOT EXISTS channel_memberships (
+        channel_id TEXT NOT NULL,
+        member_type TEXT NOT NULL CHECK (member_type IN ('human', 'agent')),
+        member_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('owner', 'moderator', 'member')),
+        joined_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        left_at TEXT,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'removed')),
+        PRIMARY KEY (channel_id, member_type, member_id),
+        FOREIGN KEY (channel_id) REFERENCES group_conversations(id) ON DELETE CASCADE
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_channel_memberships_member
+        ON channel_memberships(member_type, member_id, status, channel_id)`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_channel_memberships_channel
+        ON channel_memberships(channel_id, status, member_type)`)
+
+      db.run(`INSERT OR IGNORE INTO channel_memberships
+        (channel_id, member_type, member_id, role, joined_at, updated_at, left_at, status)
+        SELECT id, 'human', owner_user_id, 'owner',
+               COALESCE(NULLIF(created_at, ''), ?), ?, NULL, 'active'
+        FROM group_conversations
+        WHERE owner_user_id IS NOT NULL AND owner_user_id != ''`, [now, now])
+
+      const legacyMembersExist = db.prepare(`SELECT name FROM sqlite_master
+        WHERE type='table' AND name='group_conversation_members'`).get()
+      if (legacyMembersExist) {
+        const placeholders = HISTORICAL_AGENT_IDS.map(() => '?').join(',')
+        db.run(`INSERT OR IGNORE INTO channel_memberships
+          (channel_id, member_type, member_id, role, joined_at, updated_at, left_at, status)
+          SELECT m.conversation_id, 'agent', m.member_id, 'member',
+                 COALESCE(NULLIF(m.added_at, ''), NULLIF(c.created_at, ''), ?), ?, NULL, 'active'
+          FROM group_conversation_members m
+          JOIN group_conversations c ON c.id=m.conversation_id
+          WHERE m.member_id IN (${placeholders})`, [now, now, ...HISTORICAL_AGENT_IDS])
+      }
+
+      addColumn(db, 'group_messages', 'sender_actor_type TEXT')
+      addColumn(db, 'group_messages', 'sender_actor_id TEXT')
+      addColumn(db, 'group_messages', 'execution_owner_user_id TEXT')
+      addColumn(db, 'group_messages', 'trigger_message_id TEXT')
+      addColumn(db, 'group_messages', 'trigger_actor_id TEXT')
+
+      db.run(`UPDATE group_messages
+        SET sender_actor_type='system', sender_actor_id='system'
+        WHERE sender_id='system' AND sender_actor_type IS NULL`)
+      const actorPlaceholders = HISTORICAL_AGENT_IDS.map(() => '?').join(',')
+      db.run(`UPDATE group_messages
+        SET sender_actor_type='agent', sender_actor_id=sender_id
+        WHERE sender_id IN (${actorPlaceholders}) AND sender_actor_type IS NULL`, [...HISTORICAL_AGENT_IDS])
+      db.run(`UPDATE group_messages
+        SET sender_actor_type='human',
+            sender_actor_id=(SELECT c.owner_user_id FROM group_conversations c WHERE c.id=group_messages.conversation_id)
+        WHERE sender_id='admin'
+          AND sender_actor_type IS NULL
+          AND EXISTS (
+            SELECT 1 FROM group_conversations c
+            WHERE c.id=group_messages.conversation_id
+              AND c.owner_user_id IS NOT NULL AND c.owner_user_id!=''
+          )`)
     },
   },
 ]

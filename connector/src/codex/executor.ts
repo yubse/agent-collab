@@ -20,6 +20,7 @@ export type CodexExecutionMetrics = {
 
 export type CodexExecutionHooks = {
   onStarted?: (startedAt: string) => void
+  onDelta?: (delta: string, createdAt: string) => void
 }
 
 type WorkerLease = { index: number; provider: SharedCodexProvider }
@@ -30,6 +31,8 @@ export class LocalCodexExecutor {
   private readonly available: number[]
   private readonly waiters: Array<(lease: WorkerLease) => void> = []
   private sessions = new Map<string, string | null>()
+  private activeRequests = new Map<string, SharedCodexProvider>()
+  private cancelledRequests = new Set<string>()
 
   constructor(
     private config: { binary: string; cwd: string; stateDir: string; executionTimeoutMs: number },
@@ -48,6 +51,10 @@ export class LocalCodexExecutor {
   ): Promise<{ content: string; usage: any; metrics: CodexExecutionMetrics }> {
     const totalStartedMs = Date.now()
     const lease = await this.acquire()
+    if (this.cancelledRequests.delete(request.request_id)) {
+      this.release(lease.index)
+      throw new Error('CODEX_EXECUTION_CANCELLED')
+    }
     const workerStartedMs = Date.now()
     const queueWaitMs = Math.max(0, workerStartedMs - totalStartedMs)
     hooks.onStarted?.(new Date(workerStartedMs).toISOString())
@@ -55,10 +62,14 @@ export class LocalCodexExecutor {
     const opts = creativeAgentSendOptions(request.agent_id)
 
     try {
+      this.activeRequests.set(request.request_id, lease.provider)
       // Creative prompts already contain the exact scoped context for this round.
       // A fresh ephemeral thread avoids silently reloading complete hidden history.
       lease.provider.selectThread(opts.freshThread ? null : this.sessionFor(key))
-      const execution = await this.runTurn(lease.provider, request.prompt, opts)
+      const execution = await this.runTurn(lease.provider, request.prompt, opts, (delta) => {
+        const at = new Date().toISOString()
+        hooks.onDelta?.(delta, at)
+      })
       if (!opts.freshThread) this.persistSession(key, lease.provider.sessionId)
       return {
         content: execution.content,
@@ -71,8 +82,19 @@ export class LocalCodexExecutor {
         },
       }
     } finally {
+      this.activeRequests.delete(request.request_id)
+      this.cancelledRequests.delete(request.request_id)
       this.release(lease.index)
     }
+  }
+
+  async cancel(requestId: string): Promise<boolean> {
+    const provider = this.activeRequests.get(requestId)
+    if (!provider) {
+      this.cancelledRequests.add(requestId)
+      return true
+    }
+    return provider.interrupt()
   }
 
   async warmup(): Promise<void> {
@@ -143,6 +165,7 @@ export class LocalCodexExecutor {
     provider: SharedCodexProvider,
     prompt: string,
     opts: AgentSendOpts,
+    onDelta: (delta: string) => void,
   ): Promise<{ content: string; usage: any; threadMs: number; codexExecutionMs: number }> {
     return new Promise((resolve, reject) => {
       const assistant: string[] = []
@@ -160,6 +183,7 @@ export class LocalCodexExecutor {
         reject(new Error('CODEX_EXECUTION_TIMEOUT'))
       }), this.config.executionTimeoutMs)
       provider.onEvent((event: AgentEvent) => {
+        if (event.type === 'delta' && event.text) onDelta(event.text)
         if (event.type === 'assistant' && event.text?.trim()) assistant.push(event.text.trim())
         if (event.type === 'result') {
           const finishedMs = Date.now()

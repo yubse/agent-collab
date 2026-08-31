@@ -1,6 +1,8 @@
 export type {
   ConnectorHelloAck,
+  CancelRequest,
   ExecutionAck,
+  ExecutionDelta,
   ExecutionRequest,
   ExecutionResult,
   ExecutionTimings,

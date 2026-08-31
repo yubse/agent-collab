@@ -8,9 +8,15 @@ import { runConnector } from './connection/client.ts'
 import { PairingService } from './pairing/service.ts'
 import { ConnectorStateStore } from './state/store.ts'
 import { LocalHelperServer } from './helper/server.ts'
+import { formatProxyLog } from './network/proxy.ts'
 
 export async function main(): Promise<never> {
   const config = loadConfig()
+  console.log(formatProxyLog({
+    source: config.codexProxySource,
+    type: config.codexProxyType,
+    environment: config.codexProxyEnvironment,
+  }))
   const state = new ConnectorStateStore()
   let deviceToken = config.deviceToken
   let claimInFlight: Promise<{ bound: boolean; already_bound: boolean }> | null = null
@@ -24,7 +30,7 @@ export async function main(): Promise<never> {
       label: `connector:managed-app-server-worker-${index + 2}`,
       binaryPath: codexBinary,
       cwd: config.codexCwd,
-      env: { CODEX_HOME: config.codexHome },
+      env: { ...config.codexProxyEnvironment, CODEX_HOME: config.codexHome },
       extraArgs: [...PURE_CHAT_APP_SERVER_ARGS],
       onDiagnostic: (event) => {
         if (event.stream === 'process') console.error(`[codex] worker=${index + 2} status=exited code=${event.exitCode ?? 'unknown'}`)

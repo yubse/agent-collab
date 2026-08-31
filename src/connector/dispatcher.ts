@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import type { ExecutionAck, ExecutionRequest, ExecutionResult } from './protocol.ts'
+import type { CancelRequest, ExecutionAck, ExecutionDelta, ExecutionRequest, ExecutionResult } from './protocol.ts'
 import { loadConnectorTimeouts, type ConnectorTimeouts } from './timeouts.ts'
 import { ConnectorRegistry } from './registry.ts'
 
@@ -11,6 +11,8 @@ type Pending = {
   reject: (error: Error) => void
   ackTimer: ReturnType<typeof setTimeout>
   pendingTimer: ReturnType<typeof setTimeout>
+  onDelta?: (delta: ExecutionDelta) => void
+  lastDeltaSequence: number
 }
 
 type DispatcherTimeouts = Pick<ConnectorTimeouts, 'requestAckTimeoutMs' | 'serverPendingTimeoutMs'>
@@ -26,7 +28,10 @@ export class ConnectorDispatcher {
     registry.onDisconnect((connection) => this.rejectDevice(connection.deviceId, 'connector disconnected'))
   }
 
-  dispatch(input: Omit<ExecutionRequest, 'type' | 'request_id' | 'created_at'>): Promise<ExecutionResult> {
+  dispatch(
+    input: Omit<ExecutionRequest, 'type' | 'request_id' | 'created_at'>,
+    hooks: { onDelta?: (delta: ExecutionDelta) => void; onRequest?: (requestId: string) => void } = {},
+  ): Promise<ExecutionResult> {
     const connection = this.registry.forUser(input.user_id)
     if (!connection) return Promise.reject(new Error('CODEX_CONNECTOR_OFFLINE: no online connector for current user'))
     const request: ExecutionRequest = {
@@ -55,7 +60,10 @@ export class ConnectorDispatcher {
         reject,
         ackTimer,
         pendingTimer,
+        onDelta: hooks.onDelta,
+        lastDeltaSequence: 0,
       })
+      hooks.onRequest?.(request.request_id)
       try {
         connection.socket.send(JSON.stringify(request))
         this.log(`[execution] request=${safeId(request.request_id)} state=request_sent at=${request.created_at}`)
@@ -64,6 +72,29 @@ export class ConnectorDispatcher {
         reject(new Error(error?.message || 'unable to send connector request'))
       }
     })
+  }
+
+  cancel(requestId: string): boolean {
+    const pending = this.pending.get(requestId)
+    if (!pending) return false
+    const connection = this.registry.forUser(pending.userId)
+    if (connection?.deviceId === pending.deviceId) {
+      const request: CancelRequest = { type: 'cancel_request', request_id: requestId, reason: 'user_cancel' }
+      try { connection.socket.send(JSON.stringify(request)) } catch {}
+    }
+    this.clearPending(requestId)
+    pending.reject(new Error('CODEX_EXECUTION_CANCELLED'))
+    this.log(`[execution] request=${safeId(requestId)} state=cancel_sent at=${new Date().toISOString()}`)
+    return true
+  }
+
+  handleDelta(deviceId: string, userId: string, delta: ExecutionDelta): boolean {
+    const pending = this.pending.get(delta.request_id)
+    if (!pending || pending.deviceId !== deviceId || pending.userId !== userId) return false
+    if (delta.sequence <= pending.lastDeltaSequence) return false
+    pending.lastDeltaSequence = delta.sequence
+    pending.onDelta?.(delta)
+    return true
   }
 
   handleAck(deviceId: string, userId: string, ack: ExecutionAck): boolean {

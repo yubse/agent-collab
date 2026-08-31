@@ -16,6 +16,8 @@ export type AgentTurnRoute = {
   dispatchId: string
   recordId: string
   prompt: string
+  /** Stable id shared by pending stream events and the final persisted message. */
+  responseMessageId: string
   started: boolean
   /** Hop number of the assistant output produced by this turn. */
   hopCount: number

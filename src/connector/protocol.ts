@@ -35,6 +35,20 @@ export type ExecutionAck = {
   acknowledged_at: string
 }
 
+export type ExecutionDelta = {
+  type: 'execution_delta'
+  request_id: string
+  sequence: number
+  delta: string
+  created_at: string
+}
+
+export type CancelRequest = {
+  type: 'cancel_request'
+  request_id: string
+  reason: 'user_cancel'
+}
+
 export type ExecutionTimings = {
   execution_request_at: string
   execution_received_at: string
@@ -58,8 +72,8 @@ export type ExecutionResult = {
   timings?: ExecutionTimings
 }
 
-export type ConnectorToServer = ConnectorHello | ConnectorHeartbeat | ExecutionAck | ExecutionResult
-export type ServerToConnector = ConnectorHelloAck | ConnectorHeartbeatAck | ExecutionRequest
+export type ConnectorToServer = ConnectorHello | ConnectorHeartbeat | ExecutionAck | ExecutionDelta | ExecutionResult
+export type ServerToConnector = ConnectorHelloAck | ConnectorHeartbeatAck | ExecutionRequest | CancelRequest
 
 export function parseConnectorMessage(raw: string): ConnectorToServer {
   let value: any
@@ -77,6 +91,12 @@ export function parseConnectorMessage(raw: string): ConnectorToServer {
     if (value.status !== 'running') throw new Error('invalid execution ack status')
     if (typeof value.acknowledged_at !== 'string' || !value.acknowledged_at) throw new Error('acknowledged_at required')
     return value as ExecutionAck
+  }
+  if (value.type === 'execution_delta') {
+    if (typeof value.request_id !== 'string' || !value.request_id) throw new Error('request_id required')
+    if (!Number.isInteger(value.sequence) || value.sequence < 1) throw new Error('invalid delta sequence')
+    if (typeof value.delta !== 'string' || !value.delta) throw new Error('delta required')
+    return value as ExecutionDelta
   }
   if (value.type === 'execution_result') {
     if (typeof value.request_id !== 'string' || !value.request_id) throw new Error('request_id required')

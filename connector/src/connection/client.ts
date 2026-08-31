@@ -2,6 +2,7 @@ import type { ConnectorConfig } from '../config/index.ts'
 import {
   CONNECTOR_PROTOCOL_VERSION,
   type ExecutionAck,
+  type ExecutionDelta,
   type ExecutionRequest,
   type ServerToConnector,
 } from '../protocol.ts'
@@ -96,6 +97,11 @@ export function connectOnce(
         }, seconds * 1_000)
         return
       }
+      if (message.type === 'cancel_request') {
+        void runner.cancel(message.request_id)
+        console.log(`[execution] request=${safeId(message.request_id)} state=cancel_received at=${new Date().toISOString()}`)
+        return
+      }
       if (message.type !== 'execution_request') return
       const request = message as ExecutionRequest
       runner.receive(request)
@@ -115,7 +121,20 @@ export function connectOnce(
       // launching a second Codex turn.
       if (attachedRequests.has(request.request_id)) return
       attachedRequests.add(request.request_id)
-      void runner.start(request).then((result) => {
+      let deltaSequence = 0
+      let helperFirstDelta = false
+      void runner.start(request, { onDelta: (delta, createdAt) => {
+        if (ws.readyState !== WebSocket.OPEN) return
+        const frame: ExecutionDelta = {
+          type: 'execution_delta', request_id: request.request_id,
+          sequence: ++deltaSequence, delta, created_at: createdAt,
+        }
+        ws.send(JSON.stringify(frame))
+        if (!helperFirstDelta) {
+          helperFirstDelta = true
+          console.log(`[stream] request=${safeId(request.request_id)} stage=helper_first_delta at=${createdAt}`)
+        }
+      } }).then((result) => {
         if (ws.readyState !== WebSocket.OPEN) return
         ws.send(JSON.stringify(result))
         const at = result.timings?.execution_result_at || new Date().toISOString()

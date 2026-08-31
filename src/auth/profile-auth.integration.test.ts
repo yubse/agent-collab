@@ -175,6 +175,33 @@ describe('Trusted LAN profile authentication', () => {
     expect(liutingMessages.messages.some((message: any) => message.text === marker)).toBe(false)
   })
 
+  test('browser cannot forge message user, sender, actor or role', async () => {
+    const marker = `D1_ACTOR_${Date.now()}`
+    const sent = await json(await api('/group/send', tinaCookie, {
+      method: 'POST',
+      body: JSON.stringify({
+        conversation_id: tinaConversationId,
+        text: marker,
+        user_id: liuting.id,
+        sender_id: 'director',
+        sender_actor_id: liuting.id,
+        sender_actor_type: 'human',
+        owner_user_id: liuting.id,
+        execution_owner_user_id: liuting.id,
+        role: 'owner',
+      }),
+    }))
+    expect(sent.record.sender_id).toBe('admin')
+    expect(sent.record.user_id).toBe(tina.id)
+    expect(sent.record.sender_actor_type).toBe('human')
+    expect(sent.record.sender_actor_id).toBe(tina.id)
+    expect(sent.record.execution_owner_user_id).toBeNull()
+
+    const messages = (await json(await api(`/api/conversations/${encodeURIComponent(tinaConversationId)}/messages`, tinaCookie))).messages
+    const saved = messages.find((message: any) => message.text === marker)
+    expect(saved).toMatchObject({ sender_id: 'admin', sender_actor_type: 'human', sender_actor_id: tina.id })
+  })
+
   test('profile memory and connector devices remain isolated', async () => {
     await json(await api('/api/agents/social/memory', tinaCookie, {
       method: 'PUT', body: JSON.stringify({ content: 'TINA_PRIVATE_MEMORY' }),

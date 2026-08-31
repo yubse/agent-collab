@@ -18,6 +18,7 @@
  */
 export type AgentEvent =
   | { type: 'system_init'; session_id?: string; raw: any }
+  | { type: 'delta'; text: string; raw: any }
   | { type: 'assistant'; text?: string; tool_uses?: Array<{ name: string; input: any }>; thinking?: string; raw: any }
   | { type: 'result'; usage?: AgentUsage; raw: any }
   | { type: 'error'; message: string; raw?: any }

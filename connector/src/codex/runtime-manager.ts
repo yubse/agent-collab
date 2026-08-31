@@ -328,7 +328,7 @@ export class CodexRuntimeManager {
   }
 
   private codexEnvironment(): Record<string, string | undefined> {
-    return { CODEX_HOME: this.config.codexHome }
+    return { ...this.config.codexProxyEnvironment, CODEX_HOME: this.config.codexHome }
   }
 
   private update(patch: Partial<CodexRuntimeSnapshot>): void {

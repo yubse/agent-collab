@@ -7,6 +7,7 @@ export type CodexExecutor = {
     request: ExecutionRequest,
     hooks?: CodexExecutionHooks,
   ): Promise<{ content: string; usage: Record<string, number> | null; metrics?: CodexExecutionMetrics }>
+  cancel?(requestId: string): Promise<boolean>
 }
 
 type ExecutionRecord = {
@@ -16,6 +17,7 @@ type ExecutionRecord = {
   codexStartedAt: string | null
   promise: Promise<ExecutionResult> | null
   result: ExecutionResult | null
+  cancelled: boolean
 }
 
 export class ExecutionRunner {
@@ -39,6 +41,7 @@ export class ExecutionRunner {
       codexStartedAt: null,
       promise: null,
       result: null,
+      cancelled: false,
     })
     this.log(`[execution] request=${safeId(request.request_id)} state=received at=${receivedAt}`)
     return { isNew: true }
@@ -51,7 +54,7 @@ export class ExecutionRunner {
     this.log(`[execution] request=${safeId(requestId)} state=acknowledged at=${acknowledgedAt}`)
   }
 
-  start(request: ExecutionRequest): Promise<ExecutionResult> {
+  start(request: ExecutionRequest, hooks: Pick<CodexExecutionHooks, 'onDelta'> = {}): Promise<ExecutionResult> {
     if (!this.executions.has(request.request_id)) this.receive(request)
     const record = this.executions.get(request.request_id)!
     if (record.result) return Promise.resolve(record.result)
@@ -60,7 +63,7 @@ export class ExecutionRunner {
     this.activeCount += 1
     this.state.setExecution('EXECUTION_RUNNING')
     this.log(`[execution] request=${safeId(request.request_id)} state=queued`)
-    record.promise = this.executeOnce(record)
+    record.promise = this.executeOnce(record, hooks)
     return record.promise
   }
 
@@ -72,7 +75,16 @@ export class ExecutionRunner {
     return this.start(request)
   }
 
-  private async executeOnce(record: ExecutionRecord): Promise<ExecutionResult> {
+  async cancel(requestId: string): Promise<boolean> {
+    const record = this.executions.get(requestId)
+    if (!record || record.result || record.cancelled) return false
+    record.cancelled = true
+    this.log(`[execution] request=${safeId(requestId)} state=cancel_requested at=${new Date().toISOString()}`)
+    await this.executor.cancel?.(requestId)
+    return true
+  }
+
+  private async executeOnce(record: ExecutionRecord, hooks: Pick<CodexExecutionHooks, 'onDelta'>): Promise<ExecutionResult> {
     const request = record.request
     let startedMs = Date.now()
     const markStarted = (startedAt: string) => {
@@ -82,7 +94,19 @@ export class ExecutionRunner {
       this.log(`[execution] request=${safeId(request.request_id)} state=codex_running at=${startedAt}`)
     }
     try {
-      const execution = await this.executor.execute(request, { onStarted: markStarted })
+      let sawFirstDelta = false
+      const execution = await this.executor.execute(request, {
+        onStarted: markStarted,
+        onDelta: (delta, createdAt) => {
+          if (record.cancelled) return
+          if (!sawFirstDelta) {
+            sawFirstDelta = true
+            this.log(`[stream] request=${safeId(request.request_id)} stage=codex_first_delta at=${createdAt}`)
+          }
+          hooks.onDelta?.(delta, createdAt)
+        },
+      })
+      if (record.cancelled) throw new Error('CODEX_EXECUTION_CANCELLED')
       if (!record.codexStartedAt) markStarted(new Date(startedMs).toISOString())
       const finishedAt = new Date().toISOString()
       const resultAt = new Date().toISOString()
@@ -164,6 +188,7 @@ function safeId(value: string): string {
 }
 
 function safeErrorCode(message: string): string {
+  if (/CODEX_EXECUTION_CANCELLED/i.test(message)) return 'CODEX_EXECUTION_CANCELLED'
   if (/CODEX_EXECUTION_TIMEOUT|timed out/i.test(message)) return 'CODEX_EXECUTION_TIMEOUT'
   if (/network|connect|dns|transport/i.test(message)) return 'CODEX_NETWORK_ERROR'
   return 'CODEX_EXECUTION_ERROR'

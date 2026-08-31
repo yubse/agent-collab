@@ -133,8 +133,13 @@ describe('connector dispatch isolation', () => {
       type: 'execution_ack', request_id: request.request_id, status: 'running', acknowledged_at: new Date().toISOString(),
     })).toBe(true)
     expect(dispatcher.pendingState(request.request_id)).toBe('running')
+    expect(dispatcher.handleDelta('dev-b', 'user-b', {
+      type: 'execution_delta', request_id: request.request_id, sequence: 1,
+      delta: 'answer ', created_at: new Date().toISOString(),
+    })).toBe(true)
     dispatcher.handleResult('dev-b', 'user-b', { type: 'execution_result', request_id: request.request_id, status: 'success', content: 'answer B' })
     await sendPromise
+    expect(events.find((event) => event.type === 'delta')?.text).toBe('answer ')
     expect(events.find((event) => event.type === 'assistant')?.text).toBe('answer B')
   })
 
@@ -175,6 +180,35 @@ describe('connector dispatch isolation', () => {
     expect(dispatcher.handleResult('dev-a', 'user-a', result)).toBe(true)
     expect(dispatcher.handleResult('dev-a', 'user-a', result)).toBe(false)
     expect((await resultPromise).content).toBe('one')
+  })
+
+  test('cancel_request targets one request and ignores its late result', async () => {
+    const registry = new ConnectorRegistry()
+    const socketA = new FakeSocket()
+    const socketB = new FakeSocket()
+    registry.register({ deviceId: 'dev-a', userId: 'user-a', deviceName: 'A', socket: socketA })
+    registry.register({ deviceId: 'dev-b', userId: 'user-b', deviceName: 'B', socket: socketB })
+    const dispatcher = new ConnectorDispatcher(registry, timeouts)
+    let requestA = ''
+    const resultA = dispatcher.dispatch(
+      { user_id: 'user-a', conversation_id: 'conv-a', agent_id: 'social', prompt: 'cancel me' },
+      { onRequest: (id) => { requestA = id } },
+    )
+    const resultB = dispatcher.dispatch({ user_id: 'user-b', conversation_id: 'conv-b', agent_id: 'social', prompt: 'keep me' })
+    const requestB = JSON.parse(socketB.sent[0])
+
+    expect(dispatcher.cancel(requestA)).toBe(true)
+    await expect(resultA).rejects.toThrow('CODEX_EXECUTION_CANCELLED')
+    expect(JSON.parse(socketA.sent[1])).toMatchObject({ type: 'cancel_request', request_id: requestA })
+    expect(socketB.sent).toHaveLength(1)
+    expect(dispatcher.handleResult('dev-a', 'user-a', {
+      type: 'execution_result', request_id: requestA, status: 'success', content: 'late',
+    })).toBe(false)
+    expect(dispatcher.pendingCount()).toBe(1)
+    dispatcher.handleResult('dev-b', 'user-b', {
+      type: 'execution_result', request_id: requestB.request_id, status: 'success', content: 'still running',
+    })
+    expect((await resultB).content).toBe('still running')
   })
 
   test('ACK timeout does not resend an execution request', async () => {

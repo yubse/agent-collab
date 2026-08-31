@@ -221,15 +221,15 @@ export class CodexProvider implements AgentProvider {
 
   async interrupt(): Promise<boolean> {
     if (!this.isAlive) return false
-    // Best-effort turn cancellation before SIGKILL — codex supports turn/interrupt.
+    // Cancel only the active turn. The app-server is shared/reused and must stay
+    // alive for other conversations and later requests.
     if (this._threadId) {
       try {
         await this._request('turn/interrupt', { threadId: this._threadId })
-      } catch { /* fall through to SIGKILL */ }
+        return true
+      } catch { return false }
     }
-    try { this.proc!.kill('SIGKILL') } catch {}
-    try { await this.proc!.exited } catch {}
-    return true
+    return false
   }
 
   async close(): Promise<void> {
@@ -542,13 +542,11 @@ export class CodexProvider implements AgentProvider {
       return
     }
 
-    // AIC-116 cycle 2: do NOT emit partial deltas as `assistant` events. Each delta
-    // is one streaming token chunk — emitting them as assistant text would let the server
-    // write N intermediate fragments + 1 final copy to group_messages.
-    // Buffer them silently; the matching `item/completed` carries the full text and is the
-    // single emission point.
+    // Partial text is a transient `delta` event. It is never persisted as an
+    // assistant message; item/completed remains the single final-text emission.
     if (method === 'item/agentMessage/delta') {
-      this.eventCb?.({ type: 'other', raw })  // surface for transcript UI debug, NOT as assistant
+      const delta = typeof params.delta === 'string' ? params.delta : ''
+      if (delta) this.eventCb?.({ type: 'delta', text: delta, raw })
       return
     }
     if (method === 'item/completed') {
