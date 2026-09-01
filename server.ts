@@ -967,7 +967,9 @@ function handleProviderError(userId: string, conversationId: string, agentId: st
   const key = runtimeProviderKey(userId, conversationId, agentId)
   console.error(`provider[${agentId}] error: kind=${err.kind} msg=${err.message}`)
   const failedRoute = _agentTurnRoutes.current(key)
-  if (failedRoute && !failedRoute.observeOnly) setRoutePresence(failedRoute, agentId, 'error')
+  if (failedRoute && !failedRoute.observeOnly) {
+    setRoutePresence(failedRoute, agentId, /CODEX_EXECUTION_CANCELLED/i.test(err.message) ? 'idle' : 'error')
+  }
   if (err.kind === 'process_exited' || err.kind === 'spawn_failed') {
     if (isAgentWorkingInDb(agentId)) markAgentIdle(agentId)
     // AIC-116 cycle 2: drop the dead provider instance so the next dispatch
@@ -3107,7 +3109,6 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
   provider.send(route.prompt).catch((e: any) => {
     console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
     _agentTurnRoutes.remove(key, route.id)
-    if (!route.observeOnly) setRoutePresence(route, agentId, 'error')
     demoteAgentTurnDelivery(agentId, route)
     if (!route.observeOnly) {
       const rawError = String(e?.message || '')
@@ -3118,6 +3119,7 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
           : /CODEX_EXECUTION_CANCELLED/i.test(rawError)
             ? 'CODEX_EXECUTION_CANCELLED'
             : 'CODEX_EXECUTION_ERROR'
+      setRoutePresence(route, agentId, error === 'CODEX_EXECUTION_CANCELLED' ? 'idle' : 'error')
       // The Browser already understands execution_error. Provider rejections must
       // close the pending bubble just like success/cancel, otherwise a failed
       // Helper turn remains "正在思考" forever and the Thread composer stays in
