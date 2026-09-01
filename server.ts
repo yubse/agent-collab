@@ -734,6 +734,14 @@ function setRoutePresence(route: AgentTurnRoute, agentId: string, status: AgentP
   }))
 }
 
+// Presence TTLs must expire independently of the 15s SSE transport heartbeat.
+// Otherwise a 7s typing indicator or 5s Agent error can remain visible for up
+// to one heartbeat interval. This timer owns no business state and naturally
+// starts empty after a Server restart.
+setInterval(() => {
+  for (const update of presenceStore.sweep()) publishPresenceUpdate(update)
+}, 1_000)
+
 function readBrowserExecutionEvents(userId: string, conversationId: string, since: number | null, threadId: string | null = null) {
   const key = executionStreamKey(userId, conversationId)
   const list = browserExecutionEvents.get(key) || []
