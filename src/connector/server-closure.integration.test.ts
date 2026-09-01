@@ -69,7 +69,8 @@ async function json(response: Response): Promise<any> {
 }
 
 type TestConnector = { ws: WebSocket; requests: any[]; cancellations: any[]; token: string; close(): Promise<void> }
-type ConnectorAnswer = string | ((request: any) => string | Promise<string>)
+type ConnectorAnswerValue = string | { error: string }
+type ConnectorAnswer = ConnectorAnswerValue | ((request: any) => ConnectorAnswerValue | Promise<ConnectorAnswerValue>)
 
 async function pairConnector(cookie: string, name: string, answer: ConnectorAnswer): Promise<TestConnector> {
   const pairing = await json(await api('/api/connectors/claim/start', cookie, { method: 'POST', body: '{}' }))
@@ -117,6 +118,24 @@ function openConnector(token: string, name: string, answer: ConnectorAnswer): Pr
         const started = Date.now()
         void Promise.resolve(typeof answer === 'function' ? answer(message) : answer).then((content) => {
           const finished = Date.now()
+          if (typeof content !== 'string') {
+            ws.send(JSON.stringify({
+              type: 'execution_result', request_id: message.request_id,
+              status: 'error', error: content.error,
+              timings: {
+                execution_request_at: message.created_at,
+                execution_received_at: new Date(started).toISOString(),
+                execution_ack_at: new Date(started).toISOString(),
+                codex_started_at: new Date(started).toISOString(),
+                codex_finished_at: new Date(finished).toISOString(),
+                execution_result_at: new Date(finished).toISOString(),
+                queue_wait_ms: 0, thread_ms: 0,
+                codex_execution_ms: Math.max(0, finished - started),
+                total_ms: Math.max(0, finished - started),
+              },
+            }))
+            return
+          }
           ws.send(JSON.stringify({
             type: 'execution_delta', request_id: message.request_id,
             sequence: 1, delta: content, created_at: new Date(finished).toISOString(),
@@ -460,6 +479,37 @@ describe('Server → Connector → Conversation closure', () => {
     }))
     expect(response.record.delivery.failed).toContain('content')
     expect(response.record.delivery.errors.content).toBe('CODEX_CONNECTOR_OFFLINE')
+  })
+
+  test('closes the browser execution when a Connector Codex turn fails', async () => {
+    const conversationId = await freeConversation(userACookie, 'Connector execution failure')
+    const connector = await pairConnector(userACookie, 'Failing Connector', { error: 'CODEX_EXECUTION_ERROR' })
+    await json(await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({
+        conversation_id: conversationId, text: '@content fail visibly', mentions: ['content'],
+      }),
+    }))
+    const deadline = Date.now() + 2_000
+    let stream: any = null
+    while (Date.now() < deadline) {
+      stream = await json(await api(
+        `/group/poll?conversation_id=${encodeURIComponent(conversationId)}&stream_since=0`, userACookie,
+      ))
+      if (stream.execution_events.some((item: any) => item.type === 'execution_error')) break
+      await Bun.sleep(10)
+    }
+    const started = stream.execution_events.find((item: any) => item.type === 'execution_started')
+    expect(started).toBeTruthy()
+    expect(stream.execution_events).toContainEqual(expect.objectContaining({
+      type: 'execution_error',
+      message_id: started.message_id,
+      status: 'error',
+      error: 'CODEX_EXECUTION_ERROR',
+    }))
+    expect(stream.execution_events.filter((item: any) =>
+      item.type === 'execution_result' && item.message_id === started.message_id)).toHaveLength(0)
+    expect(connector.ws.readyState).toBe(WebSocket.OPEN)
+    await connector.close()
   })
 
   test('stops one conversation by request_id and ignores late connector output', async () => {

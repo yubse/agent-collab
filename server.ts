@@ -3067,6 +3067,28 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
     console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
     _agentTurnRoutes.remove(key, route.id)
     demoteAgentTurnDelivery(agentId, route)
+    if (!route.observeOnly) {
+      const rawError = String(e?.message || '')
+      const error = /CODEX_EXECUTION_TIMEOUT/i.test(rawError)
+        ? 'CODEX_EXECUTION_TIMEOUT'
+        : /CODEX_CONNECTOR_OFFLINE/i.test(rawError)
+          ? 'CODEX_CONNECTOR_OFFLINE'
+          : /CODEX_EXECUTION_CANCELLED/i.test(rawError)
+            ? 'CODEX_EXECUTION_CANCELLED'
+            : 'CODEX_EXECUTION_ERROR'
+      // The Browser already understands execution_error. Provider rejections must
+      // close the pending bubble just like success/cancel, otherwise a failed
+      // Helper turn remains "正在思考" forever and the Thread composer stays in
+      // stop mode. Keep the raw provider error server-side only.
+      publishBrowserExecutionEvent(route.userId, route.conversationId, {
+        type: 'execution_error',
+        message_id: route.responseMessageId,
+        agent_id: agentId,
+        status: 'error',
+        error,
+        thread_id: route.threadId || null,
+      })
+    }
     if (route.creativeDiscussion) failCreativeDiscussion(route.creativeDiscussion.discussionId, 'AGENT_SEND_FAILED')
     if (isAgentWorkingInDb(agentId) && !_agentTurnRoutes.hasResponseTurn(key)) markAgentIdle(agentId)
     startNextAgentTurn(userId, conversationId, agentId)
