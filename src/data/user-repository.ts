@@ -30,10 +30,10 @@ export class UserRepository {
     if (channelExists && !canReadChannel(this.db, conversationId, userId)) return []
     const select = `SELECT id, ts AS created_at, conversation_id, sender_id, sender_model,
       sender_actor_type, sender_actor_id, execution_owner_user_id, trigger_message_id, trigger_actor_id,
-      text, images, files, mentions, reply_to, message_type, task_id, meta FROM group_messages`
+      thread_id, text, images, files, mentions, reply_to, message_type, task_id, meta FROM group_messages`
     const safeLimit = Math.max(1, Math.min(limit, 500))
     const rows = channelExists
-      ? this.db.prepare(`${select} WHERE conversation_id=? ORDER BY ts DESC LIMIT ?`).all(conversationId, safeLimit)
+      ? this.db.prepare(`${select} WHERE conversation_id=? AND thread_id IS NULL ORDER BY ts DESC LIMIT ?`).all(conversationId, safeLimit)
       : this.db.prepare(`${select} WHERE user_id=? AND conversation_id=? ORDER BY ts DESC LIMIT ?`).all(userId, conversationId, safeLimit)
     return (rows as any[]).reverse()
   }

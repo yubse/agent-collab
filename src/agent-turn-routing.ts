@@ -12,6 +12,7 @@ export type AgentTurnRoute = {
   id: string
   userId: string
   conversationId: string
+  threadId?: string | null
   observeOnly: boolean
   dispatchId: string
   recordId: string
@@ -77,5 +78,15 @@ export class AgentTurnRouteQueue {
     const routes = this.queues.get(agentId) || []
     this.queues.delete(agentId)
     return routes
+  }
+
+  removeWhere(agentId: string, predicate: (route: AgentTurnRoute) => boolean): { removed: AgentTurnRoute[]; activeRemoved: boolean } {
+    const queue = this.queues.get(agentId) || []
+    const active = queue[0] || null
+    const removed = queue.filter(predicate)
+    const kept = queue.filter((route) => !predicate(route))
+    if (kept.length) this.queues.set(agentId, kept)
+    else this.queues.delete(agentId)
+    return { removed, activeRemoved: Boolean(active && removed.includes(active)) }
   }
 }

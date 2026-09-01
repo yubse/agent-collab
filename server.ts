@@ -519,6 +519,7 @@ type GroupRecord = {
   execution_owner_user_id: string | null
   trigger_message_id: string | null
   trigger_actor_id: string | null
+  thread_id: string | null
   sender_actor: ResolvedActor | null
   text: string
   images: string[]
@@ -533,6 +534,12 @@ type GroupRecord = {
   task_id: string | null
   parent_task_id: string | null
   owner: string | null
+  thread_summary?: {
+    id: string
+    reply_count: number
+    last_reply_at: string | null
+    participant_actor_ids: string[]
+  } | null
 }
 
 const GROUP_MESSAGE_TYPES = new Set(['task', 'decision', 'ship', 'block', 'progress', 'chat', 'system_notification'])
@@ -627,6 +634,7 @@ type BrowserExecutionEvent = {
   event_id: number
   message_id: string
   conversation_id: string
+  thread_id?: string | null
   agent_id?: string
   created_at: string
   delta?: string
@@ -641,6 +649,7 @@ const serverFirstDeltaRequests = new Set<string>()
 type BrowserExecutionSubscriber = {
   userId: string
   conversationId: string
+  threadId: string | null
   controller: ReadableStreamDefaultController<Uint8Array>
 }
 const browserExecutionSubscribers = new Map<string, Set<BrowserExecutionSubscriber>>()
@@ -696,17 +705,19 @@ function publishBrowserExecutionEvent(
       try { subscriber.controller.close() } catch {}
       continue
     }
+    if ((item.thread_id || null) !== subscriber.threadId) continue
     try { subscriber.controller.enqueue(frame) } catch { browserExecutionSubscribers.get(key)?.delete(subscriber) }
   }
   return item
 }
 
-function readBrowserExecutionEvents(userId: string, conversationId: string, since: number | null) {
+function readBrowserExecutionEvents(userId: string, conversationId: string, since: number | null, threadId: string | null = null) {
   const key = executionStreamKey(userId, conversationId)
   const list = browserExecutionEvents.get(key) || []
+  const visible = list.filter((item) => (item.thread_id || null) === threadId)
   const events = since === null
-    ? list.filter((item) => browserExecutionActive.has(`${key}:${item.message_id}`))
-    : list.filter((item) => item.event_id > since)
+    ? visible.filter((item) => browserExecutionActive.has(`${key}:${item.message_id}`))
+    : visible.filter((item) => item.event_id > since)
   return { events, lastEventId: browserExecutionSequence }
 }
 
@@ -804,6 +815,7 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
       message_id: activeRoute.responseMessageId,
       agent_id: agentId,
       delta: ev.text,
+      thread_id: activeRoute.threadId || null,
     })
     return
   }
@@ -846,6 +858,7 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
         agent_id: agentId,
         content: text,
         status: 'success',
+        thread_id: activeRoute.threadId || null,
       })
       return
     }
@@ -872,6 +885,7 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
           execution_owner_user_id: activeRoute.userId,
           trigger_message_id: activeRoute.recordId,
           trigger_actor_id: (db.prepare(`SELECT sender_actor_id FROM group_messages WHERE id=?`).get(activeRoute.recordId) as any)?.sender_actor_id || activeRoute.userId,
+          thread_id: activeRoute.threadId || null,
           message_type: 'chat',
           source: 'provider_reply',
         },
@@ -885,6 +899,7 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
         agent_id: agentId,
         content: text,
         status: 'success',
+        thread_id: activeRoute.threadId || null,
       })
       const executionRequestId = typeof ev.raw?.request_id === 'string'
         ? ev.raw.request_id.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
@@ -899,7 +914,7 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
         dispatchGroupRecord(record, responseTargets, activeRoute.hopCount)
       }
       // Non-mentioned agents still receive the message as silent context.
-      if (!dmAgentFor(conversationId)) {
+      if (!activeRoute.threadId && !dmAgentFor(conversationId)) {
         const observers = groupObserverTargetsFor(agentId, responseTargets, conversationId, activeRoute.userId)
         if (observers.length) {
           dispatchGroupRecord(record, observers, activeRoute.hopCount, /* observeOnly */ true)
@@ -1049,6 +1064,36 @@ function channelMemberCandidates(tenantId: string) {
     .all(tenantId)
   const agents = ROLE_AGENT_IDS.map((id) => resolveActor(db, 'agent', id)).filter(Boolean)
   return { humans, agents }
+}
+
+function threadRow(threadId: string) {
+  return db.prepare(`SELECT id, channel_id, root_message_id, created_by_actor_type,
+    created_by_actor_id, status, created_at, updated_at FROM threads WHERE id=?`).get(threadId) as any
+}
+
+function threadPayload(threadId: string, userId: string) {
+  const thread = threadRow(threadId)
+  if (!thread || !canReadChannel(db, thread.channel_id, userId)) return null
+  const rootRow = db.prepare(`SELECT * FROM group_messages WHERE id=? AND conversation_id=? AND thread_id IS NULL`)
+    .get(thread.root_message_id, thread.channel_id) as any
+  if (!rootRow) return null
+  const summary = threadSummaryForRoot(thread.root_message_id)
+  return { ...thread, root_message: groupRowToRecord(rootRow), ...summary }
+}
+
+function threadSummaryForRoot(rootMessageId: string) {
+  const thread = db.prepare(`SELECT id FROM threads WHERE root_message_id=?`).get(rootMessageId) as any
+  if (!thread) return null
+  const stats = db.prepare(`SELECT COUNT(*) AS reply_count, MAX(ts) AS last_reply_at
+    FROM group_messages WHERE thread_id=?`).get(thread.id) as any
+  const participants = db.prepare(`SELECT DISTINCT sender_actor_id FROM group_messages
+    WHERE thread_id=? AND sender_actor_id IS NOT NULL ORDER BY ts DESC LIMIT 5`).all(thread.id) as any[]
+  return {
+    id: String(thread.id),
+    reply_count: Number(stats?.reply_count || 0),
+    last_reply_at: stats?.last_reply_at || null,
+    participant_actor_ids: participants.map((row) => String(row.sender_actor_id)),
+  }
 }
 
 function groupMemberIds(conversationId: string, userId: string): string[] {
@@ -1643,6 +1688,7 @@ function notifyActorViaDM(actor_id: string, task: any, event: any) {
       sender_id: 'system', sender_model: null,
       sender_actor_type: 'system', sender_actor_id: 'system',
       execution_owner_user_id: null, trigger_message_id: null, trigger_actor_id: null,
+      thread_id: null,
       sender_actor: resolveActor(db, 'system', 'system'),
       text, images: [], files: [], mentions: [],
       parent_msg_id: null, reply_to: null,
@@ -2172,6 +2218,7 @@ function groupRowToRecord(row: any): GroupRecord {
     execution_owner_user_id: row.execution_owner_user_id || null,
     trigger_message_id: row.trigger_message_id || null,
     trigger_actor_id: row.trigger_actor_id || null,
+    thread_id: row.thread_id || null,
     text: row.text,
     images: jsonParseSafe(row.images, []),
     files: jsonParseSafe(row.files, []),
@@ -2186,10 +2233,21 @@ function groupRowToRecord(row: any): GroupRecord {
     parent_task_id: row.parent_task_id || null,
     owner: row.owner || null,
   } as Omit<GroupRecord, 'sender_actor'>
-  return { ...record, sender_actor: resolvedActorForMessage(db, record) }
+  return {
+    ...record,
+    sender_actor: resolvedActorForMessage(db, record),
+    thread_summary: record.thread_id ? null : threadSummaryForRoot(record.id),
+  }
 }
 
-function readGroupRecords(userId: string, since: string | null, limit: number, conversationId?: string, beforeId?: string | null) {
+function readGroupRecords(
+  userId: string,
+  since: string | null,
+  limit: number,
+  conversationId?: string,
+  beforeId?: string | null,
+  threadId: string | null = null,
+) {
   const safeLimit = Math.min(Math.max(limit || 120, 1), 500)
   const persistedChannel = conversationId
     ? db.prepare(`SELECT id FROM group_conversations WHERE id=?`).get(conversationId)
@@ -2199,18 +2257,18 @@ function readGroupRecords(userId: string, since: string | null, limit: number, c
   // AIC-90: before_id 历史分页 — 取 ts < anchor.ts (按 ts DESC) limit 条 + reverse 让最早在头
   if (beforeId) {
     const anchor = persistedChannel
-      ? db.prepare(`SELECT ts FROM group_messages WHERE id=? AND conversation_id=?`).get(beforeId, conversationId) as any
+      ? db.prepare(`SELECT ts FROM group_messages WHERE id=? AND conversation_id=? AND thread_id IS ?`).get(beforeId, conversationId, threadId) as any
       : db.prepare(`SELECT ts FROM group_messages WHERE id=? AND user_id=?`).get(beforeId, userId) as any
     if (!anchor) return []
     rows = persistedChannel
-      ? (db.prepare(`SELECT * FROM group_messages WHERE conversation_id=? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(conversationId, anchor.ts, safeLimit) as any[]).reverse()
+      ? (db.prepare(`SELECT * FROM group_messages WHERE conversation_id=? AND thread_id IS ? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(conversationId, threadId, anchor.ts, safeLimit) as any[]).reverse()
       : conversationId
       ? (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id=? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(userId, conversationId, anchor.ts, safeLimit) as any[]).reverse()
       : (db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND ts < ? ORDER BY ts DESC LIMIT ?`).all(userId, anchor.ts, safeLimit) as any[]).reverse()
   } else if (persistedChannel) {
     rows = since
-      ? db.prepare(`SELECT * FROM group_messages WHERE conversation_id=? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(conversationId, since, safeLimit) as any[]
-      : (db.prepare(`SELECT * FROM group_messages WHERE conversation_id=? ORDER BY ts DESC LIMIT ?`).all(conversationId, safeLimit) as any[]).reverse()
+      ? db.prepare(`SELECT * FROM group_messages WHERE conversation_id=? AND thread_id IS ? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(conversationId, threadId, since, safeLimit) as any[]
+      : (db.prepare(`SELECT * FROM group_messages WHERE conversation_id=? AND thread_id IS ? ORDER BY ts DESC LIMIT ?`).all(conversationId, threadId, safeLimit) as any[]).reverse()
   } else if (conversationId) {
     rows = since
       ? db.prepare(`SELECT * FROM group_messages WHERE user_id=? AND conversation_id = ? AND ts > ? ORDER BY ts ASC LIMIT ?`).all(userId, conversationId, since, safeLimit) as any[]
@@ -2351,6 +2409,7 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
     trigger_actor_id: senderId !== 'admin' && senderId !== 'system'
       ? String(input.trigger_actor_id || '').trim() || null
       : null,
+    thread_id: String(input.thread_id || '').trim() || null,
     sender_actor: actor ? resolveActor(db, actor.type, actor.id) : null,
     text,
     images,
@@ -2369,10 +2428,10 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
   db.run(
     `INSERT INTO group_messages
       (id, ts, conversation_id, sender_id, sender_model, sender_actor_type, sender_actor_id,
-       execution_owner_user_id, trigger_message_id, trigger_actor_id,
+       execution_owner_user_id, trigger_message_id, trigger_actor_id, thread_id,
        text, images, files, mentions, parent_msg_id, reply_to, source, delivery, meta,
        message_type, task_id, parent_task_id, owner, user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       record.id,
       record.ts,
@@ -2384,6 +2443,7 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
       record.execution_owner_user_id,
       record.trigger_message_id,
       record.trigger_actor_id,
+      record.thread_id,
       record.text,
       JSON.stringify(record.images),
       JSON.stringify(record.files),
@@ -2404,7 +2464,11 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
     type: 'message_created',
     message_id: record.id,
     agent_id: record.sender_actor_type === 'agent' ? record.sender_actor_id || undefined : undefined,
+    thread_id: record.thread_id,
   })
+  if (record.thread_id) {
+    db.run(`UPDATE threads SET updated_at=? WHERE id=?`, [record.ts, record.thread_id])
+  }
   // AIC-51: previously agent post → markAgentIdle as a "round done" heuristic.
   // Removed because it fires mid-round when the agent sends a progress message
   // while still working, falsely flipping state to idle before Stop hook /
@@ -2495,7 +2559,12 @@ function failCreativeDiscussion(discussionId: string, reason: string) {
   appendCreativeSystemMessage(discussion, `⚠ 创意讨论在第${discussion.current_round}轮停止：${safeReason}`, discussion.current_round, { status: 'failed' })
 }
 
-async function stopConversationRun(userId: string, conversationId: string) {
+async function stopConversationRun(
+  userId: string,
+  conversationId: string,
+  threadId: string | null = null,
+  responseMessageIds: Set<string> | null = null,
+) {
   let cancelledRequests = 0
   let stoppedRoutes = 0
   const ownPrefix = `${userId}:${conversationId}:`
@@ -2508,7 +2577,12 @@ async function stopConversationRun(userId: string, conversationId: string) {
       const executionOwnerUserId = key.slice(0, key.indexOf(channelMarker))
       if (!canStopExecution(db, conversationId, userId, executionOwnerUserId)) continue
     } else if (!key.startsWith(ownPrefix)) continue
-    const routes = _agentTurnRoutes.clear(key)
+    const selected = threadId || responseMessageIds
+      ? _agentTurnRoutes.removeWhere(key, (route) =>
+          (!threadId || route.threadId === threadId)
+          && (!responseMessageIds || responseMessageIds.has(route.responseMessageId)))
+      : { removed: _agentTurnRoutes.clear(key), activeRemoved: true }
+    const routes = selected.removed
     if (!routes.length) continue
     stoppedRoutes += routes.length
     const active = routes[0]
@@ -2521,9 +2595,10 @@ async function stopConversationRun(userId: string, conversationId: string) {
         agent_id: agentId,
         status: 'error',
         error: 'CODEX_EXECUTION_CANCELLED',
+        thread_id: route.threadId || null,
       })
     }
-    if (active?.started) {
+    if (active?.started && selected.activeRemoved) {
       interruptions.push(provider.interrupt().then((cancelled) => { if (cancelled) cancelledRequests += 1 }))
     }
     if (isAgentWorkingInDb(agentId)) markAgentIdle(agentId)
@@ -2540,8 +2615,9 @@ async function stopConversationRun(userId: string, conversationId: string) {
   if (stoppedRoutes || discussion) {
     appendGroupRecord({
       sender_id: 'system', conversation_id: conversationId, text: '已停止',
+      thread_id: threadId,
       source: 'user_cancel', message_type: 'system_notification',
-      meta: { stopped_routes: stoppedRoutes, cancelled_requests: cancelledRequests },
+      meta: { stopped_routes: stoppedRoutes, cancelled_requests: cancelledRequests, thread_id: threadId },
     }, [], { mode: 'system', targets: [], delivered: [], failed: [] }, userId)
   }
   return { stopped: Boolean(stoppedRoutes || discussion), stoppedRoutes, cancelledRequests }
@@ -2917,17 +2993,29 @@ function buildBridgePrompt(record: GroupRecord, recipient: string, hopCount: num
   const privateMemory = channelScope === 'shared'
     ? ''
     : userRepo.memory(record.user_id, recipient)?.content?.trim() || ''
-  const recentContext = readGroupRecords(record.user_id, null, 12, record.conversation_id)
-    .filter((item) => item.id !== record.id)
+  const thread = record.thread_id
+    ? db.prepare(`SELECT t.*, m.text AS root_text, m.sender_actor_type AS root_actor_type,
+        m.sender_actor_id AS root_actor_id, m.sender_id AS root_sender_id
+      FROM threads t JOIN group_messages m ON m.id=t.root_message_id
+      WHERE t.id=? AND t.channel_id=?`).get(record.thread_id, record.conversation_id) as any
+    : null
+  const recentRecords = record.thread_id
+    ? readGroupRecords(record.user_id, null, 20, record.conversation_id, null, record.thread_id)
+    : readGroupRecords(record.user_id, null, 12, record.conversation_id)
+  const recentContext = recentRecords.filter((item) => item.id !== record.id)
     .map((item) => {
-      const name = GROUP_ROSTER_BY_ID.get(item.sender_id)?.display_name || item.sender_id
+      const name = item.sender_actor?.display_name || GROUP_ROSTER_BY_ID.get(item.sender_id)?.display_name || item.sender_id
       return `${name}: ${item.text.replace(/\s+/g, ' ').slice(0, 500)}`
     })
     .join('\n')
+  const rootContext = thread
+    ? `${resolveActor(db, thread.root_actor_type, thread.root_actor_id)?.display_name || thread.root_sender_id}: ${String(thread.root_text || '').replace(/\s+/g, ' ').slice(0, 700)}`
+    : ''
   const serverContext = [
     sharedDefinition ? `[共享 Agent Definition]\n${sharedDefinition}` : '',
     privateMemory ? `[当前用户私有 Memory]\n${privateMemory}` : '',
-    recentContext ? `[当前 Conversation 近期上下文]\n${recentContext}` : '',
+    rootContext ? `[Thread 原始消息]\n${rootContext}` : '',
+    recentContext ? `[${record.thread_id ? '当前 Thread' : '当前 Conversation'} 近期上下文]\n${recentContext}` : '',
   ].filter(Boolean).join('\n\n')
   const request = `${head}\n${meta}\n${record.text}${groupAttachmentsBlock(record)}${footer}`
   return serverContext ? `${serverContext}\n\n[本次请求]\n${request}` : request
@@ -2973,6 +3061,7 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
     type: 'execution_started',
     message_id: route.responseMessageId,
     agent_id: agentId,
+    thread_id: route.threadId || null,
   })
   provider.send(route.prompt).catch((e: any) => {
     console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
@@ -3028,6 +3117,7 @@ function dispatchGroupRecord(record: GroupRecord, targets: string[], hopCount: n
       recordId: record.id,
       prompt: text,
       responseMessageId: groupId('grp'),
+      threadId: record.thread_id,
       started: false,
       hopCount: hopCount + 1,
     })
@@ -3670,6 +3760,89 @@ Bun.serve<ConnectorSocketData>({
       return Response.json({ ok: true, removed: true })
     }
 
+    const channelThreadsMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/threads$/)
+    if (req.method === 'POST' && channelThreadsMatch && isAuthed) {
+      const channelId = decodeURIComponent(channelThreadsMatch[1])
+      if (!canReadChannel(db, channelId, currentUser!.id) || !canPostChannel(db, channelId, currentUser!.id)) {
+        return Response.json({ ok: false, error: 'channel not found' }, { status: 404 })
+      }
+      const body = await readOptionalJsonObject(req)
+      const rootMessageId = String(body.root_message_id || '').trim()
+      const root = db.prepare(`SELECT id FROM group_messages
+        WHERE id=? AND conversation_id=? AND thread_id IS NULL`).get(rootMessageId, channelId)
+      if (!root) return Response.json({ ok: false, error: 'root message not found' }, { status: 404 })
+      let thread = db.prepare(`SELECT id FROM threads WHERE root_message_id=?`).get(rootMessageId) as any
+      let created = false
+      if (!thread) {
+        const id = `thread-${randomBytes(8).toString('hex')}`
+        const now = groupNowIso()
+        try {
+          db.run(`INSERT INTO threads
+            (id, channel_id, root_message_id, created_by_actor_type, created_by_actor_id, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'human', ?, 'open', ?, ?)`, [id, channelId, rootMessageId, currentUser!.id, now, now])
+          thread = { id }
+          created = true
+        } catch (error: any) {
+          if (!String(error?.message || '').includes('UNIQUE')) throw error
+          thread = db.prepare(`SELECT id FROM threads WHERE root_message_id=?`).get(rootMessageId) as any
+        }
+      }
+      return Response.json({ ok: true, thread: threadPayload(String(thread.id), currentUser!.id) }, { status: created ? 201 : 200 })
+    }
+
+    const threadMatch = url.pathname.match(/^\/api\/threads\/([^/]+)$/)
+    if (req.method === 'GET' && threadMatch && isAuthed) {
+      const thread = threadPayload(decodeURIComponent(threadMatch[1]), currentUser!.id)
+      return thread
+        ? Response.json({ ok: true, thread })
+        : Response.json({ ok: false, error: 'thread not found' }, { status: 404 })
+    }
+
+    const threadMessagesMatch = url.pathname.match(/^\/api\/threads\/([^/]+)\/messages$/)
+    if (threadMessagesMatch && isAuthed) {
+      const threadId = decodeURIComponent(threadMessagesMatch[1])
+      const thread = threadRow(threadId)
+      if (!thread || !canReadChannel(db, thread.channel_id, currentUser!.id)) {
+        return Response.json({ ok: false, error: 'thread not found' }, { status: 404 })
+      }
+      if (req.method === 'GET') {
+        const limit = Number.parseInt(url.searchParams.get('limit') || '120', 10)
+        return Response.json({
+          ok: true,
+          thread: threadPayload(threadId, currentUser!.id),
+          messages: readGroupRecords(currentUser!.id, null, limit, thread.channel_id, null, threadId),
+        })
+      }
+      if (req.method === 'POST') {
+        if (thread.status !== 'open' || !canPostChannel(db, thread.channel_id, currentUser!.id)) {
+          return Response.json({ ok: false, error: thread.status !== 'open' ? 'THREAD_CLOSED' : 'thread not found' }, { status: thread.status !== 'open' ? 409 : 404 })
+        }
+        try {
+          const body = await readOptionalJsonObject(req)
+          const text = String(body.text || '')
+          const mentions = normalizeGroupMentions(body.mentions, text)
+          const targets = groupTargetsFor('admin', mentions, 0, thread.channel_id, currentUser!.id)
+          const delivery = {
+            targets,
+            mode: mentions.includes(GROUP_ALL_TOKEN) ? 'all' : (mentions.length ? 'mention' : 'default'),
+            dispatch_id: groupId('dsp'), delivered: [], failed: [],
+          }
+          const record = appendGroupRecord({
+            text,
+            images: body.images,
+            files: body.files,
+            conversation_id: thread.channel_id,
+            thread_id: threadId,
+            sender_id: 'admin',
+          }, mentions, delivery, currentUser!.id)
+          if (targets.length) dispatchGroupRecord(record, targets, 0)
+          return Response.json({ ok: true, record, targets, observers: [] }, { status: 201 })
+        } catch (error: any) {
+          return Response.json({ ok: false, error: error?.message || 'unable to post thread message' }, { status: 400 })
+        }
+      }
+    }
+
     const conversationMessagesMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/)
     if (req.method === 'GET' && conversationMessagesMatch && isAuthed) {
       const conversationId = decodeURIComponent(conversationMessagesMatch[1])
@@ -3680,6 +3853,7 @@ Bun.serve<ConnectorSocketData>({
       const messages = userRepo.listMessages(currentUser!.id, conversationId).map((message) => ({
         ...message,
         sender_actor: resolvedActorForMessage(db, message),
+        thread_summary: message.thread_id ? null : threadSummaryForRoot(message.id),
       }))
       return Response.json({ ok: true, messages })
     }
@@ -3882,6 +4056,7 @@ Bun.serve<ConnectorSocketData>({
     if (req.method === 'GET' && url.pathname === '/group/stream' && isAuthed) {
       const defaultConversation = ensureUserDefaultConversation(currentUser!)
       const conversationId = url.searchParams.get('conversation_id') || defaultConversation.id
+      const threadId = url.searchParams.get('thread_id') || null
       if (!dmAgentFor(conversationId) && !canReadChannel(db, conversationId, currentUser!.id)) {
         return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
       }
@@ -3895,12 +4070,19 @@ Bun.serve<ConnectorSocketData>({
       }
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
-          subscriberRef = { userId: currentUser!.id, conversationId, controller }
+          if (threadId) {
+            const thread = threadRow(threadId)
+            if (!thread || thread.channel_id !== conversationId) {
+              controller.error(new Error('thread not found'))
+              return
+            }
+          }
+          subscriberRef = { userId: currentUser!.id, conversationId, threadId, controller }
           const subscribers = browserExecutionSubscribers.get(key) || new Set()
           subscribers.add(subscriberRef)
           browserExecutionSubscribers.set(key, subscribers)
           controller.enqueue(streamEncoder.encode(': connected\n\n'))
-          for (const event of readBrowserExecutionEvents(currentUser!.id, conversationId, null).events) {
+          for (const event of readBrowserExecutionEvents(currentUser!.id, conversationId, null, threadId).events) {
             controller.enqueue(streamEncoder.encode(`data: ${JSON.stringify(event)}\n\n`))
           }
           heartbeat = setInterval(() => {
@@ -3939,16 +4121,24 @@ Bun.serve<ConnectorSocketData>({
       const limit = parseInt(url.searchParams.get('limit') || '120')
       const defaultConversation = ensureUserDefaultConversation(currentUser!)
       const conversationId = url.searchParams.get('conversation_id') || defaultConversation.id
+      const threadId = url.searchParams.get('thread_id') || null
       if (!dmAgentFor(conversationId) && !canReadChannel(db, conversationId, currentUser!.id)) {
         return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
       }
-      const records = readGroupRecords(currentUser!.id, since, limit, conversationId, beforeId)
+      if (threadId) {
+        const thread = threadRow(threadId)
+        if (!thread || thread.channel_id !== conversationId) {
+          return Response.json({ ok: false, error: 'thread not found' }, { status: 404 })
+        }
+      }
+      const records = readGroupRecords(currentUser!.id, since, limit, conversationId, beforeId, threadId)
       const streamSinceRaw = url.searchParams.get('stream_since')
       const streamSince = streamSinceRaw === null ? null : Number.parseInt(streamSinceRaw, 10)
       const stream = readBrowserExecutionEvents(
         currentUser!.id,
         conversationId,
         Number.isFinite(streamSince) ? streamSince : null,
+        threadId,
       )
       // AIC-90: 历史分页返 cursor (= 最早一条 id, client 下次传 before_id 用) + has_more
       // 兼容老 caller (不传 before_id 行为不变, cursor=null has_more=false)
@@ -3975,13 +4165,23 @@ Bun.serve<ConnectorSocketData>({
       try {
         const body = await readOptionalJsonObject(req)
         const conversationId = String(body.conversation_id || ensureUserDefaultConversation(currentUser!).id)
+        const threadId = String(body.thread_id || '').trim() || null
+        const responseMessageIds = Array.isArray(body.message_ids)
+          ? new Set<string>(body.message_ids.map(String).filter(Boolean))
+          : null
+        if (threadId) {
+          const thread = threadRow(threadId)
+          if (!thread || thread.channel_id !== conversationId) {
+            return Response.json({ ok: false, error: 'thread not found' }, { status: 404 })
+          }
+        }
         if (!dmAgentFor(conversationId)
             && (!canReadChannel(db, conversationId, currentUser!.id)
               || !canStopExecution(db, conversationId, currentUser!.id, currentUser!.id))) {
           return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
         }
-        const result = await stopConversationRun(currentUser!.id, conversationId)
-        return Response.json({ ok: true, status: 'stopped', conversation_id: conversationId, ...result })
+        const result = await stopConversationRun(currentUser!.id, conversationId, threadId, responseMessageIds)
+        return Response.json({ ok: true, status: 'stopped', conversation_id: conversationId, thread_id: threadId, ...result })
       } catch (error: any) {
         return Response.json({ ok: false, error: error?.message || 'stop failed' }, { status: 400 })
       }

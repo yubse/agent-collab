@@ -80,6 +80,9 @@ describe('D1 migration', () => {
       { id: 'm-unknown', sender_actor_type: null, sender_actor_id: null },
     ])
     expect((db.prepare(`SELECT COUNT(*) AS n FROM schema_migrations WHERE version=6`).get() as any).n).toBe(1)
+    expect((db.prepare(`SELECT COUNT(*) AS n FROM schema_migrations WHERE version=7`).get() as any).n).toBe(1)
+    expect((db.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='threads'`).get() as any).n).toBe(1)
+    expect((db.prepare(`PRAGMA table_info(group_messages)`).all() as any[]).some((column) => column.name === 'thread_id')).toBe(true)
   })
 })
 

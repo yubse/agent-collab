@@ -241,6 +241,29 @@ const MIGRATIONS: Migration[] = [
           )`)
     },
   },
+  {
+    version: 7,
+    name: 'channel_threads',
+    up(db) {
+      db.run(`CREATE TABLE IF NOT EXISTS threads (
+        id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        root_message_id TEXT NOT NULL UNIQUE,
+        created_by_actor_type TEXT NOT NULL CHECK (created_by_actor_type IN ('human', 'agent', 'system')),
+        created_by_actor_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (channel_id) REFERENCES group_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (root_message_id) REFERENCES group_messages(id) ON DELETE CASCADE
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_threads_channel_updated
+        ON threads(channel_id, updated_at)`)
+      addColumn(db, 'group_messages', 'thread_id TEXT')
+      db.run(`CREATE INDEX IF NOT EXISTS idx_group_messages_thread_ts
+        ON group_messages(thread_id, ts)`)
+    },
+  },
 ]
 
 export function runMigrations(db: Database): void {

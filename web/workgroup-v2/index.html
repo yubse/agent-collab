@@ -2372,7 +2372,7 @@ button, textarea, input { font: inherit; }
     </div>
   </main>
   <aside class="studio-members-panel" id="membersPanel">
-    <div class="studio-members-head"><strong>Members</strong><button class="studio-icon-button" id="membersPanelClose" title="关闭"><span class="material-symbols-rounded">close</span></button></div>
+    <div class="studio-members-head"><strong id="membersPanelTitle">Members</strong><button class="studio-icon-button" id="membersPanelClose" title="关闭"><span class="material-symbols-rounded">close</span></button></div>
     <div id="membersPanelContent" class="studio-members-content"></div>
   </aside>
   </div>
@@ -2845,6 +2845,12 @@ const _runningExecutions = new Map();
 const _stoppedExecutionMessages = new Set();
 let _executionStreamSource = null;
 let _executionStreamChannel = null;
+let activeThread = null;
+
+function _threadChannelKey(threadId) { return `thread:${threadId}`; }
+function _executionPresentationChannel(payload) {
+  return payload?.thread_id ? _threadChannelKey(payload.thread_id) : _clientChannelForConversation(payload?.conversation_id || payload?.channel);
+}
 const _typewriter = new window.AIStudioTypewriterBuffer({
   tickMs: 20,
   onUpdate: (streamState, reason) => _renderTypewriterUpdate(streamState, reason),
@@ -2887,11 +2893,13 @@ function _conversationRunning(channelId = currentChannel) {
 function _markExecutionRunning(channelId, messageId) {
   _runningSet(channelId).add(messageId);
   updateSendBtn();
+  if (activeThread && channelId === _threadChannelKey(activeThread.id)) renderThreadPanel();
 }
 
 function _markExecutionFinished(channelId, messageId) {
   _runningExecutions.get(channelId)?.delete(messageId);
   updateSendBtn();
+  if (activeThread && channelId === _threadChannelKey(activeThread.id)) renderThreadPanel();
 }
 
 function _sendStreamTrace(stage, messageId, elapsedMs) {
@@ -2902,13 +2910,16 @@ function _sendStreamTrace(stage, messageId, elapsedMs) {
   }).catch(() => {});
 }
 
-function _ensureExecutionStream(channelId) {
+function _ensureExecutionStream(channelId, threadId = activeThread?.channel_id === CHANNELS[channelId]?.convId ? activeThread?.id : null) {
   const cfg = CHANNELS[channelId];
   if (!cfg || typeof EventSource !== 'function') return;
-  if (_executionStreamSource && _executionStreamChannel === channelId) return;
+  const streamKey = `${channelId}:${threadId || ''}`;
+  if (_executionStreamSource && _executionStreamChannel === streamKey) return;
   if (_executionStreamSource) _executionStreamSource.close();
-  _executionStreamChannel = channelId;
-  _executionStreamSource = new EventSource(`/group/stream?conversation_id=${encodeURIComponent(cfg.convId)}`);
+  _executionStreamChannel = streamKey;
+  const params = new URLSearchParams({ conversation_id: cfg.convId });
+  if (threadId) params.set('thread_id', threadId);
+  _executionStreamSource = new EventSource(`/group/stream?${params}`);
   _executionStreamSource.onmessage = event => {
     try { _consumeExecutionEvents([JSON.parse(event.data)]); }
     catch (error) { console.warn('[stream] invalid server event', error); }
@@ -2942,7 +2953,7 @@ function handleExecutionDelta(event) {
     messageId,
     delta,
     eventKey,
-    channelId: _clientChannelForConversation(payload.conversation_id || payload.channel),
+    channelId: _executionPresentationChannel(payload),
     senderId: payload.agent_id || payload.sender_id,
     createdAt: payload.created_at || payload.ts,
   });
@@ -2952,7 +2963,7 @@ function handleExecutionStarted(event) {
   const payload = event?.payload || event || {};
   const messageId = _executionMessageId(payload);
   if (!messageId) return false;
-  const channelId = _clientChannelForConversation(payload.conversation_id || payload.channel);
+  const channelId = _executionPresentationChannel(payload);
   _stoppedExecutionMessages.delete(messageId);
   if (!_streamTrace.has(messageId)) _streamTrace.set(messageId, { startedAt: performance.now(), browserDelta: false, rendered: false });
   _markExecutionRunning(channelId, messageId);
@@ -2968,7 +2979,7 @@ function handleExecutionResult(event) {
   const payload = event?.payload || event || {};
   const messageId = _executionMessageId(payload);
   if (!messageId) return false;
-  const channelId = _clientChannelForConversation(payload.conversation_id || payload.channel);
+  const channelId = _executionPresentationChannel(payload);
   _markExecutionFinished(channelId, messageId);
   if (_stoppedExecutionMessages.has(messageId)) return false;
   console.info(`[stream] message=${messageId} stage=execution_result at=${new Date().toISOString()}`);
@@ -2986,7 +2997,11 @@ function _consumeExecutionEvents(events) {
     if (!_isExecutionStreamEvent(event)) continue;
     const type = String(event.type || event.event);
     if (type === 'message_created') {
-      const channelId = _clientChannelForConversation(event.conversation_id || event.channel);
+      const channelId = _executionPresentationChannel(event);
+      if (event.thread_id && activeThread?.id === event.thread_id) {
+        loadThread(activeThread.id, { preserveComposer: true });
+        continue;
+      }
       const cs = channelState[channelId];
       if (cs) { cs.cursor = null; pollGroup(channelId).then(() => { if (currentChannel === channelId) render(); }); }
     } else if (type === 'execution_started') handleExecutionStarted(event);
@@ -3041,15 +3056,18 @@ function _findMessageNode(container, messageId) {
 
 function _renderTypewriterUpdate(streamState, reason) {
   if (reason !== 'tick') _typewriterRevision += 1;
-  const isCurrent = streamState.channelId === currentChannel;
+  const isThread = activeThread && streamState.channelId === _threadChannelKey(activeThread.id);
+  const isCurrent = streamState.channelId === currentChannel || isThread;
   if (!isCurrent) return;
   const groupContainer = document.getElementById('groupMessages');
   const dmContainer = document.getElementById('dmMessages');
-  let row = _findMessageNode(groupContainer, streamState.id) || _findMessageNode(dmContainer, streamState.id);
+  const threadContainer = document.getElementById('threadMessages');
+  let row = _findMessageNode(groupContainer, streamState.id) || _findMessageNode(dmContainer, streamState.id) || _findMessageNode(threadContainer, streamState.id);
   if (!row) {
-    if (state.view === 'group') { _msgsSignature = ''; renderMessages(); }
+    if (isThread) renderThreadPanel();
+    else if (state.view === 'group') { _msgsSignature = ''; renderMessages(); }
     else if (state.view === 'dm') { _dmMsgsSignature = ''; renderDmMessages(); }
-    row = _findMessageNode(groupContainer, streamState.id) || _findMessageNode(dmContainer, streamState.id);
+    row = _findMessageNode(groupContainer, streamState.id) || _findMessageNode(dmContainer, streamState.id) || _findMessageNode(document.getElementById('threadMessages'), streamState.id);
   }
   if (!row) return;
   row.dataset.streamStatus = streamState.failed ? 'failed' : streamState.completed ? 'completed' : 'typing';
@@ -5054,7 +5072,14 @@ function renderWorkspaceSidebar() {
 
 function renderMembersPanel() {
   const content = document.getElementById('membersPanelContent');
+  const title = document.getElementById('membersPanelTitle');
   if (!content) return;
+  if (activeThread) {
+    if (title) title.textContent = 'Thread';
+    renderThreadPanel();
+    return;
+  }
+  if (title) title.textContent = 'Members';
   if (state.view !== 'group') {
     content.innerHTML = '<div class="studio-member-section-title">当前视图没有 Channel 成员</div>';
     return;
@@ -5080,11 +5105,97 @@ function renderMembersPanel() {
     ${(group?.current_user_role === 'owner' || group?.current_user_role === 'moderator') ? `<button class="studio-sidebar-link" data-members-manage="${esc(group.id)}"><span class="material-symbols-rounded">manage_accounts</span>管理成员</button>` : ''}`;
 }
 
+async function openThread(rootMessageId) {
+  const cfg = CHANNELS[currentChannel];
+  if (!cfg?.convId) return;
+  const created = await apiJson(`/api/channels/${encodeURIComponent(cfg.convId)}/threads`, {
+    method: 'POST', body: JSON.stringify({ root_message_id: rootMessageId }),
+  });
+  if (!created?.ok) { showWipToast(created?.error || '无法打开讨论串'); return; }
+  activeThread = { ...created.thread, messages: [] };
+  document.getElementById('membersPanel').classList.add('open');
+  await loadThread(activeThread.id);
+  _ensureExecutionStream(currentChannel, activeThread.id);
+}
+
+async function loadThread(threadId, opts = {}) {
+  const data = await apiJson(`/api/threads/${encodeURIComponent(threadId)}/messages`);
+  if (!data?.ok || activeThread?.id !== threadId) return;
+  activeThread = { ...data.thread, messages: data.messages || [] };
+  for (const message of activeThread.messages) {
+    if (_typewriter.get(message.id)) _typewriter.markPersisted(message.id, message);
+  }
+  renderThreadPanel(opts);
+}
+
+function closeThread() {
+  activeThread = null;
+  _ensureExecutionStream(currentChannel, null);
+  renderMembersPanel();
+  const cs = channelState[currentChannel];
+  if (cs) { cs.cursor = null; cs.streamCursor = null; }
+  pollGroup(currentChannel).then(() => { _msgsSignature = ''; renderMessages(); });
+}
+
+function renderThreadPanel() {
+  const content = document.getElementById('membersPanelContent');
+  if (!content || !activeThread) return;
+  const threadKey = _threadChannelKey(activeThread.id);
+  const messages = _typewriterMessagesForChannel(threadKey, activeThread.messages || []);
+  const root = activeThread.root_message || {};
+  const rootAuthor = root.sender_actor?.display_name || displayName(root.sender_actor_id || root.sender_id);
+  const running = _conversationRunning(threadKey);
+  content.innerHTML = `<div class="studio-thread-panel">
+    <div class="studio-thread-root"><small>原始消息 · ${esc(rootAuthor)}</small><div>${mdRender(root.text || '')}</div></div>
+    <div class="studio-thread-messages" id="threadMessages">${messages.length ? messages.map(renderGroupMsg).join('') : '<div class="studio-thread-empty">还没有回复</div>'}</div>
+    <div class="studio-thread-composer">
+      <textarea id="threadComposerInput" placeholder="回复到讨论串…"></textarea>
+      <div><span>Enter 发送 · Shift+Enter 换行</span><button class="ws-send-btn${running ? ' is-stop' : ''}" id="threadSendButton" data-mode="${running ? 'stop' : 'send'}">${running ? '■ 停止' : '发送'}</button></div>
+    </div>
+  </div>`;
+  const box = document.getElementById('threadMessages');
+  if (box) box.scrollTop = box.scrollHeight;
+}
+
+async function sendThreadMessage() {
+  if (!activeThread) return;
+  const input = document.getElementById('threadComposerInput');
+  const text = input?.value.trim() || '';
+  if (!text) return;
+  input.value = '';
+  const result = await apiJson(`/api/threads/${encodeURIComponent(activeThread.id)}/messages`, {
+    method: 'POST', body: JSON.stringify({ text, mentions: parseMentions(text) }),
+  });
+  if (!result?.ok) { showWipToast(result?.error || 'Thread 发送失败'); return; }
+  await loadThread(activeThread.id);
+}
+
+async function stopThreadExecution() {
+  if (!activeThread) return;
+  const key = _threadChannelKey(activeThread.id);
+  const activeIds = [...(_runningExecutions.get(key) || [])];
+  _runningExecutions.set(key, new Set());
+  for (const messageId of activeIds) {
+    _stoppedExecutionMessages.add(messageId);
+    _typewriter.stop({ messageId, error: 'CODEX_EXECUTION_CANCELLED' });
+  }
+  const result = await apiJson('/group/stop', {
+    method: 'POST', body: JSON.stringify({
+      conversation_id: activeThread.channel_id,
+      thread_id: activeThread.id,
+      message_ids: activeIds,
+    }),
+  });
+  if (!result?.ok) showWipToast(result?.error || '停止失败');
+  await loadThread(activeThread.id);
+}
+
 function setActiveGroup(groupId) {
   if (!CHANNELS[groupId] || !groupConversations.some(g => g.id === groupId)) return;
   state.activeGroup = groupId;
   state.view = 'group';
   currentChannel = groupId;
+  activeThread = null;
   persist();
   markSeen(groupId);
   updateAllUnreadCounts();
@@ -5339,6 +5450,11 @@ function renderGroupMsg(m) {
   ).join('');
   const attachments = (images || files)
     ? `<div class="ws-msg-attachment">${images}${files}</div>` : '';
+  const threadSummary = m.thread_summary;
+  const threadMeta = threadSummary?.reply_count
+    ? `<button class="studio-thread-summary" data-open-thread="${esc(m.id)}">${threadSummary.reply_count} 条回复 · 最后回复 ${esc(formatTime(threadSummary.last_reply_at))}</button>`
+    : '';
+  const threadAction = m.thread_id ? '' : `<button class="studio-thread-action" data-open-thread="${esc(m.id)}" title="回复到讨论串"><span class="material-symbols-rounded">reply</span> Thread</button>`;
 
   return `
     <div class="ws-msg-comment" data-msg-id="${esc(m.id)}"${streamStatus ? ` data-stream-status="${streamStatus}"` : ''}>
@@ -5355,7 +5471,9 @@ function renderGroupMsg(m) {
         ${(visibleText || streamState) ? `<div class="ws-msg-text">${mdRender(visibleText)}</div>` : ''}
         ${_typewriterStatusHtml(streamState)}
         ${attachments}
+        ${threadMeta}
       </div>
+      ${threadAction}
     </div>`;
 }
 
@@ -8875,7 +8993,14 @@ document.getElementById('sidebarSettingsBtn').addEventListener('click', openAppS
 document.getElementById('channelSearchButton').addEventListener('click', () => document.getElementById('wsSearchTriggerBtn').click());
 document.getElementById('channelMembersToggle').addEventListener('click', () => document.getElementById('membersPanel').classList.toggle('open'));
 document.getElementById('headerStopButton').addEventListener('click', stopCurrentConversation);
-document.getElementById('membersPanelClose').addEventListener('click', () => document.getElementById('membersPanel').classList.remove('open'));
+document.getElementById('membersPanelClose').addEventListener('click', () => {
+  if (activeThread) closeThread();
+  else document.getElementById('membersPanel').classList.remove('open');
+});
+document.getElementById('groupMessages').addEventListener('click', event => {
+  const button = event.target.closest('[data-open-thread]');
+  if (button) openThread(button.dataset.openThread);
+});
 document.querySelector('.ws-workstation-sidebar').addEventListener('click', event => {
   const viewButton = event.target.closest('[data-sidebar-view]');
   if (viewButton) setView(viewButton.dataset.sidebarView);
@@ -8883,8 +9008,24 @@ document.querySelector('.ws-workstation-sidebar').addEventListener('click', even
   if (dmButton) setActiveDm(dmButton.dataset.sidebarDm);
 });
 document.getElementById('membersPanelContent').addEventListener('click', event => {
+  const open = event.target.closest('[data-open-thread]');
+  if (open) { openThread(open.dataset.openThread); return; }
+  const threadSend = event.target.closest('#threadSendButton');
+  if (threadSend) {
+    if (threadSend.dataset.mode === 'stop') stopThreadExecution();
+    else sendThreadMessage();
+    return;
+  }
   const button = event.target.closest('[data-members-manage]');
   if (button) openGroupManage(button.dataset.membersManage);
+});
+document.getElementById('membersPanelContent').addEventListener('keydown', event => {
+  if (event.target.id !== 'threadComposerInput' || event.isComposing || event.keyCode === 229) return;
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    if (_conversationRunning(activeThread ? _threadChannelKey(activeThread.id) : '')) stopThreadExecution();
+    else sendThreadMessage();
+  }
 });
 // App-settings panel delegation (theme seg / open-identity / shortcuts)
 document.getElementById('appSettingsMask').addEventListener('click', e => {

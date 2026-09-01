@@ -167,6 +167,17 @@ async function waitForMessage(cookie: string, conversationId: string, expected: 
   throw new Error(`message ${expected} was not persisted`)
 }
 
+async function waitForThreadMessage(cookie: string, threadId: string, expected: string): Promise<any> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const data = await json(await api(`/api/threads/${encodeURIComponent(threadId)}/messages`, cookie))
+    const found = data.messages.find((item: any) => item.text === expected)
+    if (found) return found
+    await Bun.sleep(25)
+  }
+  throw new Error(`thread message ${expected} was not persisted`)
+}
+
 beforeAll(async () => {
   server = spawnServer()
   await waitForServer()
@@ -188,6 +199,99 @@ afterAll(async () => {
 })
 
 describe('Server → Connector → Conversation closure', () => {
+  test('D3 Channel Thread inherits membership, routes Agent execution and isolates context/streaming', async () => {
+    const privateMarker = `D3_PRIVATE_MEMORY_${Date.now()}`
+    await json(await api('/api/agents/content/memory', userACookie, {
+      method: 'PUT', body: JSON.stringify({ content: privateMarker }),
+    }))
+    const created = await json(await api('/api/channels', userACookie, {
+      method: 'POST', body: JSON.stringify({
+        name: 'D3 Shared', human_member_ids: [userB.id], agent_member_ids: ['content'],
+      }),
+    }))
+    const channelId = created.channel.id
+    const rootSent = await json(await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: 'D3 root packaging direction' }),
+    }))
+    const rootId = rootSent.record.id
+    const first = await api(`/api/channels/${channelId}/threads`, userACookie, {
+      method: 'POST', body: JSON.stringify({ root_message_id: rootId, created_by_actor_id: userB.id }),
+    })
+    expect(first.status).toBe(201)
+    const thread = (await json(first)).thread
+    const duplicate = await json(await api(`/api/channels/${channelId}/threads`, userBCookie, {
+      method: 'POST', body: JSON.stringify({ root_message_id: rootId }),
+    }))
+    expect(duplicate.thread.id).toBe(thread.id)
+    expect(thread.created_by_actor_id).toBe(userA.id)
+
+    const humanA = await json(await api(`/api/threads/${thread.id}/messages`, userACookie, {
+      method: 'POST', body: JSON.stringify({ text: 'A says drawer box', user_id: userB.id, thread_id: 'forged' }),
+    }))
+    const humanB = await json(await api(`/api/threads/${thread.id}/messages`, userBCookie, {
+      method: 'POST', body: JSON.stringify({ text: 'B says cost is high' }),
+    }))
+    expect(humanA.record.sender_actor_id).toBe(userA.id)
+    expect(humanA.record.thread_id).toBe(thread.id)
+    expect(humanB.record.sender_actor_id).toBe(userB.id)
+    const historyA = await json(await api(`/api/threads/${thread.id}/messages`, userACookie))
+    const historyB = await json(await api(`/api/threads/${thread.id}/messages`, userBCookie))
+    expect(historyA.messages.map((m: any) => m.id)).toEqual(historyB.messages.map((m: any) => m.id))
+
+    const connectorA = await pairConnector(userACookie, 'D3 Connector A', async (request) => {
+      if (String(request.prompt).includes('D3_CANCEL')) { await Bun.sleep(300); return 'D3_LATE_RESULT' }
+      await Bun.sleep(40); return 'D3_AGENT_REPLY'
+    })
+    await json(await api(`/api/threads/${thread.id}/messages`, userACookie, {
+      method: 'POST', body: JSON.stringify({ text: '@content propose an option', mentions: ['content'] }),
+    }))
+    const agentReply = await waitForThreadMessage(userBCookie, thread.id, 'D3_AGENT_REPLY')
+    expect(agentReply).toMatchObject({ thread_id: thread.id, execution_owner_user_id: userA.id })
+    expect(connectorA.requests).toHaveLength(1)
+    expect(connectorA.requests[0]).toMatchObject({ user_id: userA.id, conversation_id: channelId, agent_id: 'content' })
+    const prompt = String(connectorA.requests[0].prompt)
+    expect(prompt).toContain('[Thread 原始消息]')
+    expect(prompt).toContain('D3 root packaging direction')
+    expect(prompt).toContain('[当前 Thread 近期上下文]')
+    expect(prompt).not.toContain('[当前 Conversation 近期上下文]')
+    expect(prompt).not.toContain(privateMarker)
+
+    const main = await json(await api(`/api/conversations/${channelId}/messages`, userACookie))
+    expect(main.messages.some((message: any) => message.id === agentReply.id)).toBe(false)
+    const refreshedRoot = main.messages.find((message: any) => message.id === rootId)
+    expect(refreshedRoot.thread_summary).toMatchObject({ id: thread.id, reply_count: 4 })
+    const mainStream = await json(await api(`/group/poll?conversation_id=${channelId}&stream_since=0`, userACookie))
+    const threadStreamA = await json(await api(`/group/poll?conversation_id=${channelId}&thread_id=${thread.id}&stream_since=0`, userACookie))
+    const threadStreamB = await json(await api(`/group/poll?conversation_id=${channelId}&thread_id=${thread.id}&stream_since=0`, userBCookie))
+    expect(mainStream.execution_events.some((event: any) => event.message_id === agentReply.id)).toBe(false)
+    const normalized = (stream: any) => stream.execution_events.map((event: any) => [event.type, event.message_id, event.thread_id])
+    expect(normalized(threadStreamA)).toEqual(normalized(threadStreamB))
+    expect(threadStreamA.execution_events.some((event: any) => event.type === 'execution_delta' && event.message_id === agentReply.id)).toBe(true)
+    expect(threadStreamA.execution_events.filter((event: any) => event.type === 'execution_result' && event.message_id === agentReply.id)).toHaveLength(1)
+
+    await json(await api(`/api/threads/${thread.id}/messages`, userACookie, {
+      method: 'POST', body: JSON.stringify({ text: '@content D3_CANCEL', mentions: ['content'] }),
+    }))
+    while (connectorA.requests.length < 2) await Bun.sleep(5)
+    const stopped = await json(await api('/group/stop', userACookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, thread_id: thread.id }),
+    }))
+    expect(stopped).toMatchObject({ stopped: true, thread_id: thread.id })
+    expect(connectorA.cancellations).toHaveLength(1)
+    await Bun.sleep(350)
+    const afterStop = await json(await api(`/api/threads/${thread.id}/messages`, userACookie))
+    expect(afterStop.messages.some((message: any) => message.text === 'D3_LATE_RESULT')).toBe(false)
+    expect(afterStop.messages.some((message: any) => message.text === '已停止')).toBe(true)
+
+    expect((await api(`/api/threads/${thread.id}`, adminCookie)).status).toBe(404)
+    expect((await api(`/api/threads/${thread.id}/messages`, adminCookie)).status).toBe(404)
+    await json(await api(`/api/channels/${channelId}/members/human/${userB.id}`, userACookie, { method: 'DELETE' }))
+    expect((await api(`/api/threads/${thread.id}`, userBCookie)).status).toBe(404)
+    expect((await api(`/api/threads/${thread.id}/messages`, userBCookie)).status).toBe(404)
+    expect((await api(`/group/poll?conversation_id=${channelId}&thread_id=${thread.id}`, userBCookie)).status).toBe(404)
+    await connectorA.close()
+  }, 15_000)
+
   test('D2 shared Channel isolates execution ownership and broadcasts one message stream', async () => {
     const privateMarker = `PRIVATE_MEMORY_${Date.now()}`
     await json(await api('/api/agents/content/memory', userACookie, {

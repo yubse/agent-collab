@@ -54,6 +54,9 @@ body { background: var(--surface); }
 .ws-chat-messages { padding:16px 22px 20px; gap:4px; }
 .ws-msg-comment { padding:5px 8px; gap:10px; border-radius:6px; }
 .ws-msg-comment:hover { background:var(--surface-2); }
+.studio-thread-action { align-self:flex-start; opacity:0; border:0; background:transparent; color:var(--ink-3); font-size:10px; display:flex; align-items:center; gap:3px; padding:4px 6px; cursor:pointer; }
+.studio-thread-action .material-symbols-rounded { font-size:15px; }.ws-msg-comment:hover .studio-thread-action { opacity:1; }
+.studio-thread-summary { display:block; margin-top:6px; padding:0; border:0; background:transparent; color:var(--info); font-size:10px; cursor:pointer; }
 .ws-msg-avatar { width:32px; height:32px; border-radius:50%; }
 .ws-msg-author { font-size:13px; }.ws-msg-text { margin-top:2px; font-size:13.5px; line-height:1.48; }
 .ws-msg-comment[data-stream-status="typing"] { background:color-mix(in srgb,var(--surface-2) 70%,transparent); }
@@ -74,6 +77,15 @@ body { background: var(--surface); }
 .studio-role-badge,.studio-agent-badge { flex:none; font:600 8px 'JetBrains Mono',monospace; padding:2px 5px; border-radius:4px; background:var(--surface-3); color:var(--ink-3); text-transform:uppercase; }
 .studio-agent-badge { color:var(--actorB-deep); background:var(--actorB-soft); }
 .studio-status-dot { width:7px; height:7px; border-radius:50%; background:var(--mute); }.studio-status-dot.working { background:var(--warn); }.studio-status-dot.idle { background:var(--good); }
+.studio-thread-panel { height:100%; min-height:0; display:flex; flex-direction:column; }
+.studio-thread-root { flex:none; margin:0 4px 10px; padding:10px; border-radius:8px; background:var(--surface-3); font-size:12px; line-height:1.45; }
+.studio-thread-root small { display:block; margin-bottom:5px; color:var(--ink-3); font-size:9px; }
+.studio-thread-messages { flex:1; min-height:0; overflow-y:auto; padding:2px 0 10px; }
+.studio-thread-messages .ws-msg-comment { padding:6px 4px; }.studio-thread-messages .ws-msg-avatar { width:27px; height:27px; }
+.studio-thread-empty { padding:28px 8px; text-align:center; color:var(--ink-3); font-size:11px; }
+.studio-thread-composer { flex:none; padding:8px 4px 2px; border-top:1px solid var(--border); }
+.studio-thread-composer textarea { box-sizing:border-box; width:100%; min-height:58px; max-height:130px; resize:vertical; border:1px solid var(--border); border-radius:7px; padding:8px; background:var(--surface); color:var(--ink); font:12px inherit; }
+.studio-thread-composer > div { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:6px; }.studio-thread-composer > div > span { color:var(--ink-3); font-size:8px; }
 .ws-modal { border-radius:10px !important; }.ws-group-member-options { grid-template-columns:1fr; gap:5px; }.ws-group-member-option { border-radius:7px; padding:8px 10px; }
 @media (max-width:1100px) {
   .ws-workspace-shell { grid-template-columns:220px minmax(0,1fr); }
