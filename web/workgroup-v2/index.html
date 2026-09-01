@@ -3902,11 +3902,10 @@ function _identityUploadPng(actorId) {
     const file = input.files && input.files[0];
     if (!file) return;
     try {
-      const arrayBuf = await file.arrayBuffer();
       const r = await fetch(`/upload?name=${encodeURIComponent(file.name)}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: arrayBuf,
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
         credentials: 'same-origin',
       });
       const j = await r.json().catch(() => null);
@@ -4538,10 +4537,9 @@ function parseMentions(text) {
 }
 
 async function uploadFile(file) {
-  const buf = await file.arrayBuffer();
   const res = await api(`/upload?name=${encodeURIComponent(file.name)}`, {
-    method: 'POST', body: buf,
-    headers: { 'Content-Type': 'application/octet-stream' },
+    method: 'POST', body: file,
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
   });
   if (!res?.ok) return null;
   const data = await res.json();
