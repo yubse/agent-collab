@@ -5,6 +5,7 @@ export type ConnectorHello = {
   protocol_version: 1
   device_token: string
   device_name: string
+  codex_status?: 'ready' | 'not_ready'
 }
 
 export type ConnectorHelloAck = {
@@ -15,7 +16,7 @@ export type ConnectorHelloAck = {
   error?: string
 }
 
-export type ConnectorHeartbeat = { type: 'heartbeat'; sent_at: string }
+export type ConnectorHeartbeat = { type: 'heartbeat'; sent_at: string; codex_status?: 'ready' | 'not_ready' }
 export type ConnectorHeartbeatAck = { type: 'heartbeat_ack'; received_at: string }
 
 export type ExecutionRequest = {
@@ -85,7 +86,10 @@ export function parseConnectorMessage(raw: string): ConnectorToServer {
     if (typeof value.device_name !== 'string' || !value.device_name.trim()) throw new Error('device_name required')
     return value as ConnectorHello
   }
-  if (value.type === 'heartbeat') return { type: 'heartbeat', sent_at: String(value.sent_at || '') }
+  if (value.type === 'heartbeat') return {
+    type: 'heartbeat', sent_at: String(value.sent_at || ''),
+    ...(value.codex_status === 'ready' || value.codex_status === 'not_ready' ? { codex_status: value.codex_status } : {}),
+  }
   if (value.type === 'execution_ack') {
     if (typeof value.request_id !== 'string' || !value.request_id) throw new Error('request_id required')
     if (value.status !== 'running') throw new Error('invalid execution ack status')

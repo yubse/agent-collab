@@ -79,6 +79,7 @@ export function connectOnce(
         protocol_version: CONNECTOR_PROTOCOL_VERSION,
         device_token: deviceToken,
         device_name: config.deviceName,
+        codex_status: state.snapshot().codex === 'CODEX_READY' ? 'ready' : 'not_ready',
       }))
     })
     ws.addEventListener('message', (event) => {
@@ -93,7 +94,10 @@ export function connectOnce(
         console.log(`[connector] status=SERVER_CONNECTED device="${config.deviceName}"`)
         const seconds = Math.max(1, message.heartbeat_interval || 30)
         heartbeat = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'heartbeat', sent_at: new Date().toISOString() }))
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({
+            type: 'heartbeat', sent_at: new Date().toISOString(),
+            codex_status: state.snapshot().codex === 'CODEX_READY' ? 'ready' : 'not_ready',
+          }))
         }, seconds * 1_000)
         return
       }

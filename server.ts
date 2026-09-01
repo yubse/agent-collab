@@ -66,6 +66,7 @@ import {
   upsertChannelMembership,
 } from './src/channels/access.ts'
 import { actorForNewMessage, resolveActor, resolvedActorForMessage, type ActorType, type ResolvedActor } from './src/actors/resolver.ts'
+import { PresenceStore, type AgentPresenceStatus, type PresenceUpdate } from './src/presence/store.ts'
 import {
   CREATIVE_AGENTS,
   CREATIVE_AGENT_BY_ID,
@@ -647,12 +648,14 @@ const browserExecutionEvents = new Map<string, BrowserExecutionEvent[]>()
 const browserExecutionActive = new Set<string>()
 const serverFirstDeltaRequests = new Set<string>()
 type BrowserExecutionSubscriber = {
+  connectionId: string
   userId: string
   conversationId: string
   threadId: string | null
   controller: ReadableStreamDefaultController<Uint8Array>
 }
 const browserExecutionSubscribers = new Map<string, Set<BrowserExecutionSubscriber>>()
+const presenceStore = new PresenceStore()
 let browserExecutionSequence = 0
 const streamEncoder = new TextEncoder()
 
@@ -709,6 +712,26 @@ function publishBrowserExecutionEvent(
     try { subscriber.controller.enqueue(frame) } catch { browserExecutionSubscribers.get(key)?.delete(subscriber) }
   }
   return item
+}
+
+function publishPresenceUpdate(update: PresenceUpdate) {
+  if (!update.channel_id) return update
+  const key = executionStreamKey(update.execution_owner_user_id || update.actor_id, update.channel_id)
+  const frame = streamEncoder.encode(`data: ${JSON.stringify(update)}\n\n`)
+  for (const subscriber of [...(browserExecutionSubscribers.get(key) || [])]) {
+    if (!subscriberCanRead(subscriber)) continue
+    if ((update.thread_id || null) !== subscriber.threadId && update.actor_type !== 'human') continue
+    try { subscriber.controller.enqueue(frame) } catch { browserExecutionSubscribers.get(key)?.delete(subscriber) }
+  }
+  return update
+}
+
+function setRoutePresence(route: AgentTurnRoute, agentId: string, status: AgentPresenceStatus) {
+  publishPresenceUpdate(presenceStore.setAgent({
+    presenceKey: route.id, agentId, channelId: route.conversationId,
+    threadId: route.threadId || null, ownerUserId: route.userId,
+    requestId: route.requestId || route.id, status,
+  }))
 }
 
 function readBrowserExecutionEvents(userId: string, conversationId: string, since: number | null, threadId: string | null = null) {
@@ -810,6 +833,7 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
   const activeRoute = _agentTurnRoutes.current(key)
   let completedRoute: AgentTurnRoute | null = null
   if (ev.type === 'delta' && ev.text && activeRoute && !activeRoute.observeOnly) {
+    setRoutePresence(activeRoute, agentId, 'streaming')
     publishBrowserExecutionEvent(activeRoute.userId, activeRoute.conversationId, {
       type: 'execution_delta',
       message_id: activeRoute.responseMessageId,
@@ -819,10 +843,15 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
     })
     return
   }
-  if ((ev.type === 'system_init' || ev.type === 'assistant') && activeRoute && !activeRoute.observeOnly) {
+  if (ev.type === 'system_init' && activeRoute && !activeRoute.observeOnly) {
+    if (typeof ev.raw?.request_id === 'string') activeRoute.requestId = ev.raw.request_id
+    // Remote Codex reports request creation before the Helper ACK. Keep queued until
+    // ACK; local providers' normal system_init means the runtime has started.
+    if (ev.raw?.stage !== 'request') setRoutePresence(activeRoute, agentId, 'working')
     if (!isAgentWorkingInDb(agentId)) markAgentWorking(agentId, { dispatch_id: activeRoute.dispatchId })
   } else if (ev.type === 'result') {
     completedRoute = _agentTurnRoutes.complete(key)
+    if (completedRoute && !completedRoute.observeOnly) setRoutePresence(completedRoute, agentId, 'idle')
     // A completed response must not make the workstation look idle when another
     // visible response is already queued behind it. Observe-only turns stay silent.
     if (_agentTurnRoutes.hasResponseTurn(key)) {
@@ -929,6 +958,8 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
 function handleProviderError(userId: string, conversationId: string, agentId: string, err: AgentError): void {
   const key = runtimeProviderKey(userId, conversationId, agentId)
   console.error(`provider[${agentId}] error: kind=${err.kind} msg=${err.message}`)
+  const failedRoute = _agentTurnRoutes.current(key)
+  if (failedRoute && !failedRoute.observeOnly) setRoutePresence(failedRoute, agentId, 'error')
   if (err.kind === 'process_exited' || err.kind === 'spawn_failed') {
     if (isAgentWorkingInDb(agentId)) markAgentIdle(agentId)
     // AIC-116 cycle 2: drop the dead provider instance so the next dispatch
@@ -2589,6 +2620,7 @@ async function stopConversationRun(
     const agentId = key.slice(key.lastIndexOf(':') + 1)
     for (const route of routes) {
       if (route.observeOnly) continue
+      setRoutePresence(route, agentId, 'idle')
       publishBrowserExecutionEvent(userId, conversationId, {
         type: 'execution_error',
         message_id: route.responseMessageId,
@@ -3050,6 +3082,7 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
   const key = runtimeProviderKey(userId, conversationId, agentId)
   const route = _agentTurnRoutes.startNext(key)
   if (!route) return
+  if (!route.observeOnly) setRoutePresence(route, agentId, 'queued')
   const provider = ensureProvider(userId, conversationId, agentId)
   if (!provider) {
     _agentTurnRoutes.remove(key, route.id)
@@ -3066,6 +3099,7 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
   provider.send(route.prompt).catch((e: any) => {
     console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
     _agentTurnRoutes.remove(key, route.id)
+    if (!route.observeOnly) setRoutePresence(route, agentId, 'error')
     demoteAgentTurnDelivery(agentId, route)
     if (!route.observeOnly) {
       const rawError = String(e?.message || '')
@@ -3621,7 +3655,12 @@ Bun.serve<ConnectorSocketData>({
     }
 
     if (req.method === 'GET' && url.pathname === '/api/connectors' && isAuthed) {
-      return Response.json({ ok: true, devices: listDevices(db, currentUser!.id) })
+      const devices = listDevices(db, currentUser!.id).map((device: any) => {
+        const connection = connectorRegistry.get(device.id)
+        const live = presenceStore.snapshot('').connectors.find(item => item.actor_id === device.id)
+        return { ...device, presence_status: connection ? (live?.status === 'ready' ? 'ready' : 'online') : 'offline' }
+      })
+      return Response.json({ ok: true, devices })
     }
 
     const connectorUnbindMatch = url.pathname.match(/^\/api\/connectors\/([^/]+)$/)
@@ -4083,10 +4122,13 @@ Bun.serve<ConnectorSocketData>({
         return Response.json({ ok: false, error: 'conversation not found' }, { status: 404 })
       }
       const key = executionStreamKey(currentUser!.id, conversationId)
+      const connectionId = groupId('presence')
       let subscriberRef: BrowserExecutionSubscriber | null = null
       let heartbeat: ReturnType<typeof setInterval> | null = null
       const cleanup = () => {
         if (subscriberRef) browserExecutionSubscribers.get(key)?.delete(subscriberRef)
+        const offline = presenceStore.disconnectHuman(connectionId)
+        if (offline) publishPresenceUpdate(offline)
         if (heartbeat) clearInterval(heartbeat)
         req.signal.removeEventListener('abort', cleanup)
       }
@@ -4099,16 +4141,21 @@ Bun.serve<ConnectorSocketData>({
               return
             }
           }
-          subscriberRef = { userId: currentUser!.id, conversationId, threadId, controller }
+          subscriberRef = { connectionId, userId: currentUser!.id, conversationId, threadId, controller }
           const subscribers = browserExecutionSubscribers.get(key) || new Set()
           subscribers.add(subscriberRef)
           browserExecutionSubscribers.set(key, subscribers)
+          publishPresenceUpdate(presenceStore.connectHuman(connectionId, currentUser!.id, conversationId, threadId))
           controller.enqueue(streamEncoder.encode(': connected\n\n'))
           for (const event of readBrowserExecutionEvents(currentUser!.id, conversationId, null, threadId).events) {
             controller.enqueue(streamEncoder.encode(`data: ${JSON.stringify(event)}\n\n`))
           }
           heartbeat = setInterval(() => {
-            try { controller.enqueue(streamEncoder.encode(': heartbeat\n\n')) } catch { cleanup() }
+            try {
+              presenceStore.touchHuman(connectionId)
+              for (const update of presenceStore.sweep()) publishPresenceUpdate(update)
+              controller.enqueue(streamEncoder.encode(': heartbeat\n\n'))
+            } catch { cleanup() }
           }, 15_000)
           req.signal.addEventListener('abort', cleanup, { once: true })
         },
@@ -4179,8 +4226,25 @@ Bun.serve<ConnectorSocketData>({
         roster: GROUP_ROSTER,
         members: groupMembersPayload(currentUser!.id),
         channel_memberships: dmAgentFor(conversationId) ? [] : channelMembershipPayload(conversationId),
+        presence: presenceStore.snapshot(conversationId, threadId),
         status: groupStatusSnapshot(currentUser!.id),
       })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/presence/typing' && isAuthed) {
+      const body = await readOptionalJsonObject(req)
+      const conversationId = String(body.channel_id || '')
+      const threadId = String(body.thread_id || '').trim() || null
+      if (!conversationId || (!dmAgentFor(conversationId) && !canPostChannel(db, conversationId, currentUser!.id))) {
+        return Response.json({ ok: false, error: 'channel not found' }, { status: 404 })
+      }
+      if (threadId) {
+        const thread = threadRow(threadId)
+        if (!thread || thread.channel_id !== conversationId) return Response.json({ ok: false, error: 'thread not found' }, { status: 404 })
+      }
+      const update = presenceStore.setTyping(currentUser!.id, conversationId, threadId, body.typing === true)
+      publishPresenceUpdate(update)
+      return Response.json({ ok: true })
     }
 
     if (req.method === 'POST' && url.pathname === '/group/stop' && isAuthed) {
@@ -5895,6 +5959,7 @@ Bun.serve<ConnectorSocketData>({
             socket: ws,
           })
           setDeviceStatus(db, device.id, 'online')
+          presenceStore.setConnector(device.id, device.user_id, parsed.codex_status === 'ready' ? 'ready' : 'online')
           console.error(`[connector-auth] device=${safeConnectorTraceId(device.id)} user=${safeConnectorTraceId(device.user_id)} stage=authenticated registry=online`)
           ws.send(JSON.stringify({
             type: 'hello_ack',
@@ -5907,6 +5972,7 @@ Bun.serve<ConnectorSocketData>({
         connectorRegistry.touch(ws.data.deviceId)
         if (parsed.type === 'heartbeat') {
           setDeviceStatus(db, ws.data.deviceId, 'online')
+          presenceStore.setConnector(ws.data.deviceId, ws.data.userId, parsed.codex_status === 'ready' ? 'ready' : 'online')
           ws.send(JSON.stringify({ type: 'heartbeat_ack', received_at: new Date().toISOString() }))
           return
         }
@@ -5936,6 +6002,7 @@ Bun.serve<ConnectorSocketData>({
       if (!ws.data.deviceId) return
       connectorRegistry.unregister(ws.data.deviceId, ws)
       setDeviceStatus(db, ws.data.deviceId, 'offline')
+      presenceStore.setConnector(ws.data.deviceId, ws.data.userId || '', 'offline')
     },
   },
 })

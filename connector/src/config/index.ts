@@ -109,7 +109,7 @@ export function loadConfig(): ConnectorConfig {
     deviceName: process.env.AI_STUDIO_DEVICE_NAME || saved.device_name || hostname(),
     deviceId,
     platform: process.platform,
-    connectorVersion: process.env.AI_STUDIO_CONNECTOR_VERSION || '0.2.1',
+    connectorVersion: process.env.AI_STUDIO_CONNECTOR_VERSION || '0.2.2',
     webOrigin,
     helperHost: '127.0.0.1',
     helperPort: Number(process.env.AI_STUDIO_HELPER_PORT || 39481),

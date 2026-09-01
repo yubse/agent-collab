@@ -12,6 +12,7 @@ type Pending = {
   ackTimer: ReturnType<typeof setTimeout>
   pendingTimer: ReturnType<typeof setTimeout>
   onDelta?: (delta: ExecutionDelta) => void
+  onAck?: (ack: ExecutionAck) => void
   lastDeltaSequence: number
 }
 
@@ -30,7 +31,7 @@ export class ConnectorDispatcher {
 
   dispatch(
     input: Omit<ExecutionRequest, 'type' | 'request_id' | 'created_at'>,
-    hooks: { onDelta?: (delta: ExecutionDelta) => void; onRequest?: (requestId: string) => void } = {},
+    hooks: { onDelta?: (delta: ExecutionDelta) => void; onRequest?: (requestId: string) => void; onAck?: (ack: ExecutionAck) => void } = {},
   ): Promise<ExecutionResult> {
     const connection = this.registry.forUser(input.user_id)
     if (!connection) return Promise.reject(new Error('CODEX_CONNECTOR_OFFLINE: no online connector for current user'))
@@ -61,6 +62,7 @@ export class ConnectorDispatcher {
         ackTimer,
         pendingTimer,
         onDelta: hooks.onDelta,
+        onAck: hooks.onAck,
         lastDeltaSequence: 0,
       })
       hooks.onRequest?.(request.request_id)
@@ -104,6 +106,7 @@ export class ConnectorDispatcher {
     if (pending.state === 'running') return true
     pending.state = 'running'
     clearTimeout(pending.ackTimer)
+    pending.onAck?.(ack)
     this.log(`[execution] request=${safeId(ack.request_id)} state=ack_received at=${safeTimestamp(ack.acknowledged_at)}`)
     return true
   }

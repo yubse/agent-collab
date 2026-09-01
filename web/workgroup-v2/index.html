@@ -2285,6 +2285,7 @@ button, textarea, input { font: inherit; }
             <div class="ws-mention-menu" id="mentionMenu" role="listbox" aria-label="选择 @ 提及"></div>
             <div class="ws-composer">
               <div class="ws-composer-pending" id="composerPending"></div>
+              <small class="studio-typing-label" id="channelTypingLabel"></small>
               <textarea id="composerInput" placeholder="发消息到工作群 …  输入 @ 召唤对应角色"></textarea>
               <div class="ws-composer-row">
                 <button class="ws-composer-btn" id="btnAttachFile" title="附件">📎</button>
@@ -2921,12 +2922,62 @@ function _ensureExecutionStream(channelId, threadId = activeThread?.channel_id =
   if (threadId) params.set('thread_id', threadId);
   _executionStreamSource = new EventSource(`/group/stream?${params}`);
   _executionStreamSource.onmessage = event => {
-    try { _consumeExecutionEvents([JSON.parse(event.data)]); }
+    try {
+      const payload = JSON.parse(event.data);
+      if (payload.type === 'presence_update') _consumePresenceUpdate(payload);
+      else _consumeExecutionEvents([payload]);
+    }
     catch (error) { console.warn('[stream] invalid server event', error); }
   };
   _executionStreamSource.onerror = () => {
     // EventSource reconnects automatically; /group/poll remains the fallback.
   };
+}
+
+function _consumePresenceUpdate(update) {
+  if (!update?.actor_type) return;
+  const bucket = update.actor_type === 'human' ? 'humans' : update.actor_type === 'agent' ? 'agent_executions' : 'connectors';
+  const list = presenceSnapshot[bucket] || (presenceSnapshot[bucket] = []);
+  const identity = item => update.actor_type === 'agent'
+    ? `${item.actor_id}:${item.execution_owner_user_id}:${item.channel_id}:${item.thread_id || ''}`
+    : item.actor_id;
+  const index = list.findIndex(item => identity(item) === identity(update));
+  if (update.status === 'offline' || update.status === 'idle') { if (index >= 0) list.splice(index, 1); }
+  else if (index >= 0) list[index] = update;
+  else list.push(update);
+  const channelLabel = document.getElementById('channelTypingLabel');
+  if (channelLabel) channelLabel.textContent = _typingLabel(null);
+  const threadLabel = document.querySelector('.studio-thread-composer .studio-typing-label');
+  if (threadLabel && activeThread) threadLabel.textContent = _typingLabel(activeThread.id);
+  renderGroupChatHeader();
+  if (!activeThread) renderMembersPanel();
+}
+
+function _presenceForAgent(agentId) {
+  const priority = { streaming: 5, working: 4, queued: 3, error: 2, idle: 1 };
+  return (presenceSnapshot.agent_executions || []).filter(item => item.actor_id === agentId)
+    .sort((a,b) => (priority[b.status] || 0) - (priority[a.status] || 0))[0]?.status || 'idle';
+}
+
+function _sendTyping(active, threadId = activeThread?.id || null) {
+  const cfg = CHANNELS[currentChannel];
+  if (!cfg?.convId) return;
+  fetch('/api/presence/typing', { method: 'POST', credentials: 'include', keepalive: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel_id: cfg.convId, thread_id: threadId, typing: active }),
+  }).catch(() => {});
+}
+
+function _scheduleTyping(threadId = null) {
+  _sendTyping(true, threadId);
+  clearTimeout(_typingTimer);
+  _typingTimer = setTimeout(() => _sendTyping(false, threadId), 2500);
+}
+
+function _typingLabel(threadId = activeThread?.id || null) {
+  const names = (presenceSnapshot.humans || []).filter(item => item.actor_id !== currentProfile?.id && item.typing && (item.thread_id || null) === threadId)
+    .map(item => members[item.actor_id]?.display_name || item.actor_id);
+  return names.length ? `${names.join('、')}正在输入…` : '';
 }
 
 function handleExecutionDelta(event) {
@@ -3143,6 +3194,8 @@ async function loadGroups() {
 let roster = [];           // [{id, display_name, kind, avatar, color, model, tmux, can_reply}]
 let members = {};          // id → roster entry
 let agentStatus = {};      // id → {state, status_text, auto_reply, is_typing, last_seen}
+let presenceSnapshot = { humans: [], agent_executions: [], connectors: [] };
+let _typingTimer = null;
 let autoReply = {};        // id → bool
 
 let pendingFiles = [];     // [{filename, name, kind: 'image'|'file'}]
@@ -3620,11 +3673,11 @@ function renderAppSettings() {
     const helper = localHelperStatus.data;
     const codexReady = helper?.codex?.status === 'CODEX_READY';
     const currentHelperDeviceId = helper?.device?.device_id;
-    const onlineDevice = connectorDevices.find(device => device.id === currentHelperDeviceId && device.status === 'online');
+    const onlineDevice = connectorDevices.find(device => device.id === currentHelperDeviceId && (device.presence_status || device.status) !== 'offline');
     const deviceRows = connectorDevices.length ? connectorDevices.map(device => `<div style="display:flex; align-items:center; gap:9px; padding:7px 0; border-top:1px solid var(--border-2);">
-      <span style="width:8px;height:8px;border-radius:50%;background:${device.status === 'online' ? 'var(--good)' : 'var(--ink-3)'};"></span>
+      <span style="width:8px;height:8px;border-radius:50%;background:${(device.presence_status || device.status) !== 'offline' ? 'var(--good)' : 'var(--ink-3)'};"></span>
       <span style="flex:1;color:var(--ink);">${esc(device.device_name)}</span>
-      <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--ink-3);">${device.status === 'online' ? '在线' : '离线'}</span>
+      <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--ink-3);">${device.presence_status === 'ready' ? 'Ready' : (device.presence_status || device.status) === 'online' ? '在线' : '离线'}</span>
     </div>`).join('') : '';
     const helperLayer = localHelperStatus.available
       ? `<div style="padding:5px 0 10px;">
@@ -4089,6 +4142,7 @@ async function loadRoster() {
   const data = await apiJson('/group/roster');
   if (!data?.ok) return;
   roster = data.roster || roster;
+  if (data.presence) presenceSnapshot = data.presence;
   refreshTerminalSessions();
   members = {};
   for (const m of (data.members || [])) members[m.id] = m;
@@ -4510,6 +4564,7 @@ async function sendCurrentMessage() {
   if (!text && !images.length && !files.length) return;
 
   ta.value = '';
+  if (state.view === 'group') _sendTyping(false, null);
   pendingFiles = [];
   renderComposerPending();
   updateSendBtn();
@@ -5021,8 +5076,9 @@ function renderGroupChatHeader() {
   const channelMembers = group.memberships || [];
   const humans = channelMembers.filter(m => m.member_type === 'human').length;
   const agents = channelMembers.filter(m => m.member_type === 'agent').length;
+  const online = (presenceSnapshot.humans || []).filter(item => item.status === 'online').length;
   membersEl.textContent = group.scope === 'shared'
-    ? `${humans} Humans · ${agents} Agents · Shared channel`
+    ? `${humans} Humans · ${agents} Agents · ${online} online`
     : 'Private workspace';
   if (titleEl) titleEl.textContent = `${group.scope === 'shared' ? '# ' : ''}${group.name || '创意讨论群'}`;
 }
@@ -5092,12 +5148,14 @@ function renderMembersPanel() {
     const actor = membership.actor || {};
     const id = membership.member_id;
     const label = actor.display_name || displayName(id);
-    const status = agent ? (agentStatus[id]?.is_typing ? 'Working' : ['online','active','working','busy'].includes(String(agentStatus[id]?.state || '').toLowerCase()) ? 'Idle' : 'Offline') : 'Human';
+    const humanPresence = (presenceSnapshot.humans || []).find(item => item.actor_id === id);
+    const rawStatus = agent ? _presenceForAgent(id) : (humanPresence ? 'online' : 'offline');
+    const status = rawStatus.charAt(0).toUpperCase() + rawStatus.slice(1);
     return `<div class="studio-member-row">
       <span class="studio-avatar">${agent ? _actorAvatarHtml(id, 'ws-msg-avatar-text') : esc(label.slice(0,1))}</span>
       <span class="studio-member-copy"><strong>${esc(label)}</strong><small>${esc(status)}</small></span>
       ${agent ? '<span class="studio-agent-badge">Agent</span>' : membership.role !== 'member' ? `<span class="studio-role-badge">${esc(membership.role)}</span>` : ''}
-      ${agent ? `<span class="studio-status-dot ${status === 'Working' ? 'working' : status === 'Idle' ? 'idle' : ''}"></span>` : ''}
+      <span class="studio-status-dot ${['Working','Streaming','Queued','Online'].includes(status) ? 'working' : status === 'Idle' ? 'idle' : ''}"></span>
     </div>`;
   };
   content.innerHTML = `<section class="studio-member-section"><div class="studio-member-section-title">PEOPLE · ${people.length}</div>${people.map(m => row(m,false)).join('') || '<div class="studio-member-row">暂无 Human</div>'}</section>
@@ -5149,6 +5207,7 @@ function renderThreadPanel() {
     <div class="studio-thread-root"><small>原始消息 · ${esc(rootAuthor)}</small><div>${mdRender(root.text || '')}</div></div>
     <div class="studio-thread-messages" id="threadMessages">${messages.length ? messages.map(renderGroupMsg).join('') : '<div class="studio-thread-empty">还没有回复</div>'}</div>
     <div class="studio-thread-composer">
+      <small class="studio-typing-label">${esc(_typingLabel(activeThread.id))}</small>
       <textarea id="threadComposerInput" placeholder="回复到讨论串…"></textarea>
       <div><span>Enter 发送 · Shift+Enter 换行</span><button class="ws-send-btn${running ? ' is-stop' : ''}" id="threadSendButton" data-mode="${running ? 'stop' : 'send'}">${running ? '■ 停止' : '发送'}</button></div>
     </div>
@@ -5163,6 +5222,7 @@ async function sendThreadMessage() {
   const text = input?.value.trim() || '';
   if (!text) return;
   input.value = '';
+  _sendTyping(false, activeThread.id);
   const result = await apiJson(`/api/threads/${encodeURIComponent(activeThread.id)}/messages`, {
     method: 'POST', body: JSON.stringify({ text, mentions: parseMentions(text) }),
   });
@@ -9027,6 +9087,9 @@ document.getElementById('membersPanelContent').addEventListener('keydown', event
     else sendThreadMessage();
   }
 });
+document.getElementById('membersPanelContent').addEventListener('input', event => {
+  if (event.target.id === 'threadComposerInput') _scheduleTyping(activeThread?.id || null);
+});
 // App-settings panel delegation (theme seg / open-identity / shortcuts)
 document.getElementById('appSettingsMask').addEventListener('click', e => {
   const btn = e.target.closest('[data-action]');
@@ -9804,6 +9867,7 @@ document.getElementById('composerInput').addEventListener('input', e => {
   updateSendBtn();
   autoresizeTextarea(e.target);
   updateMentionMenu();
+  _scheduleTyping(null);
 });
 document.getElementById('composerInput').addEventListener('keyup', e => {
   // Caret-only moves (arrow keys, mouse positioning) need the menu state to refresh

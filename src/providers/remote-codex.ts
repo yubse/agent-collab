@@ -39,7 +39,12 @@ export class RemoteCodexProvider implements AgentProvider {
         conversation_id: this.context.conversationId,
         agent_id: this.context.agentId,
         prompt: text,
-      }, { onRequest: (requestId) => { this.activeRequestId = requestId }, onDelta: (delta) => {
+      }, { onRequest: (requestId) => {
+        this.activeRequestId = requestId
+        void this.eventCb?.({ type: 'system_init', raw: { stage: 'request', request_id: requestId } })
+      }, onAck: (ack) => {
+        void this.eventCb?.({ type: 'system_init', raw: { stage: 'ack', request_id: ack.request_id } })
+      }, onDelta: (delta) => {
         if (!sawFirstDelta) sawFirstDelta = true
         void this.eventCb?.({ type: 'delta', text: delta.delta, raw: delta })
       } })
