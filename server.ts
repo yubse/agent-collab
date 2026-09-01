@@ -738,9 +738,10 @@ function setRoutePresence(route: AgentTurnRoute, agentId: string, status: AgentP
 // Otherwise a 7s typing indicator or 5s Agent error can remain visible for up
 // to one heartbeat interval. This timer owns no business state and naturally
 // starts empty after a Server restart.
-setInterval(() => {
+const presenceSweepTimer = setInterval(() => {
   for (const update of presenceStore.sweep()) publishPresenceUpdate(update)
 }, 1_000)
+presenceSweepTimer.unref?.()
 
 function readBrowserExecutionEvents(userId: string, conversationId: string, since: number | null, threadId: string | null = null) {
   const key = executionStreamKey(userId, conversationId)
