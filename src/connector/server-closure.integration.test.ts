@@ -3,10 +3,12 @@ import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import path from 'path'
 import type { Subprocess } from 'bun'
+import { Database } from 'bun:sqlite'
 
 const port = 43_000 + Math.floor(Math.random() * 1_000)
 const baseUrl = `http://127.0.0.1:${port}`
 const tempRoot = mkdtempSync(path.join(tmpdir(), 'ai-studio-closure-'))
+const databasePath = path.join(tempRoot, 'data', 'chat.db')
 const adminPassword = 'closure-admin-password'
 let server: Subprocess<'ignore', 'pipe', 'pipe'>
 let adminCookie = ''
@@ -23,7 +25,7 @@ function spawnServer(): Subprocess<'ignore', 'pipe', 'pipe'> {
       AICOLLAB_PORT: String(port),
       AICOLLAB_HOST: '127.0.0.1',
       AICOLLAB_DATA_DIR: path.join(tempRoot, 'runtime-data'),
-      AICOLLAB_DATABASE_PATH: path.join(tempRoot, 'data', 'chat.db'),
+      AICOLLAB_DATABASE_PATH: databasePath,
       AICOLLAB_BOOTSTRAP_ADMIN_PASSWORD: adminPassword,
       PRODUCT_PROVIDER: 'remote-codex', CREATIVE_PROVIDER: 'remote-codex',
       BRAND_PROVIDER: 'remote-codex', CONTENT_PROVIDER: 'remote-codex', MARKET_PROVIDER: 'remote-codex',
@@ -470,6 +472,86 @@ describe('Server → Connector → Conversation closure', () => {
     userACookie = await login('closure_a', 'closure-password-a')
     userBCookie = await login('closure_b', 'closure-password-b')
     expect((await json(await api(`/api/conversations/${encodeURIComponent(convA)}/messages`, userACookie))).messages.some((item: any) => item.text === 'CONNECTOR_OK_A')).toBe(true)
+  }, 15_000)
+
+  test('M1 secures audio assets, shared membership and one-time Helper downloads', async () => {
+    const created = await json(await api('/api/channels', userACookie, {
+      method: 'POST', body: JSON.stringify({
+        name: 'M1 Meeting Assets', human_member_ids: [userB.id], agent_member_ids: [],
+      }),
+    }))
+    const channelId = created.channel.id
+    const mp3 = new Uint8Array([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4])
+    const uploaded = await json(await api('/upload?name=meeting.mp3', userBCookie, { method: 'POST', body: mp3 }))
+    expect(uploaded).toMatchObject({ asset_type: 'audio', mime_type: 'audio/mpeg', size: mp3.byteLength })
+    expect(uploaded.checksum).toBe(await crypto.subtle.digest('SHA-256', mp3).then((value) => Buffer.from(value).toString('hex')))
+
+    const forged = await api('/group/send', userACookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: 'forged asset', files: [uploaded.filename] }),
+    })
+    expect(forged.status).toBe(400)
+
+    const attached = await json(await api('/group/send', userBCookie, {
+      method: 'POST', body: JSON.stringify({ conversation_id: channelId, text: 'meeting audio', files: [uploaded.filename] }),
+    }))
+    const recording = (await json(await api('/api/meetings/recordings', userBCookie, {
+      method: 'POST', body: JSON.stringify({
+        asset_filename: uploaded.filename, channel_id: channelId, source_message_id: attached.record.id,
+        title: 'M1 meeting', participants: ['User A', 'User B'], language: 'zh',
+        owner_user_id: userA.id,
+      }),
+    }))).recording
+    expect(recording).toMatchObject({ owner_user_id: userB.id, channel_id: channelId, status: 'uploaded' })
+    expect((await api(`/api/meetings/recordings/${recording.id}`, userACookie)).status).toBe(200)
+    expect((await api(`/images/${uploaded.filename}`, userACookie)).status).toBe(200)
+    expect((await api(`/images/${uploaded.filename}`, adminCookie)).status).toBe(404)
+
+    const connectorB1 = await pairConnector(userBCookie, 'M1 Helper B1', 'unused')
+    const connectorB2 = await pairConnector(userBCookie, 'M1 Helper B2', 'unused')
+    const connectorA = await pairConnector(userACookie, 'M1 Helper A', 'unused')
+    const grant = await json(await api(`/api/meetings/recordings/${recording.id}/download-grant`, userBCookie, {
+      method: 'POST', body: '{}',
+    }))
+    expect(grant.device_id).toBe('dev_m1-helper-b2')
+    const grantDb = new Database(databasePath)
+    const storedGrant = grantDb.prepare(`SELECT token_hash FROM helper_download_grants WHERE recording_id=?`).get(recording.id) as any
+    grantDb.close()
+    expect(storedGrant.token_hash).not.toBe(grant.download_token)
+    expect(storedGrant.token_hash).toHaveLength(64)
+    const downloadHeaders = (deviceToken: string) => ({
+      authorization: `Bearer ${grant.download_token}`,
+      'x-ai-studio-device-token': deviceToken,
+    })
+    expect((await fetch(`${baseUrl}${grant.download_url}`, { headers: downloadHeaders(connectorA.token) })).status).toBe(404)
+    expect((await fetch(`${baseUrl}${grant.download_url}`, { headers: downloadHeaders(connectorB1.token) })).status).toBe(404)
+    const downloaded = await fetch(`${baseUrl}${grant.download_url}`, { headers: downloadHeaders(connectorB2.token) })
+    expect(downloaded.status).toBe(200)
+    expect(downloaded.headers.get('content-length')).toBe(String(mp3.byteLength))
+    expect(downloaded.headers.get('content-type')).toBe('audio/mpeg')
+    expect(new Uint8Array(await downloaded.arrayBuffer())).toEqual(mp3)
+    expect((await fetch(`${baseUrl}${grant.download_url}`, { headers: downloadHeaders(connectorB2.token) })).status).toBe(404)
+
+    const expired = await json(await api(`/api/meetings/recordings/${recording.id}/download-grant`, userBCookie, {
+      method: 'POST', body: '{}',
+    }))
+    const inspectDb = new Database(databasePath)
+    inspectDb.run(`UPDATE helper_download_grants SET expires_at=? WHERE token_hash=?`, [
+      new Date(Date.now() - 1_000).toISOString(),
+      await crypto.subtle.digest('SHA-256', new TextEncoder().encode(expired.download_token)).then((value) => Buffer.from(value).toString('hex')),
+    ])
+    inspectDb.close()
+    expect((await fetch(`${baseUrl}${expired.download_url}`, { headers: {
+      authorization: `Bearer ${expired.download_token}`,
+      'x-ai-studio-device-token': connectorB2.token,
+    } })).status).toBe(404)
+
+    expect((await api(`/api/channels/${channelId}/members/human/${userB.id}`, userACookie, { method: 'DELETE' })).status).toBe(200)
+    expect((await api(`/api/meetings/recordings/${recording.id}`, userBCookie)).status).toBe(404)
+    expect((await api(`/images/${uploaded.filename}`, userBCookie)).status).toBe(404)
+
+    await connectorA.close()
+    await connectorB1.close()
+    await connectorB2.close()
   }, 15_000)
 
   test('returns CODEX_CONNECTOR_OFFLINE immediately without local fallback', async () => {

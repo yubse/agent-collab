@@ -3,7 +3,7 @@
 import { createServer } from 'http'
 import { Database } from 'bun:sqlite'
 import path from 'path'
-import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync, statSync, renameSync } from 'fs'
+import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync, statSync, renameSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
 import { randomBytes } from 'crypto'
 import { jsonOk, jsonError, readJsonBody } from './src/responses.ts'
@@ -53,6 +53,11 @@ import { hasRequestAuth, isLocalRequestHost, requestAuthMode } from './src/auth.
 // AIC-65: handleTodosRoutes import removed — iOS todo 跟 task 撞定位，整个 todo 模块退役
 import { dangerousEndpointFor, hasRemoteControlConfirm, logDangerousOperation } from './src/security.ts'
 import { runMigrations, LEGACY_ADMIN_ID } from './src/db/migrations.ts'
+import {
+  cleanupStaleUploadTemps,
+  DEFAULT_UPLOAD_MAX_BYTES,
+  streamUploadToDisk,
+} from './src/assets/storage.ts'
 import { UserRepository } from './src/data/user-repository.ts'
 import {
   activeChannelMembership,
@@ -92,6 +97,7 @@ import {
   revokeSession,
   selectableProfileById,
   sessionCookie,
+  hashSecret,
   type AuthenticatedUser,
 } from './src/auth/user-auth.ts'
 
@@ -131,6 +137,8 @@ migrateLegacySqlite(legacyChatDbPath(import.meta.dir), chatDbPath(import.meta.di
 const LEGACY_IMG_DIR = legacyImageDir(import.meta.dir)
 const UPLOADS_DIR = RUNTIME_UPLOADS_DIR
 mkdirSync(LEGACY_IMG_DIR, { recursive: true })
+const UPLOAD_MAX_BYTES = Math.max(1, Number(process.env.AICOLLAB_UPLOAD_MAX_BYTES || DEFAULT_UPLOAD_MAX_BYTES))
+cleanupStaleUploadTemps(UPLOADS_DIR)
 
 function resolveStoredMediaPath(filename: string) {
   const candidates = [
@@ -481,6 +489,21 @@ db.run(`CREATE TABLE IF NOT EXISTS actor_theme_styles (
 // Versioned, idempotent multi-user migration. It runs only after every legacy
 // table exists so old databases can be upgraded in-place without data loss.
 runMigrations(db)
+// Final upload files that were never attached or registered as a meeting are
+// abandoned staging artifacts. Keep a full day for interrupted Browser flows,
+// then remove only rows with no normalized references.
+const orphanAssetCutoff = new Date(Date.now() - 24 * 60 * 60_000).toISOString()
+const orphanAssets = db.prepare(`SELECT a.filename FROM uploaded_assets a
+  WHERE a.created_at<?
+    AND NOT EXISTS (SELECT 1 FROM message_assets ma WHERE ma.asset_filename=a.filename)
+    AND NOT EXISTS (SELECT 1 FROM meeting_recordings mr WHERE mr.asset_filename=a.filename)`).all(orphanAssetCutoff) as any[]
+for (const asset of orphanAssets) {
+  const assetPath = resolveStoredMediaPath(String(asset.filename))
+  try {
+    if (existsSync(assetPath)) unlinkSync(assetPath)
+    db.run(`DELETE FROM uploaded_assets WHERE filename=?`, [asset.filename])
+  } catch {}
+}
 await ensureDefaultProfiles(db)
 const userRepo = new UserRepository(db)
 const connectorRegistry = new ConnectorRegistry()
@@ -2415,6 +2438,46 @@ function setGroupAgentAutoReply(agentId: string, enabled: boolean) {
   )
 }
 
+function attachmentFilenames(images: unknown[], files: unknown[]): string[] {
+  return [...new Set([
+    ...images.filter((item): item is string => typeof item === 'string'),
+    ...files.map((item: any) => typeof item === 'string' ? item : item?.server).filter((item): item is string => typeof item === 'string'),
+  ].map((item) => item.trim()).filter(Boolean))]
+}
+
+function userCanReadAsset(filename: string, userId: string): boolean {
+  const asset = db.prepare(`SELECT user_id FROM uploaded_assets WHERE filename=?`).get(filename) as any
+  if (!asset) return false
+  const relations = db.prepare(`SELECT ma.channel_id, gm.user_id AS message_owner
+    FROM message_assets ma JOIN group_messages gm ON gm.id=ma.message_id
+    WHERE ma.asset_filename=?`).all(filename) as any[]
+  if (relations.length === 0) return asset.user_id === userId
+  return relations.some((relation) => {
+    const channel = db.prepare(`SELECT id FROM group_conversations WHERE id=?`).get(relation.channel_id)
+    return channel ? canReadChannel(db, relation.channel_id, userId) : relation.message_owner === userId
+  })
+}
+
+function assertAssetsMayBeAttached(filenames: string[], conversationId: string, userId: string): void {
+  for (const filename of filenames) {
+    const asset = db.prepare(`SELECT user_id FROM uploaded_assets WHERE filename=?`).get(filename) as any
+    if (!asset) throw new Error('ATTACHMENT_NOT_FOUND')
+    if (asset.user_id === userId) continue
+    const alreadyInChannel = db.prepare(`SELECT 1 FROM message_assets
+      WHERE asset_filename=? AND channel_id=? LIMIT 1`).get(filename, conversationId)
+    if (alreadyInChannel && canReadChannel(db, conversationId, userId)) continue
+    throw new Error('ATTACHMENT_FORBIDDEN')
+  }
+}
+
+function linkMessageAssets(record: GroupRecord): void {
+  const filenames = attachmentFilenames(record.images, record.files)
+  const insert = db.prepare(`INSERT OR IGNORE INTO message_assets
+    (message_id, asset_filename, channel_id, added_by_user_id, created_at)
+    VALUES (?, ?, ?, ?, ?)`)
+  for (const filename of filenames) insert.run(record.id, filename, record.conversation_id, record.user_id, record.ts)
+}
+
 function appendGroupRecord(input: any, mentions: string[], delivery: any, userId: string) {
   const senderId = String(input.sender_id || 'admin').trim()
   const member = GROUP_ROSTER_BY_ID.get(senderId) || (senderId === 'system'
@@ -2425,6 +2488,8 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
   const images: string[] = Array.isArray(input.images) ? input.images.filter((x: any) => typeof x === 'string') : []
   const files: any[] = Array.isArray(input.files) ? input.files : []
   if (!text && images.length === 0 && files.length === 0) throw new Error('text or attachment required')
+  const conversationId = String(input.conversation_id || 'workgroup')
+  assertAssetsMayBeAttached(attachmentFilenames(images, files), conversationId, userId)
   let messageType = String(input.message_type || 'chat').trim().toLowerCase()
   if (!GROUP_MESSAGE_TYPES.has(messageType)) throw new Error(`bad message_type: ${messageType}`)
   let taskId = String(input.task_id || '').trim() || null
@@ -2437,7 +2502,7 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
     id: String(input.id || '').trim() || groupId('grp'),
     user_id: userId,
     ts,
-    conversation_id: String(input.conversation_id || 'workgroup'),
+    conversation_id: conversationId,
     sender_id: senderId,
     sender_model: input.model || member.model || null,
     sender_actor_type: actor?.type || null,
@@ -2502,6 +2567,7 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
       record.user_id,
     ],
   )
+  linkMessageAssets(record)
   publishBrowserExecutionEvent(userId, record.conversation_id, {
     type: 'message_created',
     message_id: record.id,
@@ -3412,6 +3478,48 @@ function connectorClaimRequestId(req: Request): string {
   return provided === 'unknown' ? `claim_${randomBytes(8).toString('hex')}` : provided
 }
 
+const HELPER_DOWNLOAD_GRANT_TTL_MS = 5 * 60_000
+
+function meetingRecordingForUser(recordingId: string, userId: string): any | null {
+  const recording = db.prepare(`SELECT r.*, a.original_name, a.byte_size, a.checksum, a.asset_type
+    FROM meeting_recordings r JOIN uploaded_assets a ON a.filename=r.asset_filename
+    WHERE r.id=?`).get(recordingId) as any
+  if (!recording) return null
+  if (recording.channel_id) return canReadChannel(db, recording.channel_id, userId) ? recording : null
+  return recording.owner_user_id === userId ? recording : null
+}
+
+function meetingRecordingPayload(recording: any) {
+  let participants: unknown[] = []
+  try { participants = JSON.parse(recording.participants_json || '[]') } catch {}
+  return {
+    id: recording.id,
+    asset_filename: recording.asset_filename,
+    owner_user_id: recording.owner_user_id,
+    channel_id: recording.channel_id,
+    source_message_id: recording.source_message_id,
+    title: recording.title,
+    meeting_at: recording.meeting_at,
+    participants,
+    language: recording.language,
+    duration_ms: recording.duration_ms,
+    mime_type: recording.mime_type,
+    byte_size: recording.byte_size,
+    checksum: recording.checksum,
+    original_name: recording.original_name,
+    status: recording.status,
+    error_code: recording.error_code,
+    created_at: recording.created_at,
+    updated_at: recording.updated_at,
+  }
+}
+
+function helperGrantToken(req: Request): string {
+  const authorization = req.headers.get('authorization') || ''
+  const bearer = authorization.match(/^Bearer\s+([A-Za-z0-9_-]{22,200})$/i)?.[1]
+  return bearer || ''
+}
+
 // Image HTTP server for upload/download
 Bun.serve<ConnectorSocketData>({
   port: IMG_PORT,
@@ -3451,6 +3559,7 @@ Bun.serve<ConnectorSocketData>({
       || (req.method === 'GET' && url.pathname === '/api/auth/profiles')
       || (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login' || url.pathname === '/api/auth/bootstrap' || url.pathname === '/api/auth/select-profile' || url.pathname === '/api/auth/logout'))
       || (req.method === 'POST' && (url.pathname === '/api/connectors/pairing/complete' || url.pathname === '/api/connectors/claim/complete'))
+      || (req.method === 'GET' && /^\/api\/helper\/assets\/[^/]+\/download$/.test(url.pathname))
       || (req.method === 'POST' && url.pathname === '/api/agent-statusline' && isLocalRequestHost(url.hostname))
 
     // One-time bootstrap. The existing operator token authorizes setting the
@@ -3571,30 +3680,198 @@ Bun.serve<ConnectorSocketData>({
     }
 
     if (req.method === 'POST' && url.pathname === '/upload') {
-      const origName = url.searchParams.get('name') || 'image.jpg'
-      const ext = origName.split('.').pop() || 'jpg'
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
-      const data = await req.arrayBuffer()
-      await Bun.write(path.join(UPLOADS_DIR, filename), data)
-      db.run(`INSERT INTO uploaded_assets (filename, user_id, original_name, byte_size, created_at) VALUES (?, ?, ?, ?, ?)`, [
-        filename, currentUser!.id, origName, data.byteLength, groupNowIso(),
-      ])
-      return Response.json({ filename, original: origName, size: data.byteLength })
+      try {
+        const contentLengthRaw = req.headers.get('content-length')
+        const contentLength = contentLengthRaw ? Number(contentLengthRaw) : null
+        const upload = await streamUploadToDisk({
+          uploadsDir: UPLOADS_DIR,
+          originalName: url.searchParams.get('name') || 'attachment',
+          body: req.body,
+          contentLength: Number.isFinite(contentLength) ? contentLength : null,
+          maxBytes: UPLOAD_MAX_BYTES,
+          signal: req.signal,
+        })
+        try {
+          db.run(`INSERT INTO uploaded_assets
+            (filename, user_id, original_name, byte_size, mime_type, checksum, asset_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [
+            upload.filename, currentUser!.id, upload.originalName, upload.byteSize,
+            upload.mimeType, upload.checksum, upload.assetType, groupNowIso(),
+          ])
+        } catch (error) {
+          try { unlinkSync(upload.path) } catch {}
+          throw error
+        }
+        return Response.json({
+          ok: true, filename: upload.filename, original: upload.originalName, size: upload.byteSize,
+          mime_type: upload.mimeType, checksum: upload.checksum, asset_type: upload.assetType,
+        }, { status: 201 })
+      } catch (error: any) {
+        const code = String(error?.message || 'UPLOAD_FAILED')
+        const status = code === 'UPLOAD_TOO_LARGE' ? 413 : code === 'UPLOAD_AUDIO_SIGNATURE_INVALID' ? 415 : 400
+        return Response.json({ ok: false, error: code }, { status })
+      }
     }
 
     if (req.method === 'GET' && url.pathname.startsWith('/images/')) {
       const filename = decodeURIComponent(url.pathname.slice(8))
-      const owner = db.prepare(`SELECT user_id FROM uploaded_assets WHERE filename=?`).get(filename) as any
-      const candidates = db.prepare(`SELECT DISTINCT conversation_id FROM group_messages
-        WHERE images LIKE ? OR files LIKE ?`).all(`%"${filename}"%`, `%"${filename}"%`) as any[]
-      const attachedAccess = candidates.some((row) => canReadChannel(db, String(row.conversation_id), currentUser!.id))
-      if (candidates.length > 0 && !attachedAccess) return new Response('not found', { status: 404 })
-      if (owner && owner.user_id !== currentUser!.id && !attachedAccess) return new Response('not found', { status: 404 })
-      if (!owner && currentUser!.id !== LEGACY_ADMIN_ID) return new Response('not found', { status: 404 })
+      const asset = db.prepare(`SELECT user_id, mime_type, byte_size FROM uploaded_assets WHERE filename=?`).get(filename) as any
+      if (!asset || !userCanReadAsset(filename, currentUser!.id)) return new Response('not found', { status: 404 })
       const filePath = resolveStoredMediaPath(filename)
       const file = Bun.file(filePath)
-      if (await file.exists()) return new Response(file)
+      if (await file.exists()) return new Response(file, { headers: {
+        'Content-Type': asset.mime_type || 'application/octet-stream',
+        'Content-Length': String(asset.byte_size),
+        'X-Content-Type-Options': 'nosniff',
+      } })
       return new Response('not found', { status: 404 })
+    }
+
+    const helperAssetDownloadMatch = url.pathname.match(/^\/api\/helper\/assets\/([^/]+)\/download$/)
+    if (req.method === 'GET' && helperAssetDownloadMatch) {
+      const recordingId = decodeURIComponent(helperAssetDownloadMatch[1])
+      const token = helperGrantToken(req)
+      const deviceCredential = req.headers.get('x-ai-studio-device-token') || ''
+      const device = deviceCredential ? authenticateDevice(db, deviceCredential) : null
+      if (!token || !device) return new Response('not found', { status: 404 })
+      const now = groupNowIso()
+      const grant = db.prepare(`SELECT id, recording_id, asset_filename, user_id, device_id
+        FROM helper_download_grants
+        WHERE token_hash=? AND recording_id=? AND used_at IS NULL AND expires_at>?`)
+        .get(hashSecret(token), recordingId, now) as any
+      if (!grant || grant.user_id !== device.user_id || grant.device_id !== device.id) {
+        return new Response('not found', { status: 404 })
+      }
+      const recording = meetingRecordingForUser(recordingId, device.user_id)
+      if (!recording || recording.asset_filename !== grant.asset_filename) return new Response('not found', { status: 404 })
+      const consumed = db.prepare(`UPDATE helper_download_grants SET used_at=?
+        WHERE id=? AND used_at IS NULL AND expires_at>?`).run(now, grant.id, now)
+      if (consumed.changes !== 1) return new Response('not found', { status: 404 })
+      const filePath = resolveStoredMediaPath(recording.asset_filename)
+      const file = Bun.file(filePath)
+      if (!(await file.exists())) return new Response('not found', { status: 404 })
+      console.error(`[helper-download] recording=${safeConnectorTraceId(recordingId)} user=${safeConnectorTraceId(device.user_id)} device=${safeConnectorTraceId(device.id)} byte_size=${recording.byte_size} status=started`)
+      return new Response(file, { headers: {
+        'Content-Type': recording.mime_type,
+        'Content-Length': String(recording.byte_size),
+        'Content-Disposition': `attachment; filename="${recording.asset_filename}"`,
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      } })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/meetings/recordings' && currentUser) {
+      try {
+        const body = await readOptionalJsonObject(req)
+        const filename = String(body.asset_filename || '').trim()
+        const asset = db.prepare(`SELECT * FROM uploaded_assets WHERE filename=?`).get(filename) as any
+        if (!asset || !['audio', 'meeting_recording'].includes(asset.asset_type)) {
+          return Response.json({ ok: false, error: 'audio asset not found' }, { status: 404 })
+        }
+        const channelId = String(body.channel_id || '').trim() || null
+        if (channelId && (!canReadChannel(db, channelId, currentUser!.id) || !canPostChannel(db, channelId, currentUser!.id))) {
+          return Response.json({ ok: false, error: 'channel not found' }, { status: 404 })
+        }
+        if (asset.user_id !== currentUser!.id) {
+          const sharedAsset = channelId && db.prepare(`SELECT 1 FROM message_assets
+            WHERE asset_filename=? AND channel_id=? LIMIT 1`).get(filename, channelId)
+          if (!sharedAsset) return Response.json({ ok: false, error: 'audio asset not found' }, { status: 404 })
+        }
+        const sourceMessageId = String(body.source_message_id || '').trim() || null
+        if (sourceMessageId) {
+          const source = channelId
+            ? db.prepare(`SELECT 1 FROM message_assets WHERE message_id=? AND asset_filename=? AND channel_id=?`)
+              .get(sourceMessageId, filename, channelId)
+            : db.prepare(`SELECT 1 FROM message_assets ma JOIN group_messages gm ON gm.id=ma.message_id
+                WHERE ma.message_id=? AND ma.asset_filename=? AND gm.user_id=?`)
+              .get(sourceMessageId, filename, currentUser!.id)
+          if (!source) return Response.json({ ok: false, error: 'source message not found' }, { status: 404 })
+        }
+        const participants = Array.isArray(body.participants)
+          ? body.participants.map((item: any) => String(item).trim().slice(0, 100)).filter(Boolean).slice(0, 100)
+          : []
+        const now = groupNowIso()
+        const id = `meeting_${randomBytes(16).toString('hex')}`
+        db.run('BEGIN IMMEDIATE')
+        try {
+          db.run(`INSERT INTO meeting_recordings
+            (id, asset_filename, owner_user_id, channel_id, source_message_id, title, meeting_at,
+             participants_json, language, duration_ms, mime_type, status, error_code, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'uploaded', NULL, ?, ?)`, [
+            id, filename, currentUser!.id, channelId, sourceMessageId,
+            String(body.title || '').trim().slice(0, 200) || null,
+            String(body.meeting_at || '').trim() || null,
+            JSON.stringify(participants), String(body.language || 'zh').trim().slice(0, 20) || 'zh',
+            asset.mime_type, now, now,
+          ])
+          db.run(`UPDATE uploaded_assets SET asset_type='meeting_recording' WHERE filename=?`, [filename])
+          db.run('COMMIT')
+        } catch (error) {
+          try { db.run('ROLLBACK') } catch {}
+          throw error
+        }
+        const recording = meetingRecordingForUser(id, currentUser!.id)
+        return Response.json({ ok: true, recording: meetingRecordingPayload(recording) }, { status: 201 })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'unable to create recording' }, { status: 400 })
+      }
+    }
+
+    const meetingRecordingMatch = url.pathname.match(/^\/api\/meetings\/recordings\/([^/]+)$/)
+    if (req.method === 'GET' && meetingRecordingMatch && currentUser) {
+      const recording = meetingRecordingForUser(decodeURIComponent(meetingRecordingMatch[1]), currentUser!.id)
+      return recording
+        ? Response.json({ ok: true, recording: meetingRecordingPayload(recording) })
+        : Response.json({ ok: false, error: 'recording not found' }, { status: 404 })
+    }
+
+    if (req.method === 'DELETE' && meetingRecordingMatch && currentUser) {
+      const recordingId = decodeURIComponent(meetingRecordingMatch[1])
+      const recording = db.prepare(`SELECT * FROM meeting_recordings WHERE id=?`).get(recordingId) as any
+      if (!recording || recording.owner_user_id !== currentUser!.id) {
+        return Response.json({ ok: false, error: 'recording not found' }, { status: 404 })
+      }
+      db.run(`DELETE FROM meeting_recordings WHERE id=? AND owner_user_id=?`, [recordingId, currentUser!.id])
+      const messageRefs = Number((db.prepare(`SELECT COUNT(*) AS n FROM message_assets WHERE asset_filename=?`).get(recording.asset_filename) as any)?.n || 0)
+      const recordingRefs = Number((db.prepare(`SELECT COUNT(*) AS n FROM meeting_recordings WHERE asset_filename=?`).get(recording.asset_filename) as any)?.n || 0)
+      let assetDeleted = false
+      if (messageRefs === 0 && recordingRefs === 0) {
+        const assetPath = resolveStoredMediaPath(recording.asset_filename)
+        try {
+          if (existsSync(assetPath)) unlinkSync(assetPath)
+          db.run(`DELETE FROM uploaded_assets WHERE filename=?`, [recording.asset_filename])
+          assetDeleted = true
+        } catch {}
+      }
+      return Response.json({ ok: true, deleted: true, asset_deleted: assetDeleted })
+    }
+
+    const meetingGrantMatch = url.pathname.match(/^\/api\/meetings\/recordings\/([^/]+)\/download-grant$/)
+    if (req.method === 'POST' && meetingGrantMatch && currentUser) {
+      const recordingId = decodeURIComponent(meetingGrantMatch[1])
+      const recording = meetingRecordingForUser(recordingId, currentUser!.id)
+      if (!recording) return Response.json({ ok: false, error: 'recording not found' }, { status: 404 })
+      const connection = connectorRegistry.forUser(currentUser!.id)
+      if (!connection) return Response.json({ ok: false, error: 'CODEX_CONNECTOR_OFFLINE' }, { status: 409 })
+      const now = new Date()
+      const expiresAt = new Date(now.getTime() + HELPER_DOWNLOAD_GRANT_TTL_MS).toISOString()
+      const token = randomBytes(32).toString('base64url')
+      db.run(`DELETE FROM helper_download_grants WHERE expires_at<=? OR used_at IS NOT NULL`, [now.toISOString()])
+      db.run(`INSERT INTO helper_download_grants
+        (id, token_hash, recording_id, asset_filename, user_id, device_id, expires_at, used_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`, [
+        `grant_${randomBytes(16).toString('hex')}`, hashSecret(token), recordingId,
+        recording.asset_filename, currentUser!.id, connection.deviceId, expiresAt, now.toISOString(),
+      ])
+      console.error(`[helper-download] recording=${safeConnectorTraceId(recordingId)} user=${safeConnectorTraceId(currentUser!.id)} device=${safeConnectorTraceId(connection.deviceId)} byte_size=${recording.byte_size} status=grant_created`)
+      return Response.json({
+        ok: true,
+        recording_id: recordingId,
+        device_id: connection.deviceId,
+        download_url: `/api/helper/assets/${encodeURIComponent(recordingId)}/download`,
+        download_token: token,
+        expires_at: expiresAt,
+      }, { status: 201 })
     }
 
     if (req.method === 'GET' && url.pathname === '/api/auth/me' && currentUser) {

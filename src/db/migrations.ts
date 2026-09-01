@@ -264,6 +264,100 @@ const MIGRATIONS: Migration[] = [
         ON group_messages(thread_id, ts)`)
     },
   },
+  {
+    version: 8,
+    name: 'secure_assets_and_meeting_recordings',
+    up(db) {
+      addColumn(db, 'uploaded_assets', `mime_type TEXT NOT NULL DEFAULT 'application/octet-stream'`)
+      addColumn(db, 'uploaded_assets', `checksum TEXT NOT NULL DEFAULT ''`)
+      addColumn(db, 'uploaded_assets', `asset_type TEXT NOT NULL DEFAULT 'generic' CHECK (asset_type IN ('generic', 'audio', 'meeting_recording'))`)
+
+      db.run(`CREATE TABLE IF NOT EXISTS message_assets (
+        message_id TEXT NOT NULL,
+        asset_filename TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        added_by_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (message_id, asset_filename),
+        FOREIGN KEY (message_id) REFERENCES group_messages(id) ON DELETE CASCADE,
+        FOREIGN KEY (asset_filename) REFERENCES uploaded_assets(filename) ON DELETE CASCADE,
+        FOREIGN KEY (added_by_user_id) REFERENCES users(id) ON DELETE CASCADE
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_message_assets_channel_asset
+        ON message_assets(channel_id, asset_filename)`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_message_assets_asset
+        ON message_assets(asset_filename)`)
+
+      // Normalize all existing JSON attachment references for which an asset row exists.
+      const knownAssets = new Set((db.prepare(`SELECT filename FROM uploaded_assets`).all() as any[]).map((row) => String(row.filename)))
+      const messages = db.prepare(`SELECT id, conversation_id, user_id, sender_actor_type, sender_actor_id,
+        images, files, ts FROM group_messages`).all() as any[]
+      const insert = db.prepare(`INSERT OR IGNORE INTO message_assets
+        (message_id, asset_filename, channel_id, added_by_user_id, created_at)
+        VALUES (?, ?, ?, ?, ?)`)
+      for (const message of messages) {
+        let images: any[] = []
+        let files: any[] = []
+        try { images = JSON.parse(message.images || '[]') } catch {}
+        try { files = JSON.parse(message.files || '[]') } catch {}
+        const filenames = [
+          ...images.filter((item) => typeof item === 'string'),
+          ...files.map((item) => typeof item === 'string' ? item : item?.server).filter(Boolean),
+        ]
+        const addedBy = message.sender_actor_type === 'human' && message.sender_actor_id
+          ? String(message.sender_actor_id)
+          : String(message.user_id)
+        for (const filename of new Set(filenames.map(String))) {
+          if (!knownAssets.has(filename)) continue
+          insert.run(message.id, filename, message.conversation_id, addedBy, message.ts || new Date().toISOString())
+        }
+      }
+
+      db.run(`CREATE TABLE IF NOT EXISTS meeting_recordings (
+        id TEXT PRIMARY KEY,
+        asset_filename TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        channel_id TEXT,
+        source_message_id TEXT,
+        title TEXT,
+        meeting_at TEXT,
+        participants_json TEXT NOT NULL DEFAULT '[]',
+        language TEXT NOT NULL DEFAULT 'zh',
+        duration_ms INTEGER,
+        mime_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'uploaded' CHECK (status IN ('uploaded', 'transcribing', 'summarizing', 'completed', 'failed', 'cancelled')),
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (asset_filename) REFERENCES uploaded_assets(filename) ON DELETE RESTRICT,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (channel_id) REFERENCES group_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (source_message_id) REFERENCES group_messages(id) ON DELETE SET NULL
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_meeting_recordings_owner_created
+        ON meeting_recordings(owner_user_id, created_at)`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_meeting_recordings_channel_created
+        ON meeting_recordings(channel_id, created_at)`)
+
+      db.run(`CREATE TABLE IF NOT EXISTS helper_download_grants (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        recording_id TEXT NOT NULL,
+        asset_filename TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (recording_id) REFERENCES meeting_recordings(id) ON DELETE CASCADE,
+        FOREIGN KEY (asset_filename) REFERENCES uploaded_assets(filename) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (device_id) REFERENCES connector_devices(id) ON DELETE CASCADE
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_helper_download_grants_expiry
+        ON helper_download_grants(expires_at, used_at)`)
+    },
+  },
 ]
 
 export function runMigrations(db: Database): void {
