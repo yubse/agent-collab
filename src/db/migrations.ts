@@ -358,6 +358,85 @@ const MIGRATIONS: Migration[] = [
         ON helper_download_grants(expires_at, used_at)`)
     },
   },
+  {
+    version: 9,
+    name: 'local_speech_transcriptions',
+    up(db) {
+      db.run(`CREATE TABLE IF NOT EXISTS transcriptions (
+        id TEXT PRIMARY KEY,
+        owner_user_id TEXT NOT NULL,
+        channel_id TEXT,
+        title TEXT,
+        original_name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        byte_size INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'uploading', 'processing', 'queued', 'transcoding', 'loading_model', 'transcribing', 'saving', 'completed', 'failed', 'cancelled')),
+        progress REAL NOT NULL DEFAULT 0,
+        uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+        execution_device_id TEXT,
+        error_code TEXT,
+        duration_ms INTEGER,
+        language TEXT,
+        provider TEXT,
+        runtime_version TEXT,
+        model_version TEXT,
+        processing_ms INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (channel_id) REFERENCES group_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (execution_device_id) REFERENCES connector_devices(id) ON DELETE SET NULL
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_transcriptions_owner_created
+        ON transcriptions(owner_user_id, created_at)`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_transcriptions_channel_created
+        ON transcriptions(channel_id, created_at)`)
+      db.run(`CREATE TABLE IF NOT EXISTS transcription_session_proofs (
+        id TEXT PRIMARY KEY,
+        proof_hash TEXT NOT NULL UNIQUE,
+        transcription_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (transcription_id) REFERENCES transcriptions(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (device_id) REFERENCES connector_devices(id) ON DELETE CASCADE
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_transcription_proofs_expiry
+        ON transcription_session_proofs(expires_at, used_at)`)
+    },
+  },
+  {
+    version: 10,
+    name: 'meeting_transcripts',
+    up(db) {
+      db.run(`CREATE TABLE IF NOT EXISTS meeting_transcripts (
+        id TEXT PRIMARY KEY,
+        transcription_id TEXT NOT NULL UNIQUE,
+        owner_user_id TEXT NOT NULL,
+        channel_id TEXT,
+        transcript TEXT NOT NULL,
+        chunks_json TEXT,
+        language TEXT,
+        duration_ms INTEGER NOT NULL,
+        provider TEXT NOT NULL,
+        runtime_version TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        processing_ms INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (transcription_id) REFERENCES transcriptions(id) ON DELETE CASCADE,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (channel_id) REFERENCES group_conversations(id) ON DELETE CASCADE
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_meeting_transcripts_owner_created
+        ON meeting_transcripts(owner_user_id, created_at)`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_meeting_transcripts_channel_created
+        ON meeting_transcripts(channel_id, created_at)`)
+    },
+  },
 ]
 
 export function runMigrations(db: Database): void {

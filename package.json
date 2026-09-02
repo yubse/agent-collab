@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun build server.ts --target=bun --outdir /tmp/agent-collab-server-check && bun build connector/src/index.ts --target=bun --outdir /tmp/agent-collab-connector-check",
     "connector": "bun connector/src/index.ts",
-    "doctor": "bun connector/src/doctor.ts"
+    "doctor": "bun connector/src/doctor.ts",
+    "speech": "bun connector/src/speech/index.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.4.0",

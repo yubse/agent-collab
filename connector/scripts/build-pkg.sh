@@ -41,7 +41,10 @@ if [ -z "$RUNTIME_LICENSE" ] || [ ! -f "$RUNTIME_LICENSE" ]; then
 fi
 
 "$SCRIPT_DIR/build-standalone.sh"
+"$SCRIPT_DIR/build-speech-service.sh"
+"$SCRIPT_DIR/install-sensevoice-runtime.sh"
 HELPER_BINARY="$REPO_DIR/connector/dist/aistudio-connector"
+SPEECH_BINARY="$REPO_DIR/connector/dist/aistudio-speech"
 STAGING=$(mktemp -d "${TMPDIR:-/tmp}/aistudio-helper-pkg.XXXXXX")
 trap 'rm -rf "$STAGING"' EXIT INT TERM
 ROOT="$STAGING/root"
@@ -50,6 +53,8 @@ INSTALL_ROOT="$ROOT/Library/Application Support/AIStudio"
 
 mkdir -p \
   "$INSTALL_ROOT/helper" \
+  "$INSTALL_ROOT/speech" \
+  "$INSTALL_ROOT/speech/runtime" \
   "$INSTALL_ROOT/bundled-runtime" \
   "$INSTALL_ROOT/config" \
   "$ROOT/Library/LaunchAgents" \
@@ -57,10 +62,17 @@ mkdir -p \
   "$OUTPUT_DIR"
 
 install -m 755 "$HELPER_BINARY" "$INSTALL_ROOT/helper/aistudio-helper"
+install -m 755 "$SPEECH_BINARY" "$INSTALL_ROOT/speech/aistudio-speech"
+install -m 755 "$REPO_DIR/connector/packaging/run-speech.sh" "$INSTALL_ROOT/speech/run-speech.sh"
+install -m 755 "$REPO_DIR/connector/dist/speech-runtime/llama-funasr-sensevoice" "$INSTALL_ROOT/speech/runtime/llama-funasr-sensevoice"
+install -m 644 "$REPO_DIR/connector/dist/speech-runtime/README.md" "$INSTALL_ROOT/speech/runtime/README.md"
+install -m 644 "$REPO_DIR/connector/dist/speech-runtime/runtime-version.txt" "$INSTALL_ROOT/speech/runtime/runtime-version.txt"
 install -m 755 "$REPO_DIR/connector/packaging/run-helper.sh" "$INSTALL_ROOT/helper/run-helper.sh"
 install -m 755 "$RUNTIME_BINARY" "$INSTALL_ROOT/bundled-runtime/codex"
-install -m 644 "$REPO_DIR/connector/packaging/com.aistudio.connector.plist" \
-  "$ROOT/Library/LaunchAgents/com.aistudio.connector.plist"
+install -m 644 "$REPO_DIR/connector/packaging/com.aistudio.helper.plist" \
+  "$ROOT/Library/LaunchAgents/com.aistudio.helper.plist"
+install -m 644 "$REPO_DIR/connector/packaging/com.aistudio.speech.plist" \
+  "$ROOT/Library/LaunchAgents/com.aistudio.speech.plist"
 install -m 755 "$REPO_DIR/connector/packaging/scripts/postinstall" "$SCRIPTS/postinstall"
 if [ -n "$RUNTIME_LICENSE" ] && [ -f "$RUNTIME_LICENSE" ]; then
   install -m 644 "$RUNTIME_LICENSE" "$INSTALL_ROOT/bundled-runtime/LICENSE"
@@ -81,6 +93,10 @@ chmod 644 "$INSTALL_ROOT/config/helper.json" "$INSTALL_ROOT/config/server-url.tx
 /usr/bin/xattr -cr "$ROOT"
 
 if [ -n "${DEVELOPER_ID_APPLICATION:-}" ]; then
+  /usr/bin/codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID_APPLICATION" \
+    "$INSTALL_ROOT/speech/runtime/llama-funasr-sensevoice"
+  /usr/bin/codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID_APPLICATION" \
+    "$INSTALL_ROOT/speech/aistudio-speech"
   /usr/bin/codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID_APPLICATION" \
     "$INSTALL_ROOT/helper/aistudio-helper"
 fi

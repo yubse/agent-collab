@@ -9,6 +9,7 @@ import { PairingService } from './pairing/service.ts'
 import { ConnectorStateStore } from './state/store.ts'
 import { LocalHelperServer } from './helper/server.ts'
 import { formatProxyLog } from './network/proxy.ts'
+import { SpeechCoordinator, type SpeechServiceState } from './speech/coordinator.ts'
 
 export async function main(): Promise<never> {
   const config = loadConfig()
@@ -19,6 +20,12 @@ export async function main(): Promise<never> {
   }))
   const state = new ConnectorStateStore()
   let deviceToken = config.deviceToken
+  const speech = new SpeechCoordinator(config, () => deviceToken)
+  let speechState: SpeechServiceState = 'starting'
+  const refreshSpeechState = () => void speech.status().then((status) => { speechState = status }).catch(() => { speechState = 'error' })
+  refreshSpeechState()
+  const speechStatusTimer = setInterval(refreshSpeechState, 2_000)
+  speechStatusTimer.unref?.()
   let claimInFlight: Promise<{ bound: boolean; already_bound: boolean }> | null = null
 
   const runtime = new CodexRuntimeManager(config, state)
@@ -120,6 +127,7 @@ export async function main(): Promise<never> {
           logged_in: codex.loggedIn,
           status: codex.status,
         },
+        speech: { status: speechState },
       }
     },
     claim: completeClaim,
@@ -138,6 +146,16 @@ export async function main(): Promise<never> {
     },
     codexLogin: () => runtime.login(),
     codexRestart: () => runtime.restart(),
+    speechStatus: async () => {
+      const details = await speech.details()
+      speechState = details.status
+      return details
+    },
+    speechInstall: () => speech.installModel(),
+    speechGrant: (transcriptionId, proof) => speech.grant(transcriptionId, proof),
+    speechCancel: (transcriptionId) => speech.cancel(transcriptionId),
+    speechProgress: (body) => speech.forwardProgress(body),
+    speechSecret: speech.secret,
   })
   helper.start()
   console.log(`[helper] status=online address=http://${helper.hostname}:${helper.port}`)
@@ -150,6 +168,7 @@ export async function main(): Promise<never> {
   }
 
   const shutdown = async () => {
+    clearInterval(speechStatusTimer)
     helper.stop()
     console.log('[connector] status=SERVER_DISCONNECTED reason=shutdown')
     await executor.close()

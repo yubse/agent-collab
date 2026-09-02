@@ -654,7 +654,7 @@ function runtimeProviderKey(userId: string, conversationId: string, agentId: str
 }
 
 type BrowserExecutionEvent = {
-  type: 'execution_started' | 'execution_delta' | 'execution_result' | 'execution_error' | 'message_created'
+  type: 'execution_started' | 'execution_delta' | 'execution_result' | 'execution_error' | 'message_created' | 'transcription_update'
   event_id: number
   message_id: string
   conversation_id: string
@@ -665,6 +665,9 @@ type BrowserExecutionEvent = {
   content?: string
   status?: 'success' | 'error'
   error?: string
+  transcription_id?: string
+  progress?: number
+  uploaded_bytes?: number
 }
 
 const browserExecutionEvents = new Map<string, BrowserExecutionEvent[]>()
@@ -678,6 +681,7 @@ type BrowserExecutionSubscriber = {
   controller: ReadableStreamDefaultController<Uint8Array>
 }
 const browserExecutionSubscribers = new Map<string, Set<BrowserExecutionSubscriber>>()
+const transcriptionSubscribers = new Set<{ userId: string; controller: ReadableStreamDefaultController<Uint8Array> }>()
 const presenceStore = new PresenceStore()
 let browserExecutionSequence = 0
 const streamEncoder = new TextEncoder()
@@ -747,6 +751,33 @@ function publishPresenceUpdate(update: PresenceUpdate) {
     try { subscriber.controller.enqueue(frame) } catch { browserExecutionSubscribers.get(key)?.delete(subscriber) }
   }
   return update
+}
+
+function publishTranscriptionUpdate(record: any) {
+  const item = {
+    type: 'transcription_update',
+    transcription_id: record.id,
+    status: record.status,
+    progress: record.progress,
+    uploaded_bytes: record.uploaded_bytes,
+    error_code: record.error_code,
+    updated_at: record.updated_at,
+  }
+  const frame = streamEncoder.encode(`data: ${JSON.stringify(item)}\n\n`)
+  for (const subscribers of browserExecutionSubscribers.values()) {
+    for (const subscriber of [...subscribers]) {
+      const visible = record.channel_id
+        ? subscriber.conversationId === record.channel_id && canReadChannel(db, record.channel_id, subscriber.userId)
+        : subscriber.userId === record.owner_user_id
+      if (!visible) continue
+      try { subscriber.controller.enqueue(frame) } catch { subscribers.delete(subscriber) }
+    }
+  }
+  for (const subscriber of [...transcriptionSubscribers]) {
+    const visible = record.channel_id ? canReadChannel(db, record.channel_id, subscriber.userId) : subscriber.userId === record.owner_user_id
+    if (!visible) continue
+    try { subscriber.controller.enqueue(frame) } catch { transcriptionSubscribers.delete(subscriber) }
+  }
 }
 
 function setRoutePresence(route: AgentTurnRoute, agentId: string, status: AgentPresenceStatus) {
@@ -3479,6 +3510,55 @@ function connectorClaimRequestId(req: Request): string {
 }
 
 const HELPER_DOWNLOAD_GRANT_TTL_MS = 5 * 60_000
+const SPEECH_SESSION_PROOF_TTL_MS = 3 * 60_000
+
+function parseTranscriptionChunks(raw: unknown) {
+  try { const value = JSON.parse(String(raw || '[]')); return Array.isArray(value) ? value : [] }
+  catch { return [] }
+}
+
+function transcriptionPayload(row: any) {
+  return row ? {
+    id: row.id,
+    owner_user_id: row.owner_user_id,
+    channel_id: row.channel_id,
+    title: row.title,
+    original_name: row.original_name,
+    mime_type: row.mime_type,
+    byte_size: row.byte_size,
+    status: row.status,
+    progress: row.progress,
+    uploaded_bytes: row.uploaded_bytes,
+    error_code: row.error_code,
+    duration_ms: row.duration_ms,
+    language: row.language,
+    provider: row.provider,
+    runtime_version: row.runtime_version,
+    model_version: row.model_version,
+    processing_ms: row.processing_ms,
+    has_transcript: Boolean(row.has_transcript),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  } : null
+}
+
+function meetingTranscriptPayload(row: any) {
+  return row ? {
+    id: row.id, transcription_id: row.transcription_id, owner_user_id: row.owner_user_id,
+    channel_id: row.channel_id, transcript: row.transcript, chunks: parseTranscriptionChunks(row.chunks_json),
+    language: row.language, duration_ms: row.duration_ms, provider: row.provider,
+    runtime_version: row.runtime_version, model_version: row.model_version,
+    processing_ms: row.processing_ms, created_at: row.created_at, updated_at: row.updated_at,
+  } : null
+}
+
+function transcriptionForUser(id: string, userId: string) {
+  const row = db.prepare(`SELECT * FROM transcriptions WHERE id=?`).get(id) as any
+  if (!row) return null
+  if (row.owner_user_id === userId) return row
+  if (row.channel_id && canReadChannel(db, row.channel_id, userId)) return row
+  return null
+}
 
 function meetingRecordingForUser(recordingId: string, userId: string): any | null {
   const recording = db.prepare(`SELECT r.*, a.original_name, a.byte_size, a.checksum, a.asset_type
@@ -3559,6 +3639,7 @@ Bun.serve<ConnectorSocketData>({
       || (req.method === 'GET' && url.pathname === '/api/auth/profiles')
       || (req.method === 'POST' && (url.pathname === '/api/auth/login' || url.pathname === '/web/login' || url.pathname === '/api/auth/bootstrap' || url.pathname === '/api/auth/select-profile' || url.pathname === '/api/auth/logout'))
       || (req.method === 'POST' && (url.pathname === '/api/connectors/pairing/complete' || url.pathname === '/api/connectors/claim/complete'))
+      || (req.method === 'POST' && /^\/api\/transcriptions\/[^/]+\/(speech-proof\/verify|progress|cancel\/verify)$/.test(url.pathname))
       || (req.method === 'GET' && /^\/api\/helper\/assets\/[^/]+\/download$/.test(url.pathname))
       || (req.method === 'POST' && url.pathname === '/api/agent-statusline' && isLocalRequestHost(url.hostname))
 
@@ -3677,6 +3758,257 @@ Bun.serve<ConnectorSocketData>({
         return new Response(null, { status: 302, headers: { Location: `/web/login.html?next=${encodeURIComponent(next)}` } })
       }
       return Response.json({ error: 'unauthorized' }, { status: 401 })
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/transcriptions/stream' && currentUser) {
+      let subscriber: { userId: string; controller: ReadableStreamDefaultController<Uint8Array> } | null = null
+      let heartbeat: ReturnType<typeof setInterval> | null = null
+      const cleanup = () => {
+        if (subscriber) transcriptionSubscribers.delete(subscriber)
+        if (heartbeat) clearInterval(heartbeat)
+        req.signal.removeEventListener('abort', cleanup)
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          subscriber = { userId: currentUser!.id, controller }
+          transcriptionSubscribers.add(subscriber)
+          controller.enqueue(streamEncoder.encode(': connected\n\n'))
+          heartbeat = setInterval(() => { try { controller.enqueue(streamEncoder.encode(': heartbeat\n\n')) } catch { cleanup() } }, 15_000)
+          req.signal.addEventListener('abort', cleanup, { once: true })
+        },
+        cancel: cleanup,
+      })
+      return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-store', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' } })
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/transcriptions' && currentUser) {
+      const rows = db.prepare(`SELECT t.*, EXISTS(SELECT 1 FROM meeting_transcripts mt WHERE mt.transcription_id=t.id) AS has_transcript
+        FROM transcriptions t ORDER BY t.created_at DESC LIMIT 500`).all() as any[]
+      return Response.json({ ok: true, transcriptions: rows.filter((row) => transcriptionForUser(row.id, currentUser.id)).map(transcriptionPayload) })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/transcriptions' && currentUser) {
+      try {
+        const body = await readOptionalJsonObject(req)
+        if ('owner_user_id' in body || 'user_id' in body || 'device_id' in body) {
+          return Response.json({ ok: false, error: 'identity fields are not accepted' }, { status: 400 })
+        }
+        const originalName = String(body.original_name || '').trim()
+        const mimeType = String(body.mime_type || '').trim().toLowerCase()
+        const byteSize = Number(body.byte_size)
+        if (!originalName || originalName.length > 255 || originalName.includes('/') || originalName.includes('\\') || originalName.includes('\0')) {
+          return Response.json({ ok: false, error: 'invalid filename' }, { status: 400 })
+        }
+        if (!['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3', 'audio/mp4', 'audio/x-m4a', 'video/mp4', 'application/octet-stream'].includes(mimeType)) {
+          return Response.json({ ok: false, error: 'unsupported audio type' }, { status: 415 })
+        }
+        if (!Number.isSafeInteger(byteSize) || byteSize <= 0 || byteSize > 2 * 1024 * 1024 * 1024) {
+          return Response.json({ ok: false, error: 'invalid byte size' }, { status: 400 })
+        }
+        const channelId = String(body.channel_id || '').trim() || null
+        if (channelId && (!canReadChannel(db, channelId, currentUser.id) || !canPostChannel(db, channelId, currentUser.id))) {
+          return Response.json({ ok: false, error: 'channel not found' }, { status: 404 })
+        }
+        const now = groupNowIso()
+        const id = `tr_${randomBytes(20).toString('hex')}`
+        db.run(`INSERT INTO transcriptions
+          (id, owner_user_id, channel_id, title, original_name, mime_type, byte_size, status, progress, uploaded_bytes, error_code, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, NULL, ?, ?)`, [
+          id, currentUser.id, channelId, String(body.title || '').trim().slice(0, 200) || null,
+          originalName, mimeType, byteSize, now, now,
+        ])
+        return Response.json({ ok: true, transcription: transcriptionPayload(db.prepare(`SELECT * FROM transcriptions WHERE id=?`).get(id)) }, { status: 201 })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || 'unable to create transcription' }, { status: 400 })
+      }
+    }
+
+    const transcriptionMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)$/)
+    if (req.method === 'GET' && transcriptionMatch && currentUser) {
+      const id = decodeURIComponent(transcriptionMatch[1])
+      const allowed = transcriptionForUser(id, currentUser.id)
+      const row = allowed ? db.prepare(`SELECT t.*, EXISTS(SELECT 1 FROM meeting_transcripts mt WHERE mt.transcription_id=t.id) AS has_transcript FROM transcriptions t WHERE t.id=?`).get(id) : null
+      return row ? Response.json({ ok: true, transcription: transcriptionPayload(row) }) : Response.json({ ok: false, error: 'not found' }, { status: 404 })
+    }
+
+    const transcriptMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)\/transcript$/)
+    if (req.method === 'GET' && transcriptMatch && currentUser) {
+      const id = decodeURIComponent(transcriptMatch[1])
+      if (!transcriptionForUser(id, currentUser.id)) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+      const transcript = db.prepare(`SELECT * FROM meeting_transcripts WHERE transcription_id=?`).get(id)
+      return transcript ? Response.json({ ok: true, transcript: meetingTranscriptPayload(transcript) }) : Response.json({ ok: false, error: 'not found' }, { status: 404 })
+    }
+
+    const retryTranscriptionMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)\/retry$/)
+    if (req.method === 'POST' && retryTranscriptionMatch && currentUser) {
+      const id = decodeURIComponent(retryTranscriptionMatch[1])
+      const existing = db.prepare(`SELECT * FROM transcriptions WHERE id=? AND owner_user_id=?`).get(id, currentUser.id) as any
+      if (!existing) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+      if (!['completed', 'failed', 'cancelled'].includes(existing.status)) return Response.json({ ok: false, error: 'transcription is still active' }, { status: 409 })
+      const body = await readOptionalJsonObject(req)
+      const originalName = String(body.original_name || '').trim()
+      const mimeType = String(body.mime_type || '').trim().toLowerCase()
+      const byteSize = Number(body.byte_size)
+      const retryMimeAllowed = ['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3', 'audio/mp4', 'audio/x-m4a', 'video/mp4', 'application/octet-stream'].includes(mimeType)
+      if (!originalName || originalName.includes('/') || originalName.includes('\\') || !retryMimeAllowed || !Number.isSafeInteger(byteSize) || byteSize <= 0 || byteSize > 2 * 1024 * 1024 * 1024) {
+        return Response.json({ ok: false, error: 'LOCAL_FILE_REQUIRED' }, { status: 400 })
+      }
+      const now = groupNowIso()
+      db.run('BEGIN IMMEDIATE')
+      try {
+        db.run(`DELETE FROM meeting_transcripts WHERE transcription_id=?`, [id])
+        db.run(`DELETE FROM transcription_session_proofs WHERE transcription_id=?`, [id])
+        db.run(`UPDATE transcriptions SET original_name=?, mime_type=?, byte_size=?, duration_ms=NULL, language=NULL,
+          status='pending', progress=0, uploaded_bytes=0, error_code=NULL, provider=NULL, runtime_version=NULL,
+          model_version=NULL, processing_ms=NULL, execution_device_id=NULL, updated_at=? WHERE id=?`, [originalName, mimeType, byteSize, now, id])
+        db.run('COMMIT')
+      } catch (error) { db.run('ROLLBACK'); throw error }
+      const updated = db.prepare(`SELECT * FROM transcriptions WHERE id=?`).get(id)
+      publishTranscriptionUpdate(updated)
+      return Response.json({ ok: true, transcription: transcriptionPayload(updated) })
+    }
+
+    if (req.method === 'DELETE' && transcriptionMatch && currentUser) {
+      const id = decodeURIComponent(transcriptionMatch[1])
+      const existing = db.prepare(`SELECT * FROM transcriptions WHERE id=? AND owner_user_id=?`).get(id, currentUser.id) as any
+      if (!existing) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+      if (!['completed', 'failed', 'cancelled', 'pending'].includes(existing.status)) return Response.json({ ok: false, error: 'cancel before deleting' }, { status: 409 })
+      db.run(`DELETE FROM transcriptions WHERE id=?`, [id])
+      publishTranscriptionUpdate({ ...existing, status: 'deleted', progress: 0, updated_at: groupNowIso() })
+      return Response.json({ ok: true, deleted: true })
+    }
+
+    const speechProofMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)\/speech-proof$/)
+    if (req.method === 'POST' && speechProofMatch && currentUser) {
+      const id = decodeURIComponent(speechProofMatch[1])
+      const transcription = db.prepare(`SELECT * FROM transcriptions WHERE id=? AND owner_user_id=?`).get(id, currentUser.id) as any
+      if (!transcription) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+      if (transcription.status !== 'pending') return Response.json({ ok: false, error: 'invalid status' }, { status: 409 })
+      const connection = connectorRegistry.forUser(currentUser.id)
+      if (!connection) return Response.json({ ok: false, error: 'CONNECTOR_OFFLINE' }, { status: 409 })
+      const proof = randomBytes(32).toString('base64url')
+      const now = new Date()
+      const expiresAt = new Date(now.getTime() + SPEECH_SESSION_PROOF_TTL_MS).toISOString()
+      db.run(`DELETE FROM transcription_session_proofs WHERE expires_at<=? OR used_at IS NOT NULL`, [now.toISOString()])
+      db.run(`INSERT INTO transcription_session_proofs
+        (id, proof_hash, transcription_id, user_id, device_id, expires_at, used_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`, [
+        `proof_${randomBytes(16).toString('hex')}`, hashSecret(proof), id, currentUser.id, connection.deviceId, expiresAt, now.toISOString(),
+      ])
+      return Response.json({ ok: true, transcription_id: id, session_proof: proof, expires_at: expiresAt, helper_url: 'http://127.0.0.1:39481' })
+    }
+
+    const verifyProofMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)\/speech-proof\/verify$/)
+    if (req.method === 'POST' && verifyProofMatch) {
+      if (req.headers.has('origin') || req.headers.has('sec-fetch-site')) return Response.json({ ok: false, error: 'browser not allowed' }, { status: 403 })
+      const device = authenticateDevice(db, req.headers.get('x-ai-studio-device-token') || req.headers.get('x-aistudio-device-token') || '')
+      if (!device) return Response.json({ ok: false, error: 'device unauthorized' }, { status: 401 })
+      const id = decodeURIComponent(verifyProofMatch[1])
+      const body = await readOptionalJsonObject(req)
+      if ('user_id' in body || 'device_id' in body) return Response.json({ ok: false, error: 'identity fields are not accepted' }, { status: 400 })
+      const proof = String(body.session_proof || '')
+      const now = groupNowIso()
+      const row = db.prepare(`SELECT * FROM transcription_session_proofs
+        WHERE proof_hash=? AND transcription_id=? AND used_at IS NULL AND expires_at>?`).get(hashSecret(proof), id, now) as any
+      if (!row || row.user_id !== device.user_id || row.device_id !== device.id) return Response.json({ ok: false, error: 'proof invalid or expired' }, { status: 404 })
+      const transcription = db.prepare(`SELECT * FROM transcriptions WHERE id=? AND owner_user_id=?`).get(id, device.user_id) as any
+      if (!transcription) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+      const consumed = db.prepare(`UPDATE transcription_session_proofs SET used_at=? WHERE id=? AND used_at IS NULL AND expires_at>?`).run(now, row.id, now)
+      if (consumed.changes !== 1) return Response.json({ ok: false, error: 'proof invalid or expired' }, { status: 404 })
+      db.run(`UPDATE transcriptions SET execution_device_id=?, updated_at=? WHERE id=? AND owner_user_id=?`, [device.id, now, id, device.user_id])
+      return Response.json({ ok: true, transcription_id: id, user_id: device.user_id, device_id: device.id })
+    }
+
+    const progressMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)\/progress$/)
+    if (req.method === 'POST' && progressMatch) {
+      if (req.headers.has('origin')) return Response.json({ ok: false, error: 'browser not allowed' }, { status: 403 })
+      const device = authenticateDevice(db, req.headers.get('x-ai-studio-device-token') || req.headers.get('x-aistudio-device-token') || '')
+      if (!device) return Response.json({ ok: false, error: 'device unauthorized' }, { status: 401 })
+      const id = decodeURIComponent(progressMatch[1])
+      const transcription = db.prepare(`SELECT * FROM transcriptions WHERE id=? AND owner_user_id=?`).get(id, device.user_id) as any
+      if (!transcription) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+      if (!transcription.execution_device_id || transcription.execution_device_id !== device.id) return Response.json({ ok: false, error: 'device mismatch' }, { status: 403 })
+      const body = await readOptionalJsonObject(req)
+      if ((body.user_id && body.user_id !== device.user_id) || (body.device_id && body.device_id !== device.id)) {
+        return Response.json({ ok: false, error: 'binding mismatch' }, { status: 403 })
+      }
+      const status = String(body.status || '')
+      if (!['uploading', 'processing', 'queued', 'transcoding', 'loading_model', 'transcribing', 'saving', 'completed', 'failed', 'cancelled'].includes(status)) return Response.json({ ok: false, error: 'invalid status' }, { status: 400 })
+      if (transcription.status === 'cancelled' && status !== 'cancelled') return Response.json({ ok: false, error: 'already cancelled' }, { status: 409 })
+      const progress = Math.min(1, Math.max(0, Number(body.progress) || 0))
+      const uploadedBytes = Math.min(transcription.byte_size, Math.max(0, Math.round(Number(body.uploaded_bytes) || 0)))
+      const now = groupNowIso()
+      const alreadySaved = db.prepare(`SELECT * FROM meeting_transcripts WHERE transcription_id=?`).get(id) as any
+      if (status === 'completed' && alreadySaved) {
+        if (transcription.status !== 'completed') db.run(`UPDATE transcriptions SET status='completed', progress=1, updated_at=? WHERE id=?`, [groupNowIso(), id])
+        const updated = db.prepare(`SELECT t.*, 1 AS has_transcript FROM transcriptions t WHERE id=?`).get(id)
+        return Response.json({ ok: true, duplicate: true, transcription: transcriptionPayload(updated), transcript: meetingTranscriptPayload(alreadySaved) })
+      }
+      const result = status === 'completed' && body.result && typeof body.result === 'object' ? body.result as Record<string, unknown> : null
+      const transcript = result ? String(result.transcript || '') : ''
+      const chunks = result && Array.isArray(result.chunks) ? result.chunks : []
+      if (result && (!transcript || transcript.length > 10_000_000 || JSON.stringify(chunks).length > 12_000_000 || result.provider !== 'sensevoice')) {
+        return Response.json({ ok: false, error: 'invalid transcription result' }, { status: 400 })
+      }
+      if (status === 'completed') {
+        if (!result) return Response.json({ ok: false, error: 'transcription result required' }, { status: 400 })
+        const transcriptId = `mt_${randomBytes(20).toString('hex')}`
+        db.run('BEGIN IMMEDIATE')
+        try {
+          db.run(`UPDATE transcriptions SET status='saving', progress=?, uploaded_bytes=?, error_code=NULL, updated_at=? WHERE id=? AND status!='cancelled'`, [progress, uploadedBytes, now, id])
+          const current = db.prepare(`SELECT status FROM transcriptions WHERE id=?`).get(id) as any
+          if (current?.status === 'cancelled') throw new Error('TRANSCRIPTION_CANCELLED')
+          db.run(`INSERT INTO meeting_transcripts
+            (id, transcription_id, owner_user_id, channel_id, transcript, chunks_json, language, duration_ms, provider,
+             runtime_version, model_version, processing_ms, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sensevoice', ?, ?, ?, ?, ?)`, [
+            transcriptId, id, transcription.owner_user_id, transcription.channel_id, transcript, JSON.stringify(chunks),
+            String(result.language || 'auto').slice(0, 20), Math.max(0, Math.round(Number(result.duration_ms) || 0)),
+            String(result.runtime_version || '').slice(0, 100), String(result.model_version || '').slice(0, 200),
+            Math.max(0, Math.round(Number(result.processing_ms) || 0)), now, now,
+          ])
+          db.run(`UPDATE transcriptions SET status='completed', progress=1, uploaded_bytes=?, duration_ms=?, language=?, provider='sensevoice',
+            runtime_version=?, model_version=?, processing_ms=?, error_code=NULL, updated_at=? WHERE id=?`, [
+            uploadedBytes, Math.max(0, Math.round(Number(result.duration_ms) || 0)), String(result.language || 'auto').slice(0, 20),
+            String(result.runtime_version || '').slice(0, 100), String(result.model_version || '').slice(0, 200),
+            Math.max(0, Math.round(Number(result.processing_ms) || 0)), now, id,
+          ])
+          db.run('COMMIT')
+        } catch (error: any) {
+          db.run('ROLLBACK')
+          if (error?.message === 'TRANSCRIPTION_CANCELLED') return Response.json({ ok: false, error: 'already cancelled' }, { status: 409 })
+          throw error
+        }
+      } else {
+        db.run(`UPDATE transcriptions SET status=?, progress=?, uploaded_bytes=?, error_code=?, updated_at=? WHERE id=?`, [
+          status, progress, uploadedBytes, status === 'failed' ? String(body.error_code || 'SPEECH_FAILED').slice(0, 100) : null, now, id,
+        ])
+      }
+      const updated = db.prepare(`SELECT t.*, EXISTS(SELECT 1 FROM meeting_transcripts mt WHERE mt.transcription_id=t.id) AS has_transcript FROM transcriptions t WHERE t.id=?`).get(id) as any
+      publishTranscriptionUpdate(updated)
+      return Response.json({ ok: true, transcription: transcriptionPayload(updated) })
+    }
+
+    const cancelTranscriptionMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)\/cancel$/)
+    if (req.method === 'POST' && cancelTranscriptionMatch && currentUser) {
+      const id = decodeURIComponent(cancelTranscriptionMatch[1])
+      const transcription = db.prepare(`SELECT * FROM transcriptions WHERE id=? AND owner_user_id=?`).get(id, currentUser.id) as any
+      if (!transcription) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+      if (['completed', 'failed', 'cancelled'].includes(transcription.status)) return Response.json({ ok: false, error: 'transcription is not active' }, { status: 409 })
+      const now = groupNowIso()
+      db.run(`UPDATE transcriptions SET status='cancelled', error_code=NULL, updated_at=? WHERE id=?`, [now, id])
+      const updated = db.prepare(`SELECT * FROM transcriptions WHERE id=?`).get(id) as any
+      publishTranscriptionUpdate(updated)
+      return Response.json({ ok: true, transcription: transcriptionPayload(updated), helper_url: 'http://127.0.0.1:39481' })
+    }
+
+    const cancelVerifyMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)\/cancel\/verify$/)
+    if (req.method === 'POST' && cancelVerifyMatch) {
+      if (req.headers.has('origin')) return Response.json({ ok: false, error: 'browser not allowed' }, { status: 403 })
+      const device = authenticateDevice(db, req.headers.get('x-ai-studio-device-token') || req.headers.get('x-aistudio-device-token') || '')
+      const id = decodeURIComponent(cancelVerifyMatch[1])
+      const transcription = device ? db.prepare(`SELECT * FROM transcriptions WHERE id=? AND owner_user_id=? AND status='cancelled'`).get(id, device.user_id) : null
+      return transcription ? Response.json({ ok: true }) : Response.json({ ok: false, error: 'not found' }, { status: 404 })
     }
 
     if (req.method === 'POST' && url.pathname === '/upload') {

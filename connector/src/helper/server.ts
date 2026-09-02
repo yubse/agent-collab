@@ -18,6 +18,7 @@ export type LocalHelperStatus = {
   platform: string
   connector_version: string
   codex: HelperCodexStatus
+  speech?: { status: 'offline' | 'starting' | 'ready' | 'busy' | 'error' }
 }
 
 export type LocalHelperServerOptions = {
@@ -29,6 +30,12 @@ export type LocalHelperServerOptions = {
   unbind: (deviceId: string) => Promise<{ unbound: true }>
   codexLogin: () => Promise<{ started: true; status: 'CODEX_AUTHENTICATING' }>
   codexRestart?: () => Promise<void>
+  speechStatus?: () => Promise<string | { status: string; model?: string; runtime?: string; provider?: string; active_jobs?: number }>
+  speechInstall?: () => Promise<{ model: string; runtime: string }>
+  speechGrant?: (transcriptionId: string, sessionProof: string) => Promise<{ speechToken: string; expiresAt: string; speechUrl: string }>
+  speechCancel?: (transcriptionId: string) => Promise<{ cancelled: true }>
+  speechProgress?: (body: Record<string, unknown>) => Promise<void>
+  speechSecret?: string
 }
 
 export class LocalHelperServer {
@@ -75,6 +82,48 @@ export class LocalHelperServer {
 
     if (request.method === 'GET' && url.pathname === '/codex/status') {
       return Response.json(this.options.status().codex, { headers: origin ? this.corsHeaders(false) : undefined })
+    }
+
+    if (request.method === 'GET' && url.pathname === '/speech/status' && this.options.speechStatus) {
+      const speech = await this.options.speechStatus()
+      return Response.json({ ok: true, ...(typeof speech === 'string' ? { status: speech } : speech) }, { headers: origin ? this.corsHeaders(false) : undefined })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/speech/model/install' && this.options.speechInstall) {
+      if (origin !== this.options.allowedOrigin) return Response.json({ ok: false, error: 'ORIGIN_REQUIRED' }, { status: 403 })
+      try { return Response.json({ ok: true, ...(await this.options.speechInstall()) }, { headers: this.corsHeaders(false) }) }
+      catch { return Response.json({ ok: false, error: 'SPEECH_MODEL_INSTALL_FAILED' }, { status: 500, headers: this.corsHeaders(false) }) }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/speech/grant' && this.options.speechGrant) {
+      if (origin !== this.options.allowedOrigin) return Response.json({ ok: false, error: 'ORIGIN_REQUIRED' }, { status: 403 })
+      try {
+        const body = await request.json() as any
+        if ('user_id' in body || 'device_id' in body) throw new Error('IDENTITY_NOT_ACCEPTED')
+        const result = await this.options.speechGrant(String(body.transcription_id || ''), String(body.session_proof || ''))
+        return Response.json({ ok: true, speech_token: result.speechToken, expires_at: result.expiresAt, speech_url: result.speechUrl }, { headers: this.corsHeaders(false) })
+      } catch (error: any) {
+        return Response.json({ ok: false, error: safeSpeechError(error?.message) }, { status: 400, headers: this.corsHeaders(false) })
+      }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/speech/cancel' && this.options.speechCancel) {
+      if (origin !== this.options.allowedOrigin) return Response.json({ ok: false, error: 'ORIGIN_REQUIRED' }, { status: 403 })
+      try {
+        const body = await request.json() as any
+        const result = await this.options.speechCancel(String(body.transcription_id || ''))
+        return Response.json({ ok: true, ...result }, { headers: this.corsHeaders(false) })
+      } catch { return Response.json({ ok: false, error: 'SPEECH_CANCEL_FAILED' }, { status: 400, headers: this.corsHeaders(false) }) }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/internal/speech/progress' && this.options.speechProgress) {
+      if (!this.options.speechSecret || request.headers.get('x-aistudio-speech-secret') !== this.options.speechSecret) {
+        return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+      }
+      try {
+        await this.options.speechProgress(await request.json() as Record<string, unknown>)
+        return Response.json({ ok: true })
+      } catch { return Response.json({ ok: false, error: 'SPEECH_PROGRESS_REJECTED' }, { status: 400 }) }
     }
 
     if (request.method === 'POST' && url.pathname === '/claim') {
@@ -163,7 +212,7 @@ export class LocalHelperServer {
     const headers = new Headers({
       'Access-Control-Allow-Origin': this.options.allowedOrigin,
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
       'Access-Control-Allow-Private-Network': 'true',
       'Access-Control-Max-Age': '600',
       'Vary': 'Origin',
@@ -190,4 +239,11 @@ function safeCodexError(message: string): string {
   if (/NOT_INSTALLED|BUNDLED_RUNTIME/i.test(message)) return 'CODEX_RUNTIME_NOT_INSTALLED'
   if (/AUTHENTICAT|LOGIN/i.test(message)) return 'CODEX_AUTHENTICATION_ERROR'
   return 'CODEX_RUNTIME_ERROR'
+}
+
+function safeSpeechError(message: string): string {
+  if (/ORIGIN/i.test(message)) return 'ORIGIN_NOT_ALLOWED'
+  if (/PROOF|INVALID|EXPIRED/i.test(message)) return 'SPEECH_SESSION_PROOF_REJECTED'
+  if (/OFFLINE|UNAVAILABLE|fetch failed/i.test(message)) return 'SPEECH_SERVICE_UNAVAILABLE'
+  return 'SPEECH_GRANT_FAILED'
 }

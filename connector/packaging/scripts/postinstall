@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-PLIST="/Library/LaunchAgents/com.aistudio.connector.plist"
+PLIST="/Library/LaunchAgents/com.aistudio.helper.plist"
+SPEECH_PLIST="/Library/LaunchAgents/com.aistudio.speech.plist"
 CONFIG_ROOT="/Library/Application Support/AIStudio/config"
 CONSOLE_USER=$(/usr/bin/stat -f '%Su' /dev/console)
 
@@ -19,13 +20,27 @@ run_as_console_user() {
 run_as_console_user /bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 \
   || /bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 \
   || true
+run_as_console_user /bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.helper" >/dev/null 2>&1 \
+  || /bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.helper" >/dev/null 2>&1 \
+  || true
 # bootout can return before launchd has fully removed the old job. Avoid an
 # immediate bootstrap race (macOS reports it as error 5).
 /bin/sleep 1
 if /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" >/dev/null 2>&1 \
   || run_as_console_user /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" >/dev/null 2>&1; then
-  /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 \
-    || run_as_console_user /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.connector" >/dev/null 2>&1 \
+  /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.helper" >/dev/null 2>&1 \
+    || run_as_console_user /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.helper" >/dev/null 2>&1 \
+    || true
+fi
+
+run_as_console_user /bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.speech" >/dev/null 2>&1 \
+  || /bin/launchctl bootout "gui/$CONSOLE_UID/com.aistudio.speech" >/dev/null 2>&1 \
+  || true
+/bin/sleep 1
+if /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$SPEECH_PLIST" >/dev/null 2>&1 \
+  || run_as_console_user /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$SPEECH_PLIST" >/dev/null 2>&1; then
+  /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.speech" >/dev/null 2>&1 \
+    || run_as_console_user /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.aistudio.speech" >/dev/null 2>&1 \
     || true
 fi
 

@@ -733,4 +733,123 @@ describe('Server → Connector → Conversation closure', () => {
     }
     await connector.close()
   }, 10_000)
+
+  test('M2.2A binds a single-use speech proof to Server Session user and current device', async () => {
+    const connectorA = await pairConnector(userACookie, 'Speech Connector A', 'unused')
+    const connectorB = await pairConnector(userBCookie, 'Speech Connector B', 'unused')
+    const forged = await api('/api/transcriptions', userACookie, {
+      method: 'POST', body: JSON.stringify({
+        original_name: 'meeting.m4a', mime_type: 'audio/mp4', byte_size: 4096,
+        owner_user_id: userB.id, user_id: userB.id, device_id: 'dev_forged',
+      }),
+    })
+    expect(forged.status).toBe(400)
+    const created = await json(await api('/api/transcriptions', userACookie, {
+      method: 'POST', body: JSON.stringify({ original_name: 'meeting.m4a', mime_type: 'audio/mp4', byte_size: 4096 }),
+    }))
+    expect(created.transcription.owner_user_id).toBe(userA.id)
+    expect(created.transcription.status).toBe('pending')
+    const id = created.transcription.id
+    const inspectDb = new Database(databasePath)
+    expect((inspectDb.prepare(`SELECT COUNT(*) AS n FROM uploaded_assets WHERE original_name='meeting.m4a'`).get() as any).n).toBe(0)
+    inspectDb.close()
+    expect((await api(`/api/transcriptions/${id}`, userBCookie)).status).toBe(404)
+
+    const proof = await json(await api(`/api/transcriptions/${id}/speech-proof`, userACookie, { method: 'POST', body: '{}' }))
+    const wrongDevice = await api(`/api/transcriptions/${id}/speech-proof/verify`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorB.token }, body: JSON.stringify({ session_proof: proof.session_proof }),
+    })
+    expect(wrongDevice.status).toBe(404)
+    const forgedIdentity = await api(`/api/transcriptions/${id}/speech-proof/verify`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token }, body: JSON.stringify({ session_proof: proof.session_proof, user_id: userB.id }),
+    })
+    expect(forgedIdentity.status).toBe(400)
+    const verified = await json(await api(`/api/transcriptions/${id}/speech-proof/verify`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token }, body: JSON.stringify({ session_proof: proof.session_proof }),
+    }))
+    expect(verified).toMatchObject({ user_id: userA.id })
+    expect((await api(`/api/transcriptions/${id}/speech-proof/verify`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token }, body: JSON.stringify({ session_proof: proof.session_proof }),
+    })).status).toBe(404)
+
+    const progressed = await json(await api(`/api/transcriptions/${id}/progress`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token },
+      body: JSON.stringify({ status: 'processing', progress: 1, uploaded_bytes: 4096, user_id: userA.id }),
+    }))
+    expect(progressed.transcription).toMatchObject({ status: 'processing', progress: 1, uploaded_bytes: 4096 })
+    await json(await api(`/api/transcriptions/${id}/cancel`, userACookie, { method: 'POST', body: '{}' }))
+    expect((await api(`/api/transcriptions/${id}/cancel/verify`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token }, body: '{}',
+    })).status).toBe(200)
+    const bindSpeechJob = async (jobId: string) => {
+      const jobProof = await json(await api(`/api/transcriptions/${jobId}/speech-proof`, userACookie, { method: 'POST', body: '{}' }))
+      expect((await api(`/api/transcriptions/${jobId}/speech-proof/verify`, '', {
+        method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token }, body: JSON.stringify({ session_proof: jobProof.session_proof }),
+      })).status).toBe(200)
+    }
+    const completedJob = await json(await api('/api/transcriptions', userACookie, {
+      method: 'POST', body: JSON.stringify({ original_name: 'sensevoice.wav', mime_type: 'audio/wav', byte_size: 32044 }),
+    }))
+    await bindSpeechJob(completedJob.transcription.id)
+    expect((await api(`/api/transcriptions/${completedJob.transcription.id}/progress`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorB.token }, body: JSON.stringify({ status: 'transcribing', progress: 0.5, uploaded_bytes: 32044 }),
+    })).status).toBe(404)
+    const completed = await json(await api(`/api/transcriptions/${completedJob.transcription.id}/progress`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token },
+      body: JSON.stringify({
+        status: 'completed', progress: 1, uploaded_bytes: 32044,
+        result: { transcript: '真实转写', chunks: [{ text: '真实转写', start_ms: null, end_ms: null, speaker: null }], duration_ms: 1000, language: 'zh', provider: 'sensevoice', runtime_version: 'runtime-llamacpp-v0.2.1', model_version: 'pinned-q8', processing_ms: 120 },
+      }),
+    }))
+    expect(completed.transcription).toMatchObject({ status: 'completed', provider: 'sensevoice', duration_ms: 1000, has_transcript: true })
+    const transcript = await json(await api(`/api/transcriptions/${completedJob.transcription.id}/transcript`, userACookie))
+    expect(transcript.transcript.transcript).toBe('真实转写')
+    expect(transcript.transcript.chunks).toHaveLength(1)
+    expect((await api(`/api/transcriptions/${completedJob.transcription.id}/transcript`, userBCookie)).status).toBe(404)
+    const duplicate = await json(await api(`/api/transcriptions/${completedJob.transcription.id}/progress`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token },
+      body: JSON.stringify({ status: 'completed', progress: 1, uploaded_bytes: 32044, result: { transcript: '不得重复', provider: 'sensevoice' } }),
+    }))
+    expect(duplicate.duplicate).toBe(true)
+    const countDb = new Database(databasePath)
+    expect((countDb.prepare(`SELECT COUNT(*) AS n FROM meeting_transcripts WHERE transcription_id=?`).get(completedJob.transcription.id) as any).n).toBe(1)
+    countDb.close()
+
+    const lateJob = await json(await api('/api/transcriptions', userACookie, {
+      method: 'POST', body: JSON.stringify({ original_name: 'late.wav', mime_type: 'audio/wav', byte_size: 32044 }),
+    }))
+    await bindSpeechJob(lateJob.transcription.id)
+    await json(await api(`/api/transcriptions/${lateJob.transcription.id}/cancel`, userACookie, { method: 'POST', body: '{}' }))
+    expect((await api(`/api/transcriptions/${lateJob.transcription.id}/progress`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token },
+      body: JSON.stringify({ status: 'completed', progress: 1, uploaded_bytes: 32044, result: { transcript: '迟到结果', chunks: [], duration_ms: 1000, language: 'zh', provider: 'sensevoice', runtime_version: 'test', model_version: 'test', processing_ms: 1 } }),
+    })).status).toBe(409)
+
+    expect((await api(`/api/transcriptions/${completedJob.transcription.id}/retry`, userACookie, { method: 'POST', body: '{}' })).status).toBe(400)
+    const retried = await json(await api(`/api/transcriptions/${completedJob.transcription.id}/retry`, userACookie, {
+      method: 'POST', body: JSON.stringify({ original_name: 'selected-again.wav', mime_type: 'audio/wav', byte_size: 64044 }),
+    }))
+    expect(retried.transcription.status).toBe('pending')
+    expect((await api(`/api/transcriptions/${completedJob.transcription.id}/transcript`, userACookie)).status).toBe(404)
+    await json(await api(`/api/transcriptions/${completedJob.transcription.id}/cancel`, userACookie, { method: 'POST', body: '{}' }))
+    expect((await api(`/api/transcriptions/${completedJob.transcription.id}`, userACookie, { method: 'DELETE' })).status).toBe(200)
+
+    const shared = await json(await api('/api/channels', userACookie, {
+      method: 'POST', body: JSON.stringify({ name: 'Meeting Shared', human_member_ids: [userB.id], agent_member_ids: ['content'] }),
+    }))
+    const sharedJob = await json(await api('/api/transcriptions', userACookie, {
+      method: 'POST', body: JSON.stringify({ original_name: 'shared.m4a', mime_type: 'audio/mp4', byte_size: 4096, channel_id: shared.channel.id }),
+    }))
+    await bindSpeechJob(sharedJob.transcription.id)
+    await json(await api(`/api/transcriptions/${sharedJob.transcription.id}/progress`, '', {
+      method: 'POST', headers: { 'X-AIStudio-Device-Token': connectorA.token },
+      body: JSON.stringify({ status: 'completed', progress: 1, uploaded_bytes: 4096, result: { transcript: '共享会议', chunks: [], duration_ms: 1000, language: 'zh', provider: 'sensevoice', runtime_version: 'test', model_version: 'test', processing_ms: 1 } }),
+    }))
+    expect((await api(`/api/transcriptions/${sharedJob.transcription.id}/transcript`, userBCookie)).status).toBe(200)
+    expect((await json(await api('/api/transcriptions', userBCookie))).transcriptions.some((item: any) => item.id === sharedJob.transcription.id)).toBe(true)
+    await json(await api(`/api/channels/${shared.channel.id}/members/human/${userB.id}`, userACookie, { method: 'DELETE' }))
+    expect((await api(`/api/transcriptions/${sharedJob.transcription.id}/transcript`, userBCookie)).status).toBe(404)
+    expect((await json(await api('/api/transcriptions', userBCookie))).transcriptions.some((item: any) => item.id === sharedJob.transcription.id)).toBe(false)
+    await connectorA.close(); await connectorB.close()
+  }, 10_000)
 })

@@ -8,6 +8,7 @@
     "doctor": "bun src/doctor.ts",
     "check": "bun build src/index.ts --target=bun --outdir /tmp/ai-studio-connector-check",
     "build:standalone": "sh scripts/build-standalone.sh",
+    "build:speech": "sh scripts/build-speech-service.sh",
     "build:pkg": "sh scripts/build-pkg.sh"
   }
 }

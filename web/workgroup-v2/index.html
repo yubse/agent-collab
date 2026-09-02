@@ -2188,6 +2188,7 @@ button, textarea, input { font: inherit; }
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
 <script src="/web/workgroup-v2/typewriter-buffer.js"></script>
+<script src="/web/workgroup-v2/speech-upload.js"></script>
 </head>
 <body>
 
@@ -2247,6 +2248,7 @@ button, textarea, input { font: inherit; }
     <section class="studio-sidebar-section">
       <div class="studio-sidebar-label">工作</div>
       <button class="studio-sidebar-link" data-sidebar-view="tasks"><span class="material-symbols-rounded">task_alt</span><span>我的任务</span></button>
+      <a class="studio-sidebar-link" href="/web/transcriptions/index.html" style="text-decoration:none;color:inherit"><span class="material-symbols-rounded">graphic_eq</span><span>会议转写</span></a>
     </section>
     <div class="ws-sidebar-divider"></div>
     <div class="ws-workstation-head">
@@ -2925,6 +2927,7 @@ function _ensureExecutionStream(channelId, threadId = activeThread?.channel_id =
     try {
       const payload = JSON.parse(event.data);
       if (payload.type === 'presence_update') _consumePresenceUpdate(payload);
+      else if (payload.type === 'transcription_update') window.dispatchEvent(new CustomEvent('aistudio:transcription_update', { detail: payload }));
       else _consumeExecutionEvents([payload]);
     }
     catch (error) { console.warn('[stream] invalid server event', error); }

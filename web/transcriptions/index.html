@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>会议转写 · AI Studio</title>
+  <link rel="stylesheet" href="/web/transcriptions/transcriptions.css">
+  <style>.bar.busy i{animation:speech-busy 1.2s ease-in-out infinite}@keyframes speech-busy{0%{transform:translateX(-120%)}100%{transform:translateX(320%)}}</style>
+</head>
+<body>
+  <header><a href="/web/workgroup-v2/index.html">← AI Studio</a><strong>会议转写</strong><span id="localState">检查本机服务…</span></header>
+  <main>
+    <aside>
+      <div class="aside-title"><b>转写记录</b><button id="refreshBtn">刷新</button></div>
+      <div id="history" class="history"><div class="empty">正在加载…</div></div>
+    </aside>
+    <section>
+      <div class="upload-card" id="uploadCard">
+        <h1>本地会议转写</h1>
+        <p class="privacy">🔒 原始录音仅在当前电脑本地处理，不会上传服务器。</p>
+        <label>会议标题（可选）<input id="titleInput" maxlength="200" placeholder="例如：产品周会"></label>
+        <input id="fileInput" type="file" accept=".wav,.mp3,.m4a,.mp4,audio/wav,audio/mpeg,audio/mp4,video/mp4" hidden>
+        <button class="primary" id="chooseBtn">选择会议录音</button>
+        <small>支持 WAV、MP3、M4A、MP4</small>
+      </div>
+      <div class="model-card hidden" id="modelCard">
+        <h2>首次使用需要安装本地语音识别模型</h2>
+        <p>SenseVoiceSmall Q8，约250MB。模型只保存在当前电脑。</p>
+        <button class="primary" id="installBtn">安装</button><span id="installState"></span>
+      </div>
+      <div class="job-card hidden" id="jobCard">
+        <div><strong id="jobTitle">会议转写</strong><span class="status" id="jobStatus"></span></div>
+        <div class="bar"><i id="progressBar"></i></div><p id="progressText"></p>
+        <button class="danger" id="cancelBtn">取消</button>
+      </div>
+      <article class="detail hidden" id="detail">
+        <div class="detail-head"><div><h1 id="detailTitle"></h1><p id="detailMeta"></p></div><div class="actions"><button id="copyBtn">复制全文</button><button id="retryBtn">重新转写</button><button class="danger" id="deleteBtn">删除</button></div></div>
+        <pre id="transcriptText"></pre>
+      </article>
+      <div class="notice hidden" id="notice"></div>
+    </section>
+  </main>
+  <script src="/web/workgroup-v2/speech-upload.js"></script>
+  <script src="/web/transcriptions/transcriptions.js"></script>
+</body>
+</html>
