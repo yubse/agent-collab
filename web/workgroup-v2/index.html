@@ -5473,6 +5473,20 @@ function renderMessages() {
   }, 'group');
 }
 
+function attachmentFileParts(file) {
+  if (typeof file === 'string') return { server: file, label: file };
+  if (!file || typeof file !== 'object') return null;
+  const server = String(file.server || file.filename || '').trim();
+  if (!server) return null;
+  return { server, label: String(file.original || file.name || server) };
+}
+
+function renderAttachmentFile(file, extraStyle = '') {
+  const parts = attachmentFileParts(file);
+  if (!parts) return '';
+  return `<a class="ws-msg-attachment-file" href="/images/${encodeURIComponent(parts.server)}" target="_blank"${extraStyle}>📎 ${esc(parts.label)}</a>`;
+}
+
 function renderGroupMsg(m) {
   const actor = m.sender_actor || null;
   const isSystem = actor?.type === 'system' || m.sender_id === 'system' || m.message_type === 'system_notification';
@@ -5503,9 +5517,7 @@ function renderGroupMsg(m) {
   const images = (m.images || []).map(fn =>
     `<img src="/images/${encodeURIComponent(fn)}" data-action="view-image" alt="">`
   ).join('');
-  const files = (m.files || []).map(fn =>
-    `<a class="ws-msg-attachment-file" href="/images/${encodeURIComponent(fn)}" target="_blank">📎 ${esc(fn)}</a>`
-  ).join('');
+  const files = (m.files || []).map(fn => renderAttachmentFile(fn)).join('');
   const attachments = (images || files)
     ? `<div class="ws-msg-attachment">${images}${files}</div>` : '';
   const threadSummary = m.thread_summary;
@@ -5745,9 +5757,7 @@ function renderDmMsg(m, prev) {
   const images = (m.images || []).map(fn =>
     `<img src="/images/${encodeURIComponent(fn)}" data-action="view-image" alt="" style="margin-top:6px; max-width:200px; max-height:200px; border-radius:8px; cursor:pointer; display:block;">`
   ).join('');
-  const files = (m.files || []).map(fn =>
-    `<a class="ws-msg-attachment-file" href="/images/${encodeURIComponent(fn)}" target="_blank" style="margin-top:6px; display:inline-block;">📎 ${esc(fn)}</a>`
-  ).join('');
+  const files = (m.files || []).map(fn => renderAttachmentFile(fn, ' style="margin-top:6px; display:inline-block;"')).join('');
 
   // Reply preview block.
   let replyBlock = '';
