@@ -92,10 +92,10 @@ export class SpeechService {
     if (this.server) return
     const hostname = this.options.hostname || '127.0.0.1'
     if (hostname !== '127.0.0.1') throw new Error('SPEECH_SERVICE_MUST_BIND_LOOPBACK')
-    this.server = Bun.serve({ hostname, port: this.options.port || SPEECH_SERVICE_PORT, fetch: (request) => this.handle(request) })
+    this.server = Bun.serve({ hostname, port: this.options.port ?? SPEECH_SERVICE_PORT, fetch: (request) => this.handle(request) })
   }
 
-  get port() { return this.server?.port || this.options.port || SPEECH_SERVICE_PORT }
+  get port() { return this.server?.port ?? this.options.port ?? SPEECH_SERVICE_PORT }
   get hostname() { return this.server?.hostname || this.options.hostname || '127.0.0.1' }
 
   stop() {

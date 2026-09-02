@@ -47,9 +47,12 @@ export class SenseVoiceProvider implements TranscriptionProvider {
       if (!existsSync(this.options.runtimePath)) throw new SpeechProviderError('SPEECH_RUNTIME_FAILED', 'SenseVoice runtime missing')
       await request.onStage?.('transcribing', 0.25)
       const child = Bun.spawn([this.options.runtimePath, '-m', modelPath, '-a', prepared.wavPath, '--vad', vadPath, '--vad-maxseg', '30000'], {
-        stdout: 'pipe', stderr: 'pipe', env: { ...process.env },
+        stdout: 'pipe', stderr: 'pipe', env: { ...process.env }, detached: true,
       })
-      const abort = () => child.kill('SIGTERM')
+      const abort = () => {
+        try { process.kill(-child.pid, 'SIGTERM') }
+        catch { try { child.kill('SIGTERM') } catch {} }
+      }
       request.signal.addEventListener('abort', abort, { once: true })
       let peakMemoryBytes = 0, cpuTotal = 0, cpuSamples = 0
       const sampler = setInterval(() => {
