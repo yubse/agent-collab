@@ -49,7 +49,6 @@
         headers: {
           Authorization: `Bearer ${grant.speech_token}`,
           'Content-Type': file.type || 'application/octet-stream',
-          'X-AIStudio-Original-Name': file.name,
           'X-AIStudio-Byte-Size': String(file.size),
         },
         body: file.stream(),

@@ -16,6 +16,8 @@ describe('M2.3 meeting transcription UI', () => {
     expect(upload).toContain('stage=speech_fetch_start')
     expect(upload).toContain('stage=speech_fetch_response')
     expect(upload).toContain('stage=speech_fetch_throw')
+    expect(upload).not.toContain('X-AIStudio-Original-Name')
+    expect(upload).toContain('original_name: file.name')
     expect(upload).not.toContain("fetch('/upload")
   })
 
