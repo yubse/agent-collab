@@ -215,6 +215,7 @@ export class SpeechService {
     if (!request.body) throw new Error('SPEECH_BODY_REQUIRED')
     let stage = 'temp_write_start'
     const operationStartedAt = Date.now()
+    let activeSegmentIndex: number | undefined
     const totalBytes = Number(request.headers.get('x-aistudio-byte-size') || request.headers.get('content-length') || 0)
     if (!Number.isFinite(totalBytes) || totalBytes <= 0) throw new Error('SPEECH_CONTENT_LENGTH_REQUIRED')
     if (totalBytes > SPEECH_MAX_AUDIO_BYTES) throw new Error('SPEECH_AUDIO_TOO_LARGE')
@@ -276,14 +277,16 @@ export class SpeechService {
       const result = await this.provider.transcribe({
         inputPath: processingPath, originalName, mimeType: detected.mimeType,
         signal: controller.signal,
-        onStage: async (stage, progress, details) => {
-          if (stage === 'loading_model') this.log('transcode_done', { transcription_id: grant.transcriptionId })
-          if (stage === 'transcribing' && details?.segment_index && details.segment_index !== lastSegment) {
+        onStage: async (stageName, progress, details) => {
+          stage = stageName === 'transcribing' ? 'sensevoice' : stageName
+          if (stageName === 'loading_model') this.log('transcode_done', { transcription_id: grant.transcriptionId })
+          if (stageName === 'transcribing' && details?.segment_index && details.segment_index !== lastSegment) {
             lastSegment = details.segment_index
+            activeSegmentIndex = details.segment_index
             this.log('segment_start', { transcription_id: grant.transcriptionId, segment_index: details.segment_index, segment_count: details.segment_count })
             this.log('sensevoice_start', { transcription_id: grant.transcriptionId, segment_index: details.segment_index, segment_count: details.segment_count })
           }
-          await this.report(grant, stage, progress, uploadedBytes, totalBytes, null, undefined, false, details)
+          await this.report(grant, stageName, progress, uploadedBytes, totalBytes, null, undefined, false, details)
         },
       })
       stage = 'sensevoice_done'
@@ -311,6 +314,7 @@ export class SpeechService {
         error_name: String(error?.name || 'Error').slice(0, 120),
         error_message: safeErrorCode(code),
         duration_ms: Date.now() - operationStartedAt,
+        segment_index: activeSegmentIndex ?? '',
         exit_code: Number.isInteger(error?.exit_code) ? error.exit_code : '',
       })
       await this.report(grant, cancelled ? 'cancelled' : 'failed', 0, uploadedBytes, totalBytes, cancelled ? null : safeErrorCode(code))

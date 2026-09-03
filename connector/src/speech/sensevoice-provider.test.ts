@@ -49,6 +49,16 @@ describe('M2.2B SenseVoice provider', () => {
     expect((await provider.transcribe(request())).transcript).toBe('recovered')
   })
 
+  test('accepts a valid runtime segment with no speech output', async () => {
+    const { provider, runtime, dir } = fixture('if [ -f "' + '${TMP_MARKER}' + '" ]; then exit 0; else touch "' + '${TMP_MARKER}' + '"; echo speech; fi', { segmentCount: 2 })
+    const marker = path.join(dir, 'marker')
+    const script = (await Bun.file(runtime).text()).replaceAll('${TMP_MARKER}', marker)
+    writeFileSync(runtime, script); chmodSync(runtime, 0o755)
+    const result = await provider.transcribe(request())
+    expect(result.transcript).toBe('speech')
+    expect(result.chunks).toHaveLength(2)
+  })
+
   test('cancel terminates only the active runtime', async () => {
     const { provider } = fixture('sleep 5; echo late')
     const controller = new AbortController()

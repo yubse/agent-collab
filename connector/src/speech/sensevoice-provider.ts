@@ -111,12 +111,24 @@ export class SenseVoiceProvider implements TranscriptionProvider {
       try {
         const exitCode = await Promise.race([child.exited, watchdogPromise])
         const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
-        this.options.diagnostic?.('sensevoice_process', { exit_code: exitCode, duration_ms: Date.now() - startedAt, segment_basename: path.basename(wavPath), stderr: sanitizeRuntimeError(stderr) })
+        this.options.diagnostic?.('sensevoice_process', {
+          runtime_basename: path.basename(this.options.runtimePath),
+          model_basename: path.basename(modelPath),
+          vad_basename: path.basename(vadPath),
+          segment_basename: path.basename(wavPath),
+          exit_code: exitCode,
+          signal: null,
+          duration_ms: Date.now() - startedAt,
+          stdout_present: Boolean(stdout.trim()),
+          stdout_bytes: Buffer.byteLength(stdout),
+          stderr: sanitizeRuntimeError(stderr),
+        })
         if (signal.aborted) throw new SpeechProviderError('SPEECH_CANCELLED')
         if (exitCode !== 0) throw new SpeechProviderError('SPEECH_RUNTIME_FAILED', sanitizeRuntimeError(stderr))
-        const transcript = stdout.trim()
-        if (!transcript) throw new SpeechProviderError('SPEECH_RUNTIME_FAILED', 'SenseVoice returned empty transcript')
-        return transcript
+        // A VAD segment may legitimately contain no speech (for example the
+        // tail of a recording). Treat it as an empty chunk; the aggregate
+        // result below still fails if every segment is empty.
+        return stdout.trim()
       } catch (error) {
         abort()
         await child.exited.catch(() => {})
