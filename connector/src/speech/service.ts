@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'crypto'
 import { chmodSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'fs'
 import { open, rename, unlink } from 'fs/promises'
 import path from 'path'
-import { detectAudioSignature, safeOriginalName } from '../../../src/assets/storage.ts'
+import { detectAudioSignature } from '../../../src/assets/storage.ts'
 import { AudioPipeline } from './audio-pipeline.ts'
 import { ModelManager } from './model-manager.ts'
 import { SpeechProviderError, type TranscriptionProvider, type TranscriptionResult } from './provider.ts'
@@ -178,6 +178,8 @@ export class SpeechService {
       return Response.json({ ok: true, ...result }, { status: 202, headers: this.corsHeaders() })
     } catch (error: any) {
       const code = String(error?.message || 'SPEECH_UPLOAD_FAILED')
+      const receivedContentType = (request.headers.get('content-type') || '(empty)').split(';')[0].trim().slice(0, 100)
+      console.error(`[speech-upload] transcription=${transcriptionId} received_content_type=${receivedContentType} reason=${safeErrorCode(code)}`)
       const status = code === 'SPEECH_AUDIO_TOO_LARGE' ? 413 : code.includes('FORMAT') ? 415 : code === 'SPEECH_CANCELLED' ? 409 : 500
       return Response.json({ ok: false, error: code }, { status, headers: this.corsHeaders() })
     }
@@ -185,9 +187,6 @@ export class SpeechService {
 
   private async receiveAudio(request: Request, grant: SpeechGrant) {
     if (!request.body) throw new Error('SPEECH_BODY_REQUIRED')
-    const originalName = safeOriginalName(request.headers.get('x-aistudio-original-name') || 'recording')
-    const extension = originalName.includes('.') ? originalName.split('.').pop()!.toLowerCase() : ''
-    if (!['wav', 'mp3', 'm4a', 'mp4'].includes(extension)) throw new Error('SPEECH_UNSUPPORTED_FORMAT')
     const totalBytes = Number(request.headers.get('x-aistudio-byte-size') || request.headers.get('content-length') || 0)
     if (!Number.isFinite(totalBytes) || totalBytes <= 0) throw new Error('SPEECH_CONTENT_LENGTH_REQUIRED')
     if (totalBytes > SPEECH_MAX_AUDIO_BYTES) throw new Error('SPEECH_AUDIO_TOO_LARGE')
@@ -229,15 +228,18 @@ export class SpeechService {
         }
       }
       if (uploadedBytes !== totalBytes) throw new Error('SPEECH_BYTE_SIZE_MISMATCH')
-      const detected = detectAudioSignature(header.subarray(0, headerLength), extension)
-      if (!detected || !mimeMatches(request.headers.get('content-type') || '', extension)) throw new Error('SPEECH_AUDIO_FORMAT_INVALID')
+      const detected = resolveAudioFormat(header.subarray(0, headerLength), request.headers.get('content-type') || '')
+      if (!detected) throw new Error('SPEECH_AUDIO_FORMAT_INVALID')
+      // The browser no longer sends the original filename. Use an internal,
+      // ASCII-only name derived from verified bytes for the local pipeline.
+      const originalName = `recording.${detected.extension}`
       await handle.sync()
       await handle.close()
       await rename(temporaryPath, processingPath)
       await this.report(grant, 'processing', 1, uploadedBytes, totalBytes)
       await this.report(grant, 'queued', 1, uploadedBytes, totalBytes)
       const result = await this.provider.transcribe({
-        inputPath: processingPath, originalName, mimeType: request.headers.get('content-type') || '',
+        inputPath: processingPath, originalName, mimeType: detected.mimeType,
         signal: controller.signal,
         onStage: async (stage, progress, details) => { await this.report(grant, stage, progress, uploadedBytes, totalBytes, null, undefined, false, details) },
       })
@@ -346,15 +348,24 @@ function safeEqual(left: string, right: string) {
   const a = Buffer.from(left); const b = Buffer.from(right)
   return a.length === b.length && a.length > 0 && timingSafeEqual(a, b)
 }
-function mimeMatches(mime: string, extension: string) {
+export function resolveAudioFormat(header: Uint8Array, mime: string): { extension: 'wav' | 'mp3' | 'm4a' | 'mp4'; mimeType: string } | null {
   const normalized = mime.split(';')[0].trim().toLowerCase()
-  const allowed: Record<string, string[]> = {
-    wav: ['audio/wav', 'audio/x-wav', 'application/octet-stream'],
-    mp3: ['audio/mpeg', 'audio/mp3', 'application/octet-stream'],
-    m4a: ['audio/mp4', 'audio/x-m4a', 'application/octet-stream'],
-    mp4: ['video/mp4', 'audio/mp4', 'application/octet-stream'],
+  const candidates: Array<'wav' | 'mp3' | 'm4a' | 'mp4'> = normalized === 'audio/wav' || normalized === 'audio/x-wav'
+    ? ['wav']
+    : normalized === 'audio/mpeg' || normalized === 'audio/mp3'
+      ? ['mp3']
+      : normalized === 'video/mp4'
+        ? ['mp4']
+        : normalized === 'audio/mp4' || normalized === 'audio/x-m4a' || normalized === 'audio/m4a'
+          ? ['m4a', 'mp4']
+          : normalized === '' || normalized === 'application/octet-stream'
+            ? ['wav', 'mp3', 'm4a', 'mp4']
+            : []
+  for (const extension of candidates) {
+    const detected = detectAudioSignature(header, extension)
+    if (detected) return { extension, mimeType: detected }
   }
-  return Boolean(allowed[extension]?.includes(normalized))
+  return null
 }
 function safeErrorCode(message: string) {
   return String(message || 'SPEECH_FAILED').replace(/[^A-Z0-9_]/gi, '_').toUpperCase().slice(0, 80)

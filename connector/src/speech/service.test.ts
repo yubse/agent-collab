@@ -3,7 +3,7 @@ import { mkdtempSync, readdirSync, statSync, utimesSync, writeFileSync } from 'f
 import { tmpdir } from 'os'
 import path from 'path'
 import { LocalHelperServer } from '../helper/server.ts'
-import { cleanupSpeechTemps, SpeechGrantStore, SpeechService } from './service.ts'
+import { cleanupSpeechTemps, resolveAudioFormat, SpeechGrantStore, SpeechService } from './service.ts'
 import type { TranscriptionProvider } from './provider.ts'
 import { ModelManager, sha256File } from './model-manager.ts'
 
@@ -17,6 +17,16 @@ function wavBytes(payloadBytes = 1024) {
   const bytes = new Uint8Array(Math.max(44, payloadBytes))
   bytes.set(new TextEncoder().encode('RIFF'), 0)
   bytes.set(new TextEncoder().encode('WAVE'), 8)
+  return bytes
+}
+function ftypBytes() {
+  const bytes = new Uint8Array(32)
+  bytes.set(new TextEncoder().encode('....ftypM4A '), 0)
+  return bytes
+}
+function mp3Bytes() {
+  const bytes = new Uint8Array(32)
+  bytes.set(new TextEncoder().encode('ID3'), 0)
   return bytes
 }
 
@@ -55,6 +65,16 @@ async function upload(base: string, token: string, id: string, body = wavBytes()
 }
 
 describe('M2.2A independent speech service', () => {
+  test('accepts browser MIME aliases and detects format from magic bytes without filename', () => {
+    const wav = wavBytes()
+    expect(resolveAudioFormat(wav, 'audio/wav')).toEqual({ extension: 'wav', mimeType: 'audio/wav' })
+    expect(resolveAudioFormat(wav, '')).toEqual({ extension: 'wav', mimeType: 'audio/wav' })
+    expect(resolveAudioFormat(wav, 'application/octet-stream')).toEqual({ extension: 'wav', mimeType: 'audio/wav' })
+    expect(resolveAudioFormat(wav, 'audio/mp4')).toBeNull()
+    expect(resolveAudioFormat(ftypBytes(), 'audio/x-m4a')).toEqual({ extension: 'm4a', mimeType: 'audio/mp4' })
+    expect(resolveAudioFormat(mp3Bytes(), 'audio/mpeg')).toEqual({ extension: 'mp3', mimeType: 'audio/mpeg' })
+  })
+
   test('starts independently on loopback and reports ready', async () => {
     const { base } = await startService()
     const response = await fetch(`${base}/internal/status`, { headers: { 'X-AIStudio-Speech-Secret': secret } })
