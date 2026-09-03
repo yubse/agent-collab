@@ -12,6 +12,7 @@ export type SenseVoiceProviderOptions = {
   audioPipeline: AudioPipeline
   sampleProcess?: (pid: number) => { rssBytes: number; cpuPercent: number }
   segmentTimeoutMs?: number
+  diagnostic?: (stage: string, fields: Record<string, unknown>) => void
 }
 
 const DEFAULT_SEGMENT_TIMEOUT_MS = 90_000
@@ -88,6 +89,7 @@ export class SenseVoiceProvider implements TranscriptionProvider {
   }
 
   private async runSegment(wavPath: string, modelPath: string, vadPath: string, signal: AbortSignal, onSample: (sample: { rssBytes: number; cpuPercent: number }) => void) {
+      const startedAt = Date.now()
       const child = Bun.spawn([this.options.runtimePath, '-m', modelPath, '-a', wavPath, '--vad', vadPath, '--vad-maxseg', '25000'], {
         stdout: 'pipe', stderr: 'pipe', env: { ...process.env }, detached: true,
       })
@@ -109,6 +111,7 @@ export class SenseVoiceProvider implements TranscriptionProvider {
       try {
         const exitCode = await Promise.race([child.exited, watchdogPromise])
         const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise])
+        this.options.diagnostic?.('sensevoice_process', { exit_code: exitCode, duration_ms: Date.now() - startedAt, segment_basename: path.basename(wavPath), stderr: sanitizeRuntimeError(stderr) })
         if (signal.aborted) throw new SpeechProviderError('SPEECH_CANCELLED')
         if (exitCode !== 0) throw new SpeechProviderError('SPEECH_RUNTIME_FAILED', sanitizeRuntimeError(stderr))
         const transcript = stdout.trim()

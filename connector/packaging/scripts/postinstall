@@ -11,6 +11,13 @@ if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" =
 fi
 
 CONSOLE_UID=$(/usr/bin/id -u "$CONSOLE_USER")
+LOG_DIR="/Users/$CONSOLE_USER/Library/Application Support/AIStudio/logs"
+mkdir -p "$LOG_DIR"
+chown "$CONSOLE_UID" "$LOG_DIR"
+chmod 700 "$LOG_DIR"
+# Resolve the signed-in user's application-support path at install time so
+# launchd can open persistent, user-readable logs before the service starts.
+/usr/bin/sed -i '' "s|__AI_STUDIO_LOG_DIR__|$LOG_DIR|g" "$SPEECH_PLIST"
 run_as_console_user() {
   /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" "$@"
 }

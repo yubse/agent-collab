@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from 'fs'
+import { existsSync, mkdirSync, statSync } from 'fs'
 import { open, unlink } from 'fs/promises'
 import path from 'path'
 import { randomBytes } from 'crypto'
@@ -8,9 +8,10 @@ export const SENSEVOICE_MAX_SEGMENT_MS = 25_000
 export const SENSEVOICE_SEGMENT_OVERLAP_MS = 1_000
 export type PreparedAudioSegment = { wavPath: string; sourceStartMs: number; sourceEndMs: number; durationMs: number }
 export type PreparedAudio = { wavPath: string; durationMs: number; segments: PreparedAudioSegment[]; cleanup: () => Promise<void> }
+export type AudioDiagnostic = (stage: string, fields: Record<string, unknown>) => void
 
 export class AudioPipeline {
-  constructor(private readonly workDir: string, private readonly afconvert = '/usr/bin/afconvert') {
+  constructor(private readonly workDir: string, private readonly afconvert = '/usr/bin/afconvert', private readonly diagnostic?: AudioDiagnostic) {
     mkdirSync(workDir, { recursive: true, mode: 0o700 })
   }
 
@@ -19,10 +20,25 @@ export class AudioPipeline {
     const extension = path.extname(originalName).slice(1).toLowerCase()
     if (!['wav', 'mp3', 'm4a', 'mp4'].includes(extension)) throw new SpeechProviderError('SPEECH_UNSUPPORTED_FORMAT')
     const wavPath = path.join(this.workDir, `${randomBytes(20).toString('hex')}.16k.wav`)
+    const transcodeStartedAt = Date.now()
     const child = Bun.spawn([this.afconvert, '-f', 'WAVE', '-d', 'LEI16@16000', '-c', '1', inputPath, wavPath], { stdout: 'ignore', stderr: 'pipe' })
     const abort = () => child.kill('SIGTERM')
     signal.addEventListener('abort', abort, { once: true })
     const code = await child.exited
+    const stderr = child.stderr ? (await new Response(child.stderr).text()).trim().slice(0, 500) : ''
+    let outputBytes = 0
+    try { outputBytes = statSync(wavPath).size } catch {}
+    let inputBytes = 0
+    try { inputBytes = statSync(inputPath).size } catch {}
+    this.diagnostic?.('afconvert', {
+      exit_code: code,
+      stderr,
+      input_basename: path.basename(inputPath),
+      output_basename: path.basename(wavPath),
+      input_bytes: inputBytes,
+      output_bytes: outputBytes,
+      duration_ms: Date.now() - transcodeStartedAt,
+    })
     signal.removeEventListener('abort', abort)
     if (signal.aborted) { await unlink(wavPath).catch(() => {}); throw new SpeechProviderError('SPEECH_CANCELLED') }
     if (code !== 0) { await unlink(wavPath).catch(() => {}); throw new SpeechProviderError('SPEECH_TRANSCODE_FAILED') }

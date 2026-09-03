@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'crypto'
-import { chmodSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'fs'
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, renameSync } from 'fs'
 import { open, rename, unlink } from 'fs/promises'
 import path from 'path'
 import { detectAudioSignature } from '../../../src/assets/storage.ts'
@@ -7,6 +7,7 @@ import { AudioPipeline } from './audio-pipeline.ts'
 import { ModelManager } from './model-manager.ts'
 import { SpeechProviderError, type TranscriptionProvider, type TranscriptionResult } from './provider.ts'
 import { defaultSenseVoiceRuntime, SenseVoiceProvider } from './sensevoice-provider.ts'
+import { SENSEVOICE_MODEL, SENSEVOICE_RUNTIME } from './runtime-manifest.ts'
 
 export const SPEECH_SERVICE_PORT = 39482
 export const SPEECH_TOKEN_TTL_MS = 3 * 60_000
@@ -78,17 +79,23 @@ export class SpeechService {
   }>()
   private readonly provider: TranscriptionProvider
   readonly tmpDir: string
+  readonly logPath: string
 
   constructor(private readonly options: SpeechServiceOptions) {
     this.grants = new SpeechGrantStore(options.now)
     this.tmpDir = path.join(options.appSupportDir, 'speech', 'tmp')
+    const logDir = path.join(options.appSupportDir, 'logs')
+    mkdirSync(logDir, { recursive: true, mode: 0o700 })
+    this.logPath = path.join(logDir, 'speech-service.log')
+    try { chmodSync(this.logPath, 0o600) } catch {}
     mkdirSync(this.tmpDir, { recursive: true, mode: 0o700 })
     chmodSync(this.tmpDir, 0o700)
     cleanupSpeechTemps(this.tmpDir, options.now?.() || Date.now())
     this.provider = options.provider || new SenseVoiceProvider({
       runtimePath: defaultSenseVoiceRuntime(options.appSupportDir),
       modelManager: new ModelManager(path.join(options.appSupportDir, 'speech', 'models'), options.downloadEnv),
-      audioPipeline: new AudioPipeline(this.tmpDir),
+      audioPipeline: new AudioPipeline(this.tmpDir, '/usr/bin/afconvert', (stage, fields) => this.log(stage, fields)),
+      diagnostic: (stage, fields) => this.log(stage, fields),
     })
   }
 
@@ -97,6 +104,7 @@ export class SpeechService {
     const hostname = this.options.hostname || '127.0.0.1'
     if (hostname !== '127.0.0.1') throw new Error('SPEECH_SERVICE_MUST_BIND_LOOPBACK')
     this.server = Bun.serve({ hostname, port: this.options.port ?? SPEECH_SERVICE_PORT, fetch: (request) => this.handle(request) })
+    this.log('service_ready', { version: process.env.AI_STUDIO_VERSION || 'dev', commit: process.env.AI_STUDIO_COMMIT || 'unknown', runtime_version: SENSEVOICE_RUNTIME.version, model_checksum: SENSEVOICE_MODEL.sha256.slice(0, 12), port: this.port })
   }
 
   get port() { return this.server?.port ?? this.options.port ?? SPEECH_SERVICE_PORT }
@@ -123,6 +131,14 @@ export class SpeechService {
   private internalAuthorized(request: Request) {
     const supplied = request.headers.get('x-aistudio-speech-secret') || ''
     return safeEqual(supplied, this.options.coordinatorSecret)
+  }
+
+  private log(stage: string, fields: Record<string, unknown> = {}) {
+    const line = `[speech] stage=${stage} ${Object.entries(fields).map(([key, value]) => `${key}=${String(value).replace(/[\r\n]/g, ' ').slice(0, 500)}`).join(' ')}\n`
+    try {
+      try { if (statSync(this.logPath).size > 5 * 1024 * 1024) renameSync(this.logPath, `${this.logPath}.1`) } catch {}
+      appendFileSync(this.logPath, line, { mode: 0o600 })
+    } catch {}
   }
 
   private async handle(request: Request): Promise<Response> {
@@ -173,6 +189,8 @@ export class SpeechService {
     const token = (request.headers.get('authorization') || '').match(/^Bearer\s+([A-Za-z0-9_-]{40,100})$/)?.[1] || ''
     const grant = this.grants.consume(token, transcriptionId)
     if (!grant) return Response.json({ ok: false, error: 'SPEECH_TOKEN_INVALID_OR_EXPIRED' }, { status: 401, headers: this.corsHeaders() })
+    this.log('request_received', { transcription_id: transcriptionId, content_type: (request.headers.get('content-type') || '(empty)').split(';')[0].trim().slice(0, 100), received_bytes: Number(request.headers.get('x-aistudio-byte-size') || request.headers.get('content-length') || 0) })
+    const startedAt = Date.now()
     try {
       const result = await this.receiveAudio(request, grant)
       return Response.json({ ok: true, ...result }, { status: 202, headers: this.corsHeaders() })
@@ -180,6 +198,14 @@ export class SpeechService {
       const code = String(error?.message || 'SPEECH_UPLOAD_FAILED')
       const receivedContentType = (request.headers.get('content-type') || '(empty)').split(';')[0].trim().slice(0, 100)
       console.error(`[speech-upload] transcription=${transcriptionId} received_content_type=${receivedContentType} reason=${safeErrorCode(code)}`)
+      this.log('failed', {
+        transcription_id: transcriptionId,
+        stage: safeErrorCode(code),
+        error_name: String(error?.name || 'Error').slice(0, 120),
+        error_message: safeErrorCode(error?.message || code),
+        duration_ms: Date.now() - startedAt,
+        exit_code: Number.isInteger(error?.exit_code) ? error.exit_code : '',
+      })
       const status = code === 'SPEECH_AUDIO_TOO_LARGE' ? 413 : code.includes('FORMAT') ? 415 : code === 'SPEECH_CANCELLED' ? 409 : 500
       return Response.json({ ok: false, error: code }, { status, headers: this.corsHeaders() })
     }
@@ -187,6 +213,8 @@ export class SpeechService {
 
   private async receiveAudio(request: Request, grant: SpeechGrant) {
     if (!request.body) throw new Error('SPEECH_BODY_REQUIRED')
+    let stage = 'temp_write_start'
+    const operationStartedAt = Date.now()
     const totalBytes = Number(request.headers.get('x-aistudio-byte-size') || request.headers.get('content-length') || 0)
     if (!Number.isFinite(totalBytes) || totalBytes <= 0) throw new Error('SPEECH_CONTENT_LENGTH_REQUIRED')
     if (totalBytes > SPEECH_MAX_AUDIO_BYTES) throw new Error('SPEECH_AUDIO_TOO_LARGE')
@@ -196,6 +224,7 @@ export class SpeechService {
     const controller = new AbortController()
     const job = { controller, temporaryPath, processingPath }
     this.jobs.set(grant.transcriptionId, job)
+    this.log('temp_write_start', { transcription_id: grant.transcriptionId })
     this.state = 'busy'
     const handle = await open(temporaryPath, 'wx', 0o600)
     let uploadedBytes = 0
@@ -228,8 +257,11 @@ export class SpeechService {
         }
       }
       if (uploadedBytes !== totalBytes) throw new Error('SPEECH_BYTE_SIZE_MISMATCH')
+      stage = 'magic_check'
       const detected = resolveAudioFormat(header.subarray(0, headerLength), request.headers.get('content-type') || '')
       if (!detected) throw new Error('SPEECH_AUDIO_FORMAT_INVALID')
+      this.log('temp_write_done', { transcription_id: grant.transcriptionId, received_bytes: uploadedBytes })
+      this.log('magic_check', { transcription_id: grant.transcriptionId, magic_type: detected.mimeType })
       // The browser no longer sends the original filename. Use an internal,
       // ASCII-only name derived from verified bytes for the local pipeline.
       const originalName = `recording.${detected.extension}`
@@ -238,14 +270,29 @@ export class SpeechService {
       await rename(temporaryPath, processingPath)
       await this.report(grant, 'processing', 1, uploadedBytes, totalBytes)
       await this.report(grant, 'queued', 1, uploadedBytes, totalBytes)
+      this.log('transcode_start', { transcription_id: grant.transcriptionId })
+      let lastSegment = 0
+      stage = 'transcode_start'
       const result = await this.provider.transcribe({
         inputPath: processingPath, originalName, mimeType: detected.mimeType,
         signal: controller.signal,
-        onStage: async (stage, progress, details) => { await this.report(grant, stage, progress, uploadedBytes, totalBytes, null, undefined, false, details) },
+        onStage: async (stage, progress, details) => {
+          if (stage === 'loading_model') this.log('transcode_done', { transcription_id: grant.transcriptionId })
+          if (stage === 'transcribing' && details?.segment_index && details.segment_index !== lastSegment) {
+            lastSegment = details.segment_index
+            this.log('segment_start', { transcription_id: grant.transcriptionId, segment_index: details.segment_index, segment_count: details.segment_count })
+            this.log('sensevoice_start', { transcription_id: grant.transcriptionId, segment_index: details.segment_index, segment_count: details.segment_count })
+          }
+          await this.report(grant, stage, progress, uploadedBytes, totalBytes, null, undefined, false, details)
+        },
       })
+      stage = 'sensevoice_done'
+      this.log('sensevoice_done', { transcription_id: grant.transcriptionId, duration_ms: result.processing_ms, segment_count: result.metrics?.segment_count })
       if (controller.signal.aborted) throw new Error('SPEECH_CANCELLED')
+      stage = 'result_send'
       await this.report(grant, 'saving', 1, uploadedBytes, totalBytes)
       await this.report(grant, 'completed', 1, uploadedBytes, totalBytes, null, result, true)
+      this.log('result_send', { transcription_id: grant.transcriptionId, received_bytes: uploadedBytes, duration_ms: result.processing_ms })
       await unlink(processingPath).catch(() => {})
       this.jobs.delete(grant.transcriptionId)
       this.state = this.jobs.size ? 'busy' : 'ready'
@@ -258,9 +305,18 @@ export class SpeechService {
       this.state = this.jobs.size ? 'busy' : 'ready'
       const code = error instanceof SpeechProviderError ? error.code : error?.message
       const cancelled = code === 'SPEECH_CANCELLED'
+      this.log('failed', {
+        transcription_id: grant.transcriptionId,
+        stage,
+        error_name: String(error?.name || 'Error').slice(0, 120),
+        error_message: safeErrorCode(code),
+        duration_ms: Date.now() - operationStartedAt,
+        exit_code: Number.isInteger(error?.exit_code) ? error.exit_code : '',
+      })
       await this.report(grant, cancelled ? 'cancelled' : 'failed', 0, uploadedBytes, totalBytes, cancelled ? null : safeErrorCode(code))
       throw new Error(cancelled ? 'SPEECH_CANCELLED' : safeErrorCode(code))
     } finally {
+      this.log('cleanup', { transcription_id: grant.transcriptionId })
       reader.releaseLock()
     }
   }

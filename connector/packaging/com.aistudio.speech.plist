@@ -11,5 +11,7 @@
   <!-- Transcription is explicitly user initiated and CPU intensive. Background
        QoS can throttle each SenseVoice segment by tens of seconds. -->
   <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>__AI_STUDIO_LOG_DIR__/speech-service.stdout.log</string>
+  <key>StandardErrorPath</key><string>__AI_STUDIO_LOG_DIR__/speech-service.stderr.log</string>
 </dict>
 </plist>

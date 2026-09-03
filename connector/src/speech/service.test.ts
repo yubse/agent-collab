@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readdirSync, statSync, utimesSync, writeFileSync } from 'fs'
+import { mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import path from 'path'
 import { LocalHelperServer } from '../helper/server.ts'
@@ -157,6 +157,22 @@ describe('M2.2A independent speech service', () => {
     const response = await upload(base, grant.speech_token, 'tr_test_123456', new TextEncoder().encode('not wav'))
     expect(response.status).toBe(415)
     expect(readdirSync(service.tmpDir)).toEqual([])
+  })
+
+  test('persists redacted stage diagnostics without tokens or audio text', async () => {
+    const { base, service } = await startService()
+    const grant = await issue(base, 'tr_log_test_123456')
+    const response = await upload(base, grant.speech_token, 'tr_log_test_123456', new TextEncoder().encode('not wav'))
+    expect(response.status).toBe(415)
+    const log = readFileSync(service.logPath, 'utf8')
+    expect(log).toContain('stage=request_received')
+    expect(log).toContain('stage=temp_write_start')
+    expect(log).toContain('stage=cleanup')
+    expect(log).toContain('stage=failed')
+    expect(log).toContain('transcription_id=tr_log_test_123456')
+    expect(log).not.toContain(grant.speech_token)
+    expect(log).not.toContain('not wav')
+    expect(statSync(service.logPath).mode & 0o777).toBe(0o600)
   })
 
   test('cancel aborts only the active transcription and removes its temp file', async () => {
