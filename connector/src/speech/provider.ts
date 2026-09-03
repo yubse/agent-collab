@@ -3,6 +3,9 @@ export type TranscriptionChunk = {
   start_ms: number | null
   end_ms: number | null
   speaker: null
+  source_start_ms?: number
+  source_end_ms?: number
+  processing_ms?: number
 }
 
 export type TranscriptionResult = {
@@ -14,7 +17,7 @@ export type TranscriptionResult = {
   runtime_version: string
   model_version: string
   processing_ms: number
-  metrics?: { peak_memory_bytes: number; average_cpu_percent: number; cold_start_ms: number }
+  metrics?: { peak_memory_bytes: number; average_cpu_percent: number; cold_start_ms: number; model_load_count?: number; segment_count?: number }
 }
 
 export type TranscriptionRequest = {
@@ -24,7 +27,12 @@ export type TranscriptionRequest = {
   signal: AbortSignal
   language?: string
   hotwords?: string[]
-  onStage?: (stage: 'transcoding' | 'loading_model' | 'transcribing', progress: number) => Promise<void> | void
+  onStage?: (stage: 'transcoding' | 'loading_model' | 'transcribing', progress: number, details?: {
+    processed_audio_ms: number
+    total_audio_ms: number
+    segment_index: number
+    segment_count: number
+  }) => Promise<void> | void
 }
 
 export interface TranscriptionProvider {

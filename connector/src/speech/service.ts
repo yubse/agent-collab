@@ -235,7 +235,7 @@ export class SpeechService {
       const result = await this.provider.transcribe({
         inputPath: processingPath, originalName, mimeType: request.headers.get('content-type') || '',
         signal: controller.signal,
-        onStage: async (stage, progress) => { await this.report(grant, stage, progress, uploadedBytes, totalBytes) },
+        onStage: async (stage, progress, details) => { await this.report(grant, stage, progress, uploadedBytes, totalBytes, null, undefined, false, details) },
       })
       if (controller.signal.aborted) throw new Error('SPEECH_CANCELLED')
       await this.report(grant, 'saving', 1, uploadedBytes, totalBytes)
@@ -270,8 +270,8 @@ export class SpeechService {
     }
   }
 
-  private async report(grant: SpeechGrant, status: string, progress: number, uploadedBytes: number, totalBytes: number, errorCode: string | null = null, result?: TranscriptionResult, required = false) {
-    const body = { transcription_id: grant.transcriptionId, user_id: grant.userId, device_id: grant.deviceId, status, progress, uploaded_bytes: uploadedBytes, total_bytes: totalBytes, error_code: errorCode, ...(result ? { result } : {}) }
+  private async report(grant: SpeechGrant, status: string, progress: number, uploadedBytes: number, totalBytes: number, errorCode: string | null = null, result?: TranscriptionResult, required = false, details?: Record<string, number>) {
+    const body = { transcription_id: grant.transcriptionId, user_id: grant.userId, device_id: grant.deviceId, status, progress, uploaded_bytes: uploadedBytes, total_bytes: totalBytes, error_code: errorCode, ...(details || {}), ...(result ? { result } : {}) }
     try {
       if (this.options.reportProgress) {
         const ok = await this.options.reportProgress(body)
@@ -296,7 +296,7 @@ export function cleanupSpeechTemps(tmpDir: string, now = Date.now(), maxAgeMs = 
   mkdirSync(tmpDir, { recursive: true, mode: 0o700 })
   let removed = 0
   for (const name of readdirSync(tmpDir)) {
-    if (!name.endsWith('.uploading') && !name.endsWith('.processing') && !name.endsWith('.16k.wav')) continue
+    if (!name.endsWith('.uploading') && !name.endsWith('.processing') && !name.endsWith('.16k.wav') && !name.endsWith('.segment.wav')) continue
     const target = path.join(tmpDir, name)
     try {
       if (now - statSync(target).mtimeMs <= maxAgeMs) continue

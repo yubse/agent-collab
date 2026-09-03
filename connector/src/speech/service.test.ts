@@ -27,7 +27,7 @@ async function startService(reportProgress: (body: Record<string, unknown>) => P
     async transcribe(request) {
       await request.onStage?.('transcoding', 0.05)
       await request.onStage?.('loading_model', 0.15)
-      await request.onStage?.('transcribing', 0.25)
+      await request.onStage?.('transcribing', 0.25, { processed_audio_ms: 500, total_audio_ms: 1000, segment_index: 1, segment_count: 2 })
       if (request.signal.aborted) throw new Error('SPEECH_CANCELLED')
       return { transcript: '测试转写', chunks: [{ text: '测试转写', start_ms: null, end_ms: null, speaker: null }], duration_ms: 1000, language: 'zh', provider: 'sensevoice', runtime_version: 'test', model_version: 'test', processing_ms: 1 }
     },
@@ -98,12 +98,14 @@ describe('M2.2A independent speech service', () => {
 
   test('reports queued, saving and completed in order and requires NAS persistence', async () => {
     const stages: string[] = []
-    const { base } = await startService(async (body) => { stages.push(String(body.status)); return true })
+    const reports: Record<string, unknown>[] = []
+    const { base } = await startService(async (body) => { stages.push(String(body.status)); reports.push(body); return true })
     const grant = await issue(base)
     expect((await upload(base, grant.speech_token, 'tr_test_123456')).status).toBe(202)
     expect(stages.indexOf('queued')).toBeGreaterThan(stages.indexOf('processing'))
     expect(stages.indexOf('saving')).toBeGreaterThan(stages.indexOf('transcribing'))
     expect(stages.at(-1)).toBe('completed')
+    expect(reports.find((item) => item.status === 'transcribing')).toMatchObject({ processed_audio_ms: 500, total_audio_ms: 1000, segment_index: 1, segment_count: 2 })
   })
 
   test('does not claim completed when NAS rejects transcript persistence', async () => {
