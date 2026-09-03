@@ -37,19 +37,31 @@
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ transcription_id: transcriptionId, session_proof: proof.session_proof }),
     }).then(json);
+    console.info(`[speech-upload] transcription=${transcriptionId} stage=speech_grant_ready`);
     // Keep the browser's File as a ReadableStream; never materialize the recording
     // as an in-memory buffer and never send its bytes to the NAS origin.
-    const response = await fetch(`${grant.speech_url}/transcriptions/${encodeURIComponent(transcriptionId)}/audio`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${grant.speech_token}`,
-        'Content-Type': file.type || 'application/octet-stream',
-        'X-AIStudio-Original-Name': file.name,
-        'X-AIStudio-Byte-Size': String(file.size),
-      },
-      body: file.stream(),
-      duplex: 'half',
-    });
+    const speechUrl = `${grant.speech_url}/transcriptions/${encodeURIComponent(transcriptionId)}/audio`;
+    console.info(`[speech-upload] transcription=${transcriptionId} stage=speech_fetch_start`);
+    let response;
+    try {
+      response = await fetch(speechUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${grant.speech_token}`,
+          'Content-Type': file.type || 'application/octet-stream',
+          'X-AIStudio-Original-Name': file.name,
+          'X-AIStudio-Byte-Size': String(file.size),
+        },
+        body: file.stream(),
+        duplex: 'half',
+      });
+    } catch (error) {
+      const name = error instanceof Error ? error.name : 'UnknownError';
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[speech-upload] transcription=${transcriptionId} stage=speech_fetch_throw error_name=${name} error_message=${message}`);
+      throw error;
+    }
+    console.info(`[speech-upload] transcription=${transcriptionId} stage=speech_fetch_response status=${response.status}`);
     await json(response);
     return transcriptionId;
   }

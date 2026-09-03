@@ -3765,6 +3765,10 @@ Bun.serve<ConnectorSocketData>({
     }
 
     if (req.method === 'GET' && url.pathname === '/api/transcriptions/stream' && currentUser) {
+      // Bun's default HTTP idle timeout is short enough to terminate an SSE
+      // connection before the next heartbeat. Disable it for this request
+      // only; ordinary API requests retain the server default.
+      server.timeout(req, 0)
       const streamId = `stream_${randomBytes(8).toString('hex')}`
       const openedAt = Date.now()
       let subscriber: { streamId: string; userId: string; controller: ReadableStreamDefaultController<Uint8Array>; openedAt: number; eventCount: number; closed: boolean } | null = null

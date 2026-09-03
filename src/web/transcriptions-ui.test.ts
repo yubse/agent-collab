@@ -11,7 +11,18 @@ describe('M2.3 meeting transcription UI', () => {
     expect(html).toContain('原始录音仅在当前电脑本地处理，不会上传服务器')
     expect(html).toContain('.wav,.mp3,.m4a,.mp4')
     expect(upload).toContain('body: file.stream()')
+    expect(upload).toContain("duplex: 'half'")
+    expect(upload).toContain('stage=speech_grant_ready')
+    expect(upload).toContain('stage=speech_fetch_start')
+    expect(upload).toContain('stage=speech_fetch_response')
+    expect(upload).toContain('stage=speech_fetch_throw')
     expect(upload).not.toContain("fetch('/upload")
+  })
+
+  test('keeps SSE alive beyond Bun idle timeout without coupling upload failure to cancel', async () => {
+    const server = await Bun.file(path.join(root, '../server.ts')).text()
+    expect(server).toContain('server.timeout(req, 0)')
+    expect(page).not.toContain('events.onerror=async()=>window.AIStudioSpeech.cancel')
   })
 
   test('shows first model installation and automatically resumes the pending job', () => {
