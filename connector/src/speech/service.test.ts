@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import path from 'path'
 import { LocalHelperServer } from '../helper/server.ts'
@@ -206,6 +206,21 @@ describe('M2.2A independent speech service', () => {
     utimesSync(path.join(dir, 'old.uploading'), new Date(0), new Date(0))
     expect(cleanupSpeechTemps(dir, Date.now(), 1_000)).toBe(1)
     expect(readdirSync(dir).sort()).toEqual(['current.processing', 'keep.txt'])
+  })
+
+  test('service startup removes interrupted segment artifacts but preserves models and logs', async () => {
+    const appSupportDir = mkdtempSync(path.join(tmpdir(), 'speech-startup-clean-'))
+    const tempDir = path.join(appSupportDir, 'speech', 'tmp')
+    mkdirSync(tempDir, { recursive: true })
+    writeFileSync(path.join(tempDir, 'orphan.segment.wav'), 'audio')
+    const { service } = await (async () => {
+      const provider: TranscriptionProvider = { name: 'sensevoice', async transcribe() { return { transcript: 'ok', chunks: [], duration_ms: 1, language: 'zh', provider: 'sensevoice', runtime_version: 'test', model_version: 'test', processing_ms: 1 } } }
+      const instance = new SpeechService({ appSupportDir, allowedOrigin: origin, coordinatorSecret: secret, port: 0, provider })
+      instance.start(); services.push(instance)
+      return { service: instance }
+    })()
+    expect(readdirSync(service.tmpDir)).toEqual([])
+    expect(statSync(service.logPath).isFile()).toBe(true)
   })
 
   test('speech process failure does not stop Helper local API', async () => {

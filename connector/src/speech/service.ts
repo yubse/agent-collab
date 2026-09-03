@@ -90,7 +90,9 @@ export class SpeechService {
     try { chmodSync(this.logPath, 0o600) } catch {}
     mkdirSync(this.tmpDir, { recursive: true, mode: 0o700 })
     chmodSync(this.tmpDir, 0o700)
-    cleanupSpeechTemps(this.tmpDir, options.now?.() || Date.now())
+    // No jobs can exist before the service has started, so remove all stale
+    // task artifacts (including segment files from an interrupted process).
+    cleanupSpeechTemps(this.tmpDir, options.now?.() || Date.now(), 0)
     this.provider = options.provider || new SenseVoiceProvider({
       runtimePath: defaultSenseVoiceRuntime(options.appSupportDir),
       modelManager: new ModelManager(path.join(options.appSupportDir, 'speech', 'models'), options.downloadEnv),
@@ -388,7 +390,7 @@ export function cleanupSpeechTemps(tmpDir: string, now = Date.now(), maxAgeMs = 
     if (!name.endsWith('.uploading') && !name.endsWith('.processing') && !name.endsWith('.16k.wav') && !name.endsWith('.segment.wav')) continue
     const target = path.join(tmpDir, name)
     try {
-      if (now - statSync(target).mtimeMs <= maxAgeMs) continue
+      if (maxAgeMs > 0 && now - statSync(target).mtimeMs <= maxAgeMs) continue
       unlinkSync(target)
       removed++
     } catch {}
