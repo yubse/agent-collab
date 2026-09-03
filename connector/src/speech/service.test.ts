@@ -189,10 +189,11 @@ describe('M2.2A independent speech service', () => {
   })
 })
 
-describe('M2.2A browser streaming source', () => {
-  test('uses File.stream and never file.arrayBuffer', async () => {
+describe('M2.2A browser upload source', () => {
+  test('uses the File body for HTTP/1.x and never file.arrayBuffer', async () => {
     const source = await Bun.file(path.join(import.meta.dir, '../../../web/workgroup-v2/speech-upload.js')).text()
-    expect(source).toContain('body: file.stream()')
+    expect(source).toContain('body: file,')
+    expect(source).not.toContain('duplex:')
     expect(source).not.toContain('file.arrayBuffer(')
     expect(source).not.toContain('/upload')
   })

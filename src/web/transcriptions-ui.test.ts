@@ -10,8 +10,8 @@ describe('M2.3 meeting transcription UI', () => {
   test('keeps the recording local and supports the four real formats', () => {
     expect(html).toContain('原始录音仅在当前电脑本地处理，不会上传服务器')
     expect(html).toContain('.wav,.mp3,.m4a,.mp4')
-    expect(upload).toContain('body: file.stream()')
-    expect(upload).toContain("duplex: 'half'")
+    expect(upload).toContain('body: file,')
+    expect(upload).not.toContain('duplex:')
     expect(upload).toContain('stage=speech_grant_ready')
     expect(upload).toContain('stage=speech_fetch_start')
     expect(upload).toContain('stage=speech_fetch_response')

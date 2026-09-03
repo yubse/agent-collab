@@ -51,8 +51,9 @@
           'Content-Type': file.type || 'application/octet-stream',
           'X-AIStudio-Byte-Size': String(file.size),
         },
-        body: file.stream(),
-        duplex: 'half',
+        // Send the File directly so Chrome uses a regular Content-Length
+        // request compatible with the local HTTP/1.x Speech Service.
+        body: file,
       });
     } catch (error) {
       const name = error instanceof Error ? error.name : 'UnknownError';
