@@ -24,6 +24,10 @@ describe('M2.3 meeting transcription UI', () => {
     expect(page).toContain("api('/api/transcriptions')")
     expect(page).toContain("new EventSource('/api/transcriptions/stream')")
     expect(page).not.toContain('onmessage=async e=>{await start')
+    expect(page).toContain('processed_audio_ms')
+    expect(page).toContain('total_audio_ms')
+    expect(page).toContain('Object.assign(row,u)')
+    expect(page).not.toContain("t.status==='completed'?'100%':'35%'")
   })
 
   test('supports copy, delete and explicit local-file retry after refresh', () => {

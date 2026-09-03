@@ -760,6 +760,10 @@ function publishTranscriptionUpdate(record: any) {
     status: record.status,
     progress: record.progress,
     uploaded_bytes: record.uploaded_bytes,
+    ...(Number.isFinite(record.processed_audio_ms) ? { processed_audio_ms: record.processed_audio_ms } : {}),
+    ...(Number.isFinite(record.total_audio_ms) ? { total_audio_ms: record.total_audio_ms } : {}),
+    ...(Number.isFinite(record.segment_index) ? { segment_index: record.segment_index } : {}),
+    ...(Number.isFinite(record.segment_count) ? { segment_count: record.segment_count } : {}),
     error_code: record.error_code,
     updated_at: record.updated_at,
   }
@@ -3985,7 +3989,17 @@ Bun.serve<ConnectorSocketData>({
         ])
       }
       const updated = db.prepare(`SELECT t.*, EXISTS(SELECT 1 FROM meeting_transcripts mt WHERE mt.transcription_id=t.id) AS has_transcript FROM transcriptions t WHERE t.id=?`).get(id) as any
-      publishTranscriptionUpdate(updated)
+      const totalAudioMs = Math.max(0, Math.round(Number(body.total_audio_ms) || 0))
+      const processedAudioMs = Math.min(totalAudioMs, Math.max(0, Math.round(Number(body.processed_audio_ms) || 0)))
+      publishTranscriptionUpdate({
+        ...updated,
+        ...(totalAudioMs > 0 ? {
+          processed_audio_ms: processedAudioMs,
+          total_audio_ms: totalAudioMs,
+          segment_index: Math.max(1, Math.round(Number(body.segment_index) || 1)),
+          segment_count: Math.max(1, Math.round(Number(body.segment_count) || 1)),
+        } : {}),
+      })
       return Response.json({ ok: true, transcription: transcriptionPayload(updated) })
     }
 
