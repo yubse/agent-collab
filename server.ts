@@ -681,7 +681,7 @@ type BrowserExecutionSubscriber = {
   controller: ReadableStreamDefaultController<Uint8Array>
 }
 const browserExecutionSubscribers = new Map<string, Set<BrowserExecutionSubscriber>>()
-const transcriptionSubscribers = new Set<{ userId: string; controller: ReadableStreamDefaultController<Uint8Array> }>()
+const transcriptionSubscribers = new Set<{ streamId: string; userId: string; controller: ReadableStreamDefaultController<Uint8Array>; openedAt: number; eventCount: number; closed: boolean }>()
 const presenceStore = new PresenceStore()
 let browserExecutionSequence = 0
 const streamEncoder = new TextEncoder()
@@ -780,7 +780,7 @@ function publishTranscriptionUpdate(record: any) {
   for (const subscriber of [...transcriptionSubscribers]) {
     const visible = record.channel_id ? canReadChannel(db, record.channel_id, subscriber.userId) : subscriber.userId === record.owner_user_id
     if (!visible) continue
-    try { subscriber.controller.enqueue(frame) } catch { transcriptionSubscribers.delete(subscriber) }
+      try { subscriber.controller.enqueue(frame); subscriber.eventCount++ } catch { transcriptionSubscribers.delete(subscriber) }
   }
 }
 
@@ -3765,24 +3765,39 @@ Bun.serve<ConnectorSocketData>({
     }
 
     if (req.method === 'GET' && url.pathname === '/api/transcriptions/stream' && currentUser) {
-      let subscriber: { userId: string; controller: ReadableStreamDefaultController<Uint8Array> } | null = null
+      const streamId = `stream_${randomBytes(8).toString('hex')}`
+      const openedAt = Date.now()
+      let subscriber: { streamId: string; userId: string; controller: ReadableStreamDefaultController<Uint8Array>; openedAt: number; eventCount: number; closed: boolean } | null = null
       let heartbeat: ReturnType<typeof setInterval> | null = null
-      const cleanup = () => {
-        if (subscriber) transcriptionSubscribers.delete(subscriber)
+      let closeReason = 'unknown'
+      const abortHandler = () => cleanup('client_abort')
+      const cleanup = (reason = 'abort') => {
+        if (subscriber?.closed) return
+        closeReason = reason
+        if (subscriber) {
+          subscriber.closed = true
+          transcriptionSubscribers.delete(subscriber)
+          console.error(`[transcription-sse] stream=${streamId} user=${safeConnectorTraceId(currentUser!.id)} event_count=${subscriber.eventCount} duration_ms=${Date.now() - openedAt} close_reason=${closeReason}`)
+        }
         if (heartbeat) clearInterval(heartbeat)
-        req.signal.removeEventListener('abort', cleanup)
+        req.signal.removeEventListener('abort', abortHandler)
       }
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
-          subscriber = { userId: currentUser!.id, controller }
+          subscriber = { streamId, userId: currentUser!.id, controller, openedAt, eventCount: 0, closed: false }
           transcriptionSubscribers.add(subscriber)
-          controller.enqueue(streamEncoder.encode(': connected\n\n'))
-          heartbeat = setInterval(() => { try { controller.enqueue(streamEncoder.encode(': heartbeat\n\n')) } catch { cleanup() } }, 15_000)
-          req.signal.addEventListener('abort', cleanup, { once: true })
+          console.error(`[transcription-sse] stream=${streamId} user=${safeConnectorTraceId(currentUser!.id)} state=stream_open`)
+          try { controller.enqueue(streamEncoder.encode(': connected\n\n')); subscriber.eventCount++ } catch { cleanup('stream_error'); return }
+          heartbeat = setInterval(() => {
+            if (subscriber?.closed) return
+            try { controller.enqueue(streamEncoder.encode(': ping\n\n')); subscriber.eventCount++; console.error(`[transcription-sse] stream=${streamId} state=heartbeat`) }
+            catch { cleanup('stream_error') }
+          }, 15_000)
+          req.signal.addEventListener('abort', abortHandler, { once: true })
         },
-        cancel: cleanup,
+        cancel: () => cleanup('stream_close'),
       })
-      return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-store', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' } })
+      return new Response(stream, { headers: { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', 'Connection': 'keep-alive', 'Content-Encoding': 'identity', 'X-Accel-Buffering': 'no' } })
     }
 
     if (req.method === 'GET' && url.pathname === '/api/transcriptions' && currentUser) {
@@ -4008,7 +4023,8 @@ Bun.serve<ConnectorSocketData>({
       const id = decodeURIComponent(cancelTranscriptionMatch[1])
       const transcription = db.prepare(`SELECT * FROM transcriptions WHERE id=? AND owner_user_id=?`).get(id, currentUser.id) as any
       if (!transcription) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
-      if (['completed', 'failed', 'cancelled'].includes(transcription.status)) return Response.json({ ok: false, error: 'transcription is not active' }, { status: 409 })
+      if (['completed', 'failed'].includes(transcription.status)) return Response.json({ ok: false, error: 'transcription is not active' }, { status: 409 })
+      if (transcription.status === 'cancelled') return Response.json({ ok: true, already_cancelled: true, transcription: transcriptionPayload(transcription), helper_url: 'http://127.0.0.1:39481' })
       const now = groupNowIso()
       db.run(`UPDATE transcriptions SET status='cancelled', error_code=NULL, updated_at=? WHERE id=?`, [now, id])
       const updated = db.prepare(`SELECT * FROM transcriptions WHERE id=?`).get(id) as any

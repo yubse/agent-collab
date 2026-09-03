@@ -28,6 +28,8 @@ describe('M2.3 meeting transcription UI', () => {
     expect(page).toContain('total_audio_ms')
     expect(page).toContain('Object.assign(row,u)')
     expect(page).not.toContain("t.status==='completed'?'100%':'35%'")
+    expect(page).toContain("events.onerror=()=>{streamRetrying=true")
+    expect(page).not.toContain('events.onerror=async()=>window.AIStudioSpeech.cancel')
   })
 
   test('supports copy, delete and explicit local-file retry after refresh', () => {
