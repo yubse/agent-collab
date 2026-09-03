@@ -72,6 +72,7 @@ export class SpeechService {
   private state: 'ready' | 'busy' | 'error' = 'ready'
   private readonly grants: SpeechGrantStore
   private readonly jobs = new Map<string, ActiveJob>()
+  private readonly pendingProgress = new Map<string, Set<Promise<boolean>>>()
   private readonly provider: TranscriptionProvider
   readonly tmpDir: string
 
@@ -272,7 +273,8 @@ export class SpeechService {
 
   private async report(grant: SpeechGrant, status: string, progress: number, uploadedBytes: number, totalBytes: number, errorCode: string | null = null, result?: TranscriptionResult, required = false, details?: Record<string, number>) {
     const body = { transcription_id: grant.transcriptionId, user_id: grant.userId, device_id: grant.deviceId, status, progress, uploaded_bytes: uploadedBytes, total_bytes: totalBytes, error_code: errorCode, ...(details || {}), ...(result ? { result } : {}) }
-    try {
+    const transmit = async () => {
+      try {
       if (this.options.reportProgress) {
         const ok = await this.options.reportProgress(body)
         if (!ok && required) throw new Error('SPEECH_RESULT_SAVE_FAILED')
@@ -285,10 +287,25 @@ export class SpeechService {
       })
       if (!response.ok && required) throw new Error('SPEECH_RESULT_SAVE_FAILED')
       return response.ok
-    } catch (error) {
-      if (required) throw error
-      return false
+      } catch (error) {
+        if (required) throw error
+        return false
+      }
     }
+    if (!required) {
+      const pending = this.pendingProgress.get(grant.transcriptionId) || new Set<Promise<boolean>>()
+      this.pendingProgress.set(grant.transcriptionId, pending)
+      const task = transmit()
+      pending.add(task)
+      void task.finally(() => {
+        pending.delete(task)
+        if (!pending.size) this.pendingProgress.delete(grant.transcriptionId)
+      })
+      return true
+    }
+    const pending = this.pendingProgress.get(grant.transcriptionId)
+    if (pending?.size) await Promise.allSettled([...pending])
+    return transmit()
   }
 }
 

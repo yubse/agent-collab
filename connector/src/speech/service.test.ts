@@ -108,6 +108,20 @@ describe('M2.2A independent speech service', () => {
     expect(reports.find((item) => item.status === 'transcribing')).toMatchObject({ processed_audio_ms: 500, total_audio_ms: 1000, segment_index: 1, segment_count: 2 })
   })
 
+  test('slow NAS progress reporting does not serially block local inference', async () => {
+    const stages: string[] = []
+    const started = Date.now()
+    const { base } = await startService(async (body) => {
+      await Bun.sleep(40)
+      stages.push(String(body.status))
+      return true
+    })
+    const grant = await issue(base, 'tr_slow_progress_123456')
+    expect((await upload(base, grant.speech_token, 'tr_slow_progress_123456')).status).toBe(202)
+    expect(Date.now() - started).toBeLessThan(180)
+    expect(stages.at(-1)).toBe('completed')
+  })
+
   test('does not claim completed when NAS rejects transcript persistence', async () => {
     const { base, service } = await startService(async (body) => body.status !== 'completed')
     const grant = await issue(base)
