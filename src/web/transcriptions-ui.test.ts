@@ -60,4 +60,13 @@ describe('M2.3 meeting transcription UI', () => {
     expect(page).not.toContain('binary path')
     expect(page).not.toContain('stack trace')
   })
+
+  test('exposes independent meeting minutes generation and version history', () => {
+    expect(html).toContain('生成会议纪要')
+    expect(html).toContain('会议纪要')
+    expect(page).toContain('/minutes`')
+    expect(page).toContain('正在整理会议纪要')
+    expect(page).toContain('历史版本会保留')
+    expect(page).toContain('markdown(')
+  })
 })

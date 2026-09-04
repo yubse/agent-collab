@@ -4,6 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>会议转写 · AI Studio</title>
   <link rel="stylesheet" href="/web/transcriptions/transcriptions.css">
+  <link rel="stylesheet" href="/web/transcriptions/minutes.css">
   <style>.bar.busy i{animation:speech-busy 1.2s ease-in-out infinite}@keyframes speech-busy{0%{transform:translateX(-120%)}100%{transform:translateX(320%)}}</style>
 </head>
 <body>
@@ -35,6 +36,11 @@
       <article class="detail hidden" id="detail">
         <div class="detail-head"><div><h1 id="detailTitle"></h1><p id="detailMeta"></p></div><div class="actions"><button id="copyBtn">复制全文</button><button id="retryBtn">重新转写</button><button class="danger" id="deleteBtn">删除</button></div></div>
         <pre id="transcriptText"></pre>
+        <section class="minutes-panel" id="minutesPanel">
+          <div class="minutes-head"><h2>会议纪要</h2><button class="primary" id="generateMinutesBtn">生成会议纪要</button></div>
+          <p class="muted" id="minutesState">仅基于已完成的转写文字生成，不读取原始录音。</p>
+          <div id="minutesHistory"></div>
+        </section>
       </article>
       <div class="notice hidden" id="notice"></div>
     </section>

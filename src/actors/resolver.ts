@@ -1,5 +1,6 @@
 import type { Database } from 'bun:sqlite'
 import { CREATIVE_AGENT_BY_ID, type CreativeAgentId } from '../creative-discussion.ts'
+import { MEETING_MINUTES_AGENT, MEETING_MINUTES_AGENT_ID } from '../meeting-minutes.ts'
 
 export type ActorType = 'human' | 'agent' | 'system'
 
@@ -16,13 +17,16 @@ export function resolveActor(db: Database, type: ActorType, id: string): Resolve
     return user ? { type, id: String(user.id), display_name: String(user.display_name) } : null
   }
   const agent = CREATIVE_AGENT_BY_ID.get(id as CreativeAgentId)
-  return agent ? { type, id: agent.id, display_name: agent.displayName } : null
+  if (agent) return { type, id: agent.id, display_name: agent.displayName }
+  return id === MEETING_MINUTES_AGENT_ID
+    ? { type, id: MEETING_MINUTES_AGENT_ID, display_name: MEETING_MINUTES_AGENT.displayName }
+    : null
 }
 
 export function actorForNewMessage(senderId: string, authenticatedUserId: string): Pick<ResolvedActor, 'type' | 'id'> | null {
   if (senderId === 'system') return { type: 'system', id: 'system' }
   if (senderId === 'admin') return { type: 'human', id: authenticatedUserId }
-  if (CREATIVE_AGENT_BY_ID.has(senderId as CreativeAgentId)) return { type: 'agent', id: senderId }
+  if (CREATIVE_AGENT_BY_ID.has(senderId as CreativeAgentId) || senderId === MEETING_MINUTES_AGENT_ID) return { type: 'agent', id: senderId }
   return null
 }
 
@@ -38,4 +42,3 @@ export function resolvedActorForMessage(db: Database, message: {
   const fallback = actorForNewMessage(message.sender_id, message.user_id)
   return fallback ? resolveActor(db, fallback.type, fallback.id) : null
 }
-

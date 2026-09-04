@@ -72,6 +72,7 @@ import {
 } from './src/channels/access.ts'
 import { actorForNewMessage, resolveActor, resolvedActorForMessage, type ActorType, type ResolvedActor } from './src/actors/resolver.ts'
 import { PresenceStore, type AgentPresenceStatus, type PresenceUpdate } from './src/presence/store.ts'
+import { buildMeetingMinutesPrompt, MEETING_MINUTES_AGENT, MEETING_MINUTES_AGENT_ID, splitTranscript } from './src/meeting-minutes.ts'
 import {
   CREATIVE_AGENTS,
   CREATIVE_AGENT_BY_ID,
@@ -625,6 +626,7 @@ type AgentRuntimeConfig = {
 }
 const AGENT_RUNTIMES: Record<string, AgentRuntimeConfig> = {
   ...ROLE_AGENT_CONFIGS,
+  [MEETING_MINUTES_AGENT_ID]: loadAgentRuntimeEnv('MEETING_MINUTES'),
 }
 const AGENT_PROVIDERS = new Map<string, AgentProvider>()
 // Provider events do not carry the workgroup conversation/observe intent that caused
@@ -3860,6 +3862,47 @@ Bun.serve<ConnectorSocketData>({
       if (!transcriptionForUser(id, currentUser.id)) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
       const transcript = db.prepare(`SELECT * FROM meeting_transcripts WHERE transcription_id=?`).get(id)
       return transcript ? Response.json({ ok: true, transcript: meetingTranscriptPayload(transcript) }) : Response.json({ ok: false, error: 'not found' }, { status: 404 })
+    }
+
+    const minutesMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)\/minutes(?:\/(retry))?$/)
+    if (minutesMatch && currentUser && (req.method === 'GET' || req.method === 'POST')) {
+      const transcriptionId = decodeURIComponent(minutesMatch[1])
+      const transcription = db.prepare(`SELECT * FROM transcriptions WHERE id=?`).get(transcriptionId) as any
+      if (!transcription || !transcriptionForUser(transcriptionId, currentUser.id)) return Response.json({ ok: false, error: 'not found' }, { status: 404 })
+      if (req.method === 'GET') {
+        // Channel members share the transcript and all generated versions; private
+        // transcripts are already restricted by transcriptionForUser above.
+        const rows = db.prepare(`SELECT * FROM meeting_minutes WHERE transcription_id=? ORDER BY created_at DESC`).all(transcriptionId)
+        return Response.json({ ok: true, minutes: rows })
+      }
+      if (transcription.status !== 'completed') return Response.json({ ok: false, error: 'TRANSCRIPT_NOT_COMPLETED' }, { status: 409 })
+      const transcript = db.prepare(`SELECT * FROM meeting_transcripts WHERE transcription_id=?`).get(transcriptionId) as any
+      if (!transcript?.transcript) return Response.json({ ok: false, error: 'TRANSCRIPT_NOT_FOUND' }, { status: 404 })
+      const id = `mm_${randomBytes(20).toString('hex')}`
+      const now = groupNowIso()
+      db.run(`INSERT INTO meeting_minutes (id, transcription_id, user_id, status, model, provider, created_at, updated_at) VALUES (?, ?, ?, 'processing', ?, 'remote-codex', ?, ?)`, [id, transcriptionId, currentUser.id, MEETING_MINUTES_AGENT.model, now, now])
+      const body = await readOptionalJsonObject(req)
+      const title = typeof body.title === 'string' ? body.title.trim().slice(0, 200) : transcription.title
+      const chunks = splitTranscript(String(transcript.transcript))
+      const conversationId = transcription.channel_id || ensureUserDefaultConversation(currentUser).id
+      const runPrompt = (prompt: string) => new Promise<string>((resolve, reject) => {
+        const provider = new RemoteCodexProvider(connectorDispatcher, connectorRegistry, { userId: currentUser!.id, conversationId, agentId: MEETING_MINUTES_AGENT_ID })
+        let output = ''
+        provider.onEvent((event) => { if (event.type === 'assistant') output = event.text; else if (event.type === 'delta') output += event.text; if (event.type === 'result') resolve(output.trim()) })
+        provider.onError((error) => reject(new Error(error.message)))
+        provider.send(prompt).catch(reject)
+      })
+      void (async () => {
+        try {
+          const evidence: string[] = []
+          for (let index = 0; index < chunks.length; index++) evidence.push(await runPrompt(buildMeetingMinutesPrompt({ title, originalName: transcription.original_name, durationMs: transcription.duration_ms, transcript: chunks[index], chunkIndex: index + 1, chunkCount: chunks.length })))
+          const content = chunks.length === 1 ? evidence[0] : await runPrompt(buildMeetingMinutesPrompt({ title, originalName: transcription.original_name, durationMs: transcription.duration_ms, transcript: evidence.map((item, index) => `片段${index + 1}证据：\n${item}`).join('\n\n') }))
+          db.run(`UPDATE meeting_minutes SET status='completed', content_markdown=?, updated_at=? WHERE id=? AND status='processing'`, [content, groupNowIso(), id])
+        } catch (error: any) {
+          db.run(`UPDATE meeting_minutes SET status='failed', error_code=?, updated_at=? WHERE id=? AND status='processing'`, [String(error?.message || 'MEETING_MINUTES_FAILED').slice(0, 200), groupNowIso(), id])
+        }
+      })()
+      return Response.json({ ok: true, minutes: db.prepare(`SELECT * FROM meeting_minutes WHERE id=?`).get(id) }, { status: 202 })
     }
 
     const retryTranscriptionMatch = url.pathname.match(/^\/api\/transcriptions\/([^/]+)\/retry$/)

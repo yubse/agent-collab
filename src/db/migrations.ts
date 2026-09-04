@@ -437,6 +437,28 @@ const MIGRATIONS: Migration[] = [
         ON meeting_transcripts(channel_id, created_at)`)
     },
   },
+  {
+    version: 11,
+    name: 'meeting_minutes',
+    up(db) {
+      db.run(`CREATE TABLE IF NOT EXISTS meeting_minutes (
+        id TEXT PRIMARY KEY,
+        transcription_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+        content_markdown TEXT,
+        model TEXT,
+        provider TEXT,
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (transcription_id) REFERENCES transcriptions(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_meeting_minutes_transcription ON meeting_minutes(transcription_id, created_at)`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_meeting_minutes_user ON meeting_minutes(user_id, created_at)`)
+    },
+  },
 ]
 
 export function runMigrations(db: Database): void {
