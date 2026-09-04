@@ -69,4 +69,9 @@ describe('M2.3 meeting transcription UI', () => {
     expect(page).toContain('历史版本会保留')
     expect(page).toContain('markdown(')
   })
+
+  test('does not render Markdown table separator as an Action Item', () => {
+    expect(page).toContain('cells.every(cell=>/^:?-{3,}:?$/.test(cell))')
+    expect(page).toContain("if(cells.length&&cells.every(cell=>/^:?-{3,}:?$/.test(cell)))return ''")
+  })
 })
