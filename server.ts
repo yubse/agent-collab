@@ -72,6 +72,7 @@ import {
 } from './src/channels/access.ts'
 import { actorForNewMessage, resolveActor, resolvedActorForMessage, type ActorType, type ResolvedActor } from './src/actors/resolver.ts'
 import { PresenceStore, type AgentPresenceStatus, type PresenceUpdate } from './src/presence/store.ts'
+import { appendTimelineEvent, parseTimelineMetadata } from './src/events/timeline.ts'
 import { buildMeetingMinutesPrompt, MEETING_MINUTES_AGENT, MEETING_MINUTES_AGENT_ID, splitTranscript } from './src/meeting-minutes.ts'
 import {
   CREATIVE_AGENTS,
@@ -921,6 +922,13 @@ function handleProviderEvent(userId: string, conversationId: string, agentId: st
   } else if (ev.type === 'result') {
     completedRoute = _agentTurnRoutes.complete(key)
     if (completedRoute && !completedRoute.observeOnly) setRoutePresence(completedRoute, agentId, 'idle')
+    if (completedRoute && !completedRoute.observeOnly) appendTimelineEvent(db, {
+      channelId: completedRoute.conversationId, threadId: completedRoute.threadId || null,
+      eventType: 'agent.completed', actorType: 'agent', actorId: agentId,
+      targetType: 'execution', targetId: completedRoute.id,
+      correlationId: `execution:${completedRoute.id}:completed`,
+      metadata: { request_id: completedRoute.requestId || completedRoute.id, execution_owner_user_id: completedRoute.userId, agent_id: agentId },
+    })
     // A completed response must not make the workstation look idle when another
     // visible response is already queued behind it. Observe-only turns stay silent.
     if (_agentTurnRoutes.hasResponseTurn(key)) {
@@ -1030,6 +1038,14 @@ function handleProviderError(userId: string, conversationId: string, agentId: st
   const failedRoute = _agentTurnRoutes.current(key)
   if (failedRoute && !failedRoute.observeOnly) {
     setRoutePresence(failedRoute, agentId, /CODEX_EXECUTION_CANCELLED/i.test(err.message) ? 'idle' : 'error')
+    const cancelled = /CODEX_EXECUTION_CANCELLED/i.test(err.message)
+    appendTimelineEvent(db, {
+      channelId: failedRoute.conversationId, threadId: failedRoute.threadId || null,
+      eventType: cancelled ? 'agent.cancelled' : 'agent.failed', actorType: 'agent', actorId: agentId,
+      targetType: 'execution', targetId: failedRoute.id,
+      correlationId: `execution:${failedRoute.id}:${cancelled ? 'cancelled' : 'failed'}`,
+      metadata: { request_id: failedRoute.requestId || failedRoute.id, execution_owner_user_id: failedRoute.userId, agent_id: agentId },
+    })
   }
   if (err.kind === 'process_exited' || err.kind === 'spawn_failed') {
     if (isAgentWorkingInDb(agentId)) markAgentIdle(agentId)
@@ -1822,6 +1838,12 @@ function insertTaskEvent(task_id: string, kind: 'system_event' | 'user_comment',
   return { id, task_id, ts, kind, actor_id, body, meta: meta || {} }
 }
 
+function appendTaskTimeline(task: any, eventType: 'task.created' | 'task.updated' | 'task.completed', actorId = 'system') {
+  const channelId = String(task?.conversation_id || '').trim()
+  if (!channelId) return
+  appendTimelineEvent(db, { channelId, eventType, actorType: actorId === 'system' ? 'system' : 'human', actorId, targetType: 'task', targetId: String(task.id), correlationId: `task:${task.id}:${eventType}`, metadata: { task_id: task.id } })
+}
+
 // Enter a phase: bump cycle, insert role check rows, update task.current_phase, write phase_advance event.
 // If new_phase has auto_advance=true, also schedule the auto handler.
 // Returns the event object for the caller to use as notification payload.
@@ -1844,6 +1866,7 @@ function enterPhase(task: any, new_phase: string, fromPhase: string | null, trig
   } else {
     db.run(`UPDATE tasks_v2 SET current_phase = ?, updated_at = ? WHERE id = ?`, [new_phase, now, task.id])
   }
+  if (isClosed) appendTaskTimeline({ ...task, conversation_id: task.conversation_id }, 'task.completed', task.created_by || 'system')
   const fromDef = fromPhase ? findPhaseDef(task.type, fromPhase) : null
   // v0.7.1 Fix 2: enterPhase only writes ONE event per call. Action events (phase_reject/phase_rollback
   // with comment + rejected_by_actor) are written by the endpoint BEFORE calling enterPhase, so this
@@ -2605,6 +2628,15 @@ function appendGroupRecord(input: any, mentions: string[], delivery: any, userId
     ],
   )
   linkMessageAssets(record)
+  if (db.prepare(`SELECT id FROM group_conversations WHERE id=?`).get(record.conversation_id)) {
+    appendTimelineEvent(db, {
+      channelId: record.conversation_id, threadId: record.thread_id,
+      eventType: 'message.created', actorType: (record.sender_actor_type || 'system') as any,
+      actorId: record.sender_actor_id || 'system', targetType: 'message', targetId: record.id,
+      correlationId: `message:${record.id}`,
+      metadata: { message_type: record.message_type, source: record.source }, createdAt: record.ts,
+    })
+  }
   publishBrowserExecutionEvent(userId, record.conversation_id, {
     type: 'message_created',
     message_id: record.id,
@@ -2853,6 +2885,7 @@ function startCreativeDiscussion(topicRecord: GroupRecord) {
     (id, user_id, conversation_id, topic, status, current_round, started_at)
     VALUES (?, ?, ?, ?, 'running', 0, ?)`, [id, topicRecord.user_id, topicRecord.conversation_id, topicRecord.text, now])
   const discussion = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(id) as any
+  appendTimelineEvent(db, { channelId: discussion.conversation_id, eventType: 'discussion.started', actorType: 'human', actorId: discussion.user_id, targetType: 'discussion', targetId: id, correlationId: `discussion:${id}:started`, metadata: { discussion_id: id } })
   appendCreativeSystemMessage(discussion, `创意讨论已启动 · 固定最多${CREATIVE_DISCUSSION_MAX_ROUNDS}轮`, 0, { status: 'running' })
   queueMicrotask(() => startCreativeRound(id, 1))
   return discussion
@@ -2988,6 +3021,7 @@ function finishCreativeDiscussion(discussionId: string) {
     CREATIVE_DISCUSSION_MAX_ROUNDS, completedAt, discussionId,
   ])
   const refreshed = db.prepare(`SELECT * FROM creative_discussions WHERE id=?`).get(discussionId) as any
+  appendTimelineEvent(db, { channelId: refreshed.conversation_id, eventType: 'discussion.completed', actorType: 'system', actorId: 'system', targetType: 'discussion', targetId: discussionId, correlationId: `discussion:${discussionId}:completed`, metadata: { discussion_id: discussionId } })
   appendCreativeSystemMessage(
     refreshed,
     `创意讨论完成 · ${CREATIVE_DISCUSSION_MAX_ROUNDS}轮 · prompt ${Number(refreshed.total_prompt_tokens) || 0} tokens`,
@@ -3197,6 +3231,12 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
   const route = _agentTurnRoutes.startNext(key)
   if (!route) return
   if (!route.observeOnly) setRoutePresence(route, agentId, 'queued')
+  if (!route.observeOnly) appendTimelineEvent(db, {
+    channelId: route.conversationId, threadId: route.threadId || null,
+    eventType: 'agent.queued', actorType: 'agent', actorId: agentId,
+    targetType: 'execution', targetId: route.id, correlationId: `execution:${route.id}:queued`,
+    metadata: { request_id: route.requestId || route.id, execution_owner_user_id: route.userId, agent_id: agentId },
+  })
   const provider = ensureProvider(userId, conversationId, agentId)
   if (!provider) {
     _agentTurnRoutes.remove(key, route.id)
@@ -3209,6 +3249,12 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
     message_id: route.responseMessageId,
     agent_id: agentId,
     thread_id: route.threadId || null,
+  })
+  if (!route.observeOnly) appendTimelineEvent(db, {
+    channelId: route.conversationId, threadId: route.threadId || null,
+    eventType: 'agent.started', actorType: 'agent', actorId: agentId,
+    targetType: 'execution', targetId: route.id, correlationId: `execution:${route.id}:started`,
+    metadata: { request_id: route.requestId || route.id, execution_owner_user_id: route.userId, agent_id: agentId },
   })
   provider.send(route.prompt).catch((e: any) => {
     console.error(`dispatchGroupRecord: provider.send to ${agentId} rejected:`, e)
@@ -3881,6 +3927,11 @@ Bun.serve<ConnectorSocketData>({
       const id = `mm_${randomBytes(20).toString('hex')}`
       const now = groupNowIso()
       db.run(`INSERT INTO meeting_minutes (id, transcription_id, user_id, status, model, provider, created_at, updated_at) VALUES (?, ?, ?, 'processing', ?, 'remote-codex', ?, ?)`, [id, transcriptionId, currentUser.id, MEETING_MINUTES_AGENT.model, now, now])
+      if (transcription.channel_id) appendTimelineEvent(db, {
+        channelId: transcription.channel_id, eventType: 'meeting_minutes.created', actorType: 'human', actorId: currentUser.id,
+        targetType: 'meeting_minutes', targetId: id, correlationId: `minutes:${id}:created`,
+        metadata: { transcription_id: transcriptionId },
+      })
       const body = await readOptionalJsonObject(req)
       const title = typeof body.title === 'string' ? body.title.trim().slice(0, 200) : transcription.title
       const chunks = splitTranscript(String(transcript.transcript))
@@ -3898,8 +3949,16 @@ Bun.serve<ConnectorSocketData>({
           for (let index = 0; index < chunks.length; index++) evidence.push(await runPrompt(buildMeetingMinutesPrompt({ title, originalName: transcription.original_name, durationMs: transcription.duration_ms, transcript: chunks[index], chunkIndex: index + 1, chunkCount: chunks.length })))
           const content = chunks.length === 1 ? evidence[0] : await runPrompt(buildMeetingMinutesPrompt({ title, originalName: transcription.original_name, durationMs: transcription.duration_ms, transcript: evidence.map((item, index) => `片段${index + 1}证据：\n${item}`).join('\n\n') }))
           db.run(`UPDATE meeting_minutes SET status='completed', content_markdown=?, updated_at=? WHERE id=? AND status='processing'`, [content, groupNowIso(), id])
+          if (transcription.channel_id) appendTimelineEvent(db, {
+            channelId: transcription.channel_id, eventType: 'meeting_minutes.completed', actorType: 'agent', actorId: MEETING_MINUTES_AGENT_ID,
+            targetType: 'meeting_minutes', targetId: id, correlationId: `minutes:${id}:completed`, metadata: { transcription_id: transcriptionId },
+          })
         } catch (error: any) {
           db.run(`UPDATE meeting_minutes SET status='failed', error_code=?, updated_at=? WHERE id=? AND status='processing'`, [String(error?.message || 'MEETING_MINUTES_FAILED').slice(0, 200), groupNowIso(), id])
+          if (transcription.channel_id) appendTimelineEvent(db, {
+            channelId: transcription.channel_id, eventType: 'meeting_minutes.failed', actorType: 'agent', actorId: MEETING_MINUTES_AGENT_ID,
+            targetType: 'meeting_minutes', targetId: id, correlationId: `minutes:${id}:failed`, metadata: { transcription_id: transcriptionId },
+          })
         }
       })()
       return Response.json({ ok: true, minutes: db.prepare(`SELECT * FROM meeting_minutes WHERE id=?`).get(id) }, { status: 202 })
@@ -4449,6 +4508,28 @@ Bun.serve<ConnectorSocketData>({
       }
     }
 
+    const channelEventsMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/events$/)
+    if (req.method === 'GET' && channelEventsMatch && isAuthed) {
+      const channelId = decodeURIComponent(channelEventsMatch[1])
+      if (!canReadChannel(db, channelId, currentUser!.id)) return Response.json({ ok: false, error: 'channel not found' }, { status: 404 })
+      const threadId = url.searchParams.get('thread_id') || null
+      if (threadId) {
+        const thread = threadRow(threadId)
+        if (!thread || thread.channel_id !== channelId) return Response.json({ ok: false, error: 'thread not found' }, { status: 404 })
+      }
+      const limit = Math.max(1, Math.min(Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50, 200))
+      const eventType = url.searchParams.get('event_type') || null
+      const before = url.searchParams.get('before') || null
+      const after = url.searchParams.get('after') || null
+      const where = ['channel_id=?']; const params: any[] = [channelId]
+      if (threadId) { where.push('thread_id=?'); params.push(threadId) }
+      if (eventType) { where.push('event_type=?'); params.push(eventType) }
+      if (before) { where.push('(created_at < (SELECT created_at FROM events WHERE id=?) OR (created_at = (SELECT created_at FROM events WHERE id=?) AND id < ?))'); params.push(before, before, before) }
+      if (after) { where.push('(created_at > (SELECT created_at FROM events WHERE id=?) OR (created_at = (SELECT created_at FROM events WHERE id=?) AND id > ?))'); params.push(after, after, after) }
+      const rows = db.prepare(`SELECT * FROM events WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ?`).all(...params, limit) as any[]
+      return Response.json({ ok: true, events: rows.map(parseTimelineMetadata), limit, has_more: rows.length === limit })
+    }
+
     const channelMatch = url.pathname.match(/^\/api\/channels\/([^/]+)$/)
     if (req.method === 'GET' && channelMatch && isAuthed) {
       const channelId = decodeURIComponent(channelMatch[1])
@@ -4496,6 +4577,12 @@ Bun.serve<ConnectorSocketData>({
           if (owners <= 1) return Response.json({ ok: false, error: 'LAST_OWNER' }, { status: 409 })
         }
         upsertChannelMembership(db, { channelId, memberType, memberId, role: targetRole })
+        appendTimelineEvent(db, {
+          channelId, eventType: existing ? 'member.role_changed' : 'member.joined',
+          actorType: 'human', actorId: currentUser!.id, targetType: memberType, targetId: memberId,
+          correlationId: `membership:${channelId}:${memberType}:${memberId}:${existing ? `role:${targetRole}` : 'joined'}`,
+          metadata: { role: targetRole },
+        })
         return Response.json({ ok: true, member: activeChannelMembership(db, channelId, memberType, memberId) }, { status: 201 })
       } catch (error: any) {
         return Response.json({ ok: false, error: error?.message || 'unable to add member' }, { status: 400 })
@@ -4514,6 +4601,11 @@ Bun.serve<ConnectorSocketData>({
         const status = removed.error === 'NOT_FOUND' ? 404 : removed.error === 'FORBIDDEN' ? 403 : 409
         return Response.json({ ok: false, error: removed.error }, { status })
       }
+      appendTimelineEvent(db, {
+        channelId, eventType: 'member.removed', actorType: 'human', actorId: currentUser!.id,
+        targetType: memberType, targetId: memberId,
+        correlationId: `membership:${channelId}:${memberType}:${memberId}:removed:${Date.now()}`,
+      })
       if (memberType === 'human') disconnectUnauthorizedChannelSubscribers(channelId)
       return Response.json({ ok: true, removed: true })
     }
@@ -4540,6 +4632,11 @@ Bun.serve<ConnectorSocketData>({
             VALUES (?, ?, ?, 'human', ?, 'open', ?, ?)`, [id, channelId, rootMessageId, currentUser!.id, now, now])
           thread = { id }
           created = true
+          appendTimelineEvent(db, {
+            channelId, eventType: 'thread.created', actorType: 'human', actorId: currentUser!.id,
+            targetType: 'thread', targetId: id, correlationId: `thread:${id}:created`,
+            metadata: { root_message_id: rootMessageId },
+          })
         } catch (error: any) {
           if (!String(error?.message || '').includes('UNIQUE')) throw error
           thread = db.prepare(`SELECT id FROM threads WHERE root_message_id=?`).get(rootMessageId) as any
@@ -5923,6 +6020,7 @@ Bun.serve<ConnectorSocketData>({
         )
         insertTaskEvent(id, 'system_event', body.sender_id || 'admin', `${ACTOR_DISPLAY_NAMES[body.sender_id || 'admin']} 创建了任务`, { event_type: 'task_created' })
         const task = attachPendingFields(loadTask(id, currentUser!.id))
+        appendTaskTimeline(task, 'task.created', currentUser!.id)
         wakeTaskWaiters(id)
         return Response.json({ ok: true, task })
       } catch (e: any) {
@@ -6132,6 +6230,7 @@ Bun.serve<ConnectorSocketData>({
         vals.push(taskId)
         db.run(`UPDATE tasks_v2 SET ${sets.join(', ')} WHERE id = ?`, vals)
         const updated = attachPendingFields(loadTask(taskId, currentUser!.id))
+        appendTaskTimeline(updated, 'task.updated', currentUser!.id)
         wakeTaskWaiters(taskId)
         return Response.json({ ok: true, task: updated })
       } catch (e: any) {

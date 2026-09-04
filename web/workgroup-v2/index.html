@@ -437,6 +437,11 @@ button, textarea, input { font: inherit; }
 }
 .ws-chat-divider { color: var(--ink-3); }
 .ws-chat-members { color: var(--ink-3); font-size: 13px; }
+.ws-timeline-filters { display:flex; gap:6px; flex-wrap:wrap; padding:4px 0 12px; }
+.ws-timeline-filters .ws-tasks-tab { font-size:11px; padding:5px 9px; }
+.ws-timeline-event time { margin-left:auto; color:var(--ink-3); font-size:11px; white-space:nowrap; }
+.ws-timeline-agent { background:var(--accent-soft, #f4e8cf); }
+.ws-timeline-system { background:var(--surface-2, #eee); }
 .ws-chat-title { font-weight: 600; font-size: 16px; }
 .ws-chat-messages {
   flex: 1; overflow-y: auto;
@@ -2276,6 +2281,7 @@ button, textarea, input { font: inherit; }
             <div class="studio-channel-actions">
               <button class="studio-header-stop" id="headerStopButton" style="display:none">■ 停止</button>
               <button class="studio-icon-button" id="channelMembersToggle" title="成员"><span class="material-symbols-rounded">group</span></button>
+              <button class="studio-icon-button" id="channelTimelineToggle" title="活动 / Timeline"><span class="material-symbols-rounded">history</span></button>
               <button class="studio-icon-button" id="channelSearchButton" title="搜索"><span class="material-symbols-rounded">search</span></button>
               <button class="studio-icon-button" id="channelMoreButton" title="更多"><span class="material-symbols-rounded">more_horiz</span></button>
             </div>
@@ -3198,6 +3204,12 @@ let roster = [];           // [{id, display_name, kind, avatar, color, model, tm
 let members = {};          // id → roster entry
 let agentStatus = {};      // id → {state, status_text, auto_reply, is_typing, last_seen}
 let presenceSnapshot = { humans: [], agent_executions: [], connectors: [] };
+let membersPanelMode = 'members';
+let timelineEvents = [];
+let timelineBefore = null;
+let timelineLoading = false;
+let timelineHasMore = true;
+let timelinePollTimer = null;
 let _typingTimer = null;
 let autoReply = {};        // id → bool
 
@@ -5131,6 +5143,7 @@ function renderMembersPanel() {
   const content = document.getElementById('membersPanelContent');
   const title = document.getElementById('membersPanelTitle');
   if (!content) return;
+  if (membersPanelMode === 'timeline') { renderTimelinePanel(); return; }
   if (activeThread) {
     if (title) title.textContent = 'Thread';
     renderThreadPanel();
@@ -5163,6 +5176,59 @@ function renderMembersPanel() {
     <section class="studio-member-section"><div class="studio-member-section-title">AGENTS · ${agents.length}</div>${agents.map(m => row(m,true)).join('') || '<div class="studio-member-row">暂无 Agent</div>'}</section>
     ${(group?.current_user_role === 'owner' || group?.current_user_role === 'moderator') ? `<button class="studio-sidebar-link" data-members-manage="${esc(group.id)}"><span class="material-symbols-rounded">manage_accounts</span>管理成员</button>` : ''}`;
 }
+
+const TIMELINE_FILTERS = [['all','全部'],['message','消息'],['agent','Agent'],['member','成员'],['thread','Thread'],['meeting','会议纪要']];
+let timelineFilter = 'all';
+function timelineCategory(type) {
+  if (type === 'message.created') return 'message';
+  if (type.startsWith('agent.')) return 'agent';
+  if (type.startsWith('member.')) return 'member';
+  if (type === 'thread.created') return 'thread';
+  if (type.startsWith('meeting_minutes.')) return 'meeting';
+  return 'all';
+}
+function timelineDescription(ev) {
+  const actor = ev.actor?.display_name || members[ev.actor_id]?.display_name || displayName(ev.actor_id) || ev.actor_id || '系统';
+  const map = {
+    'message.created': '发送了一条消息', 'thread.created': '创建了 Thread',
+    'member.joined': '加入了 Channel', 'member.removed': '被移出 Channel', 'member.role_changed': '变更了成员角色',
+    'agent.queued': '进入执行队列', 'agent.started': '开始执行', 'agent.completed': '执行完成', 'agent.failed': '执行失败', 'agent.cancelled': '取消了执行',
+    'meeting_minutes.created': '开始生成会议纪要', 'meeting_minutes.completed': '生成会议纪要完成', 'meeting_minutes.failed': '会议纪要生成失败',
+  };
+  return { actor, text: map[ev.event_type] || '产生了一项活动' };
+}
+function renderTimelinePanel() {
+  const content = document.getElementById('membersPanelContent');
+  const title = document.getElementById('membersPanelTitle');
+  if (!content) return;
+  if (title) title.textContent = '活动 Timeline';
+  const filtered = timelineEvents.filter(ev => timelineFilter === 'all' || timelineCategory(ev.event_type) === timelineFilter);
+  const rows = filtered.map(ev => {
+    const d = timelineDescription(ev); const actorType = ev.actor_type || 'system';
+    const when = ev.created_at ? new Date(ev.created_at).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }) : '';
+    return `<div class="studio-member-row ws-timeline-event"><span class="studio-avatar ${actorType === 'agent' ? 'ws-timeline-agent' : actorType === 'system' ? 'ws-timeline-system' : ''}">${esc((d.actor || '系').slice(0,1))}</span><span class="studio-member-copy"><strong>${esc(d.actor)}</strong><small>${esc(d.text)}${ev.target_id ? ` · ${esc(String(ev.target_id).slice(0, 18))}` : ''}</small></span><time>${esc(when)}</time></div>`;
+  }).join('');
+  content.innerHTML = `<div class="ws-timeline-filters">${TIMELINE_FILTERS.map(([id,label]) => `<button class="ws-tasks-tab ${timelineFilter===id?'active':''}" data-timeline-filter="${id}">${label}</button>`).join('')}</div><div class="ws-timeline-list">${rows || '<div class="studio-thread-empty">暂无活动</div>'}</div>${timelineHasMore ? '<button class="studio-sidebar-link" data-timeline-more>加载更多</button>' : ''}`;
+}
+async function loadTimelineEvents({ reset = false } = {}) {
+  const group = activeGroupInfo(); if (!group?.id || timelineLoading) return;
+  if (reset) { timelineEvents = []; timelineBefore = null; timelineHasMore = true; }
+  if (!timelineHasMore) { renderTimelinePanel(); return; }
+  timelineLoading = true;
+  try {
+    const params = new URLSearchParams({ limit: '30' });
+    if (activeThread) params.set('thread_id', activeThread.id);
+    if (timelineBefore) params.set('before', timelineBefore);
+    const data = await apiJson(`/api/channels/${encodeURIComponent(group.id)}/events?${params}`);
+    if (data?.ok) { timelineEvents = [...timelineEvents, ...(data.events || [])]; timelineBefore = data.events?.at(-1)?.id || timelineBefore; timelineHasMore = Boolean(data.has_more); }
+  } finally { timelineLoading = false; renderTimelinePanel(); }
+}
+function openTimeline() {
+  membersPanelMode = 'timeline'; document.getElementById('membersPanel')?.classList.add('open');
+  loadTimelineEvents({ reset: true });
+  clearInterval(timelinePollTimer); timelinePollTimer = setInterval(() => loadTimelineEvents({ reset: true }), 15000);
+}
+function closeTimeline() { membersPanelMode = 'members'; clearInterval(timelinePollTimer); timelinePollTimer = null; renderMembersPanel(); }
 
 async function openThread(rootMessageId) {
   const cfg = CHANNELS[currentChannel];
@@ -9063,9 +9129,11 @@ document.getElementById('appSettingsBtn').addEventListener('click', openAppSetti
 document.getElementById('sidebarSettingsBtn').addEventListener('click', openAppSettings);
 document.getElementById('channelSearchButton').addEventListener('click', () => document.getElementById('wsSearchTriggerBtn').click());
 document.getElementById('channelMembersToggle').addEventListener('click', () => document.getElementById('membersPanel').classList.toggle('open'));
+document.getElementById('channelTimelineToggle').addEventListener('click', () => membersPanelMode === 'timeline' ? closeTimeline() : openTimeline());
 document.getElementById('headerStopButton').addEventListener('click', stopCurrentConversation);
 document.getElementById('membersPanelClose').addEventListener('click', () => {
   if (activeThread) closeThread();
+  else if (membersPanelMode === 'timeline') { closeTimeline(); document.getElementById('membersPanel').classList.remove('open'); }
   else document.getElementById('membersPanel').classList.remove('open');
 });
 document.getElementById('groupMessages').addEventListener('click', event => {
@@ -9079,6 +9147,9 @@ document.querySelector('.ws-workstation-sidebar').addEventListener('click', even
   if (dmButton) setActiveDm(dmButton.dataset.sidebarDm);
 });
 document.getElementById('membersPanelContent').addEventListener('click', event => {
+  const filter = event.target.closest('[data-timeline-filter]');
+  if (filter) { timelineFilter = filter.dataset.timelineFilter || 'all'; renderTimelinePanel(); return; }
+  if (event.target.closest('[data-timeline-more]')) { loadTimelineEvents(); return; }
   const open = event.target.closest('[data-open-thread]');
   if (open) { openThread(open.dataset.openThread); return; }
   const threadSend = event.target.closest('#threadSendButton');

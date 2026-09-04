@@ -459,6 +459,33 @@ const MIGRATIONS: Migration[] = [
       db.run(`CREATE INDEX IF NOT EXISTS idx_meeting_minutes_user ON meeting_minutes(user_id, created_at)`)
     },
   },
+  {
+    version: 12,
+    name: 'event_timeline',
+    up(db) {
+      db.run(`CREATE TABLE IF NOT EXISTS events (
+        id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        thread_id TEXT,
+        event_type TEXT NOT NULL,
+        actor_type TEXT NOT NULL CHECK (actor_type IN ('human','agent','system')),
+        actor_id TEXT NOT NULL,
+        target_type TEXT,
+        target_id TEXT,
+        correlation_id TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (channel_id) REFERENCES group_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE SET NULL
+      )`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_events_channel_created ON events(channel_id, created_at DESC, id DESC)`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_events_thread_created ON events(thread_id, created_at DESC, id DESC)`)
+      db.run(`CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(event_type, created_at DESC)`)
+      db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_correlation_type ON events(correlation_id, event_type) WHERE correlation_id IS NOT NULL`)
+      db.run(`CREATE TRIGGER IF NOT EXISTS events_append_only_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only'); END`)
+      db.run(`CREATE TRIGGER IF NOT EXISTS events_append_only_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only'); END`)
+    },
+  },
 ]
 
 export function runMigrations(db: Database): void {

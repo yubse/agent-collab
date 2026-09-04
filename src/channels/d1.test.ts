@@ -83,6 +83,7 @@ describe('D1 migration', () => {
     expect((db.prepare(`SELECT COUNT(*) AS n FROM schema_migrations WHERE version=7`).get() as any).n).toBe(1)
     expect((db.prepare(`SELECT COUNT(*) AS n FROM schema_migrations WHERE version=9`).get() as any).n).toBe(1)
     expect((db.prepare(`SELECT COUNT(*) AS n FROM schema_migrations WHERE version=10`).get() as any).n).toBe(1)
+    expect((db.prepare(`SELECT COUNT(*) AS n FROM schema_migrations WHERE version=12`).get() as any).n).toBe(1)
     expect((db.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='transcriptions'`).get() as any).n).toBe(1)
     expect((db.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='meeting_transcripts'`).get() as any).n).toBe(1)
     expect((db.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='threads'`).get() as any).n).toBe(1)
