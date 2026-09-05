@@ -104,4 +104,24 @@ describe('web typewriter buffer', () => {
     const refreshedPage = new TypewriterBuffer({ autoStart: false })
     expect(refreshedPage.list()).toEqual([])
   })
+
+  test('completed messages reject late deltas after the transient state is removed', () => {
+    const buffer = new TypewriterBuffer({ autoStart: false })
+    buffer.pushDelta({ messageId: 'msg-complete', eventKey: 'evt-1', delta: '完成' })
+    buffer.finish({ messageId: 'msg-complete', status: 'success', content: '完成' })
+    while (!buffer.get('msg-complete')?.completed) buffer.tick('msg-complete')
+    expect(buffer.get('msg-complete')?.completed).toBe(true)
+    buffer.remove('msg-complete')
+    expect(buffer.pushDelta({ messageId: 'msg-complete', eventKey: 'evt-late', delta: '重复' })).toBe(false)
+    expect(buffer.begin({ messageId: 'msg-complete' })).toBe(false)
+  })
+
+  test('duplicate result does not restart a completed message', () => {
+    const buffer = new TypewriterBuffer({ autoStart: false })
+    buffer.pushDelta({ messageId: 'msg-result', eventKey: 'evt-1', delta: '一次' })
+    buffer.finish({ messageId: 'msg-result', status: 'success', content: '一次' })
+    while (!buffer.get('msg-result')?.completed) buffer.tick('msg-result')
+    expect(buffer.finish({ messageId: 'msg-result', status: 'success', content: '一次一次' })).toBe(false)
+    expect(buffer.get('msg-result')?.displayedText).toBe('一次')
+  })
 })

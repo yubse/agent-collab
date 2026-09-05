@@ -35,11 +35,15 @@
       this.schedule = options.schedule || ((fn, ms) => setInterval(fn, ms));
       this.cancel = options.cancel || (timer => clearInterval(timer));
       this.messages = new Map();
+      // Completed message ids are tombstoned for the lifetime of this page. A
+      // late poll/SSE replay must never recreate a finished typewriter buffer.
+      this.completedIds = new Set();
     }
 
     begin(input) {
       const id = String(input?.messageId || input?.message_id || '').trim();
       if (!id) return false;
+      if (this.completedIds.has(id)) return false;
       if (this.messages.has(id)) return false;
       const state = {
         id,
@@ -59,6 +63,8 @@
       const id = String(input?.messageId || input?.message_id || '').trim();
       const delta = String(input?.delta ?? input?.text_delta ?? input?.content_delta ?? '');
       if (!id || !delta) return false;
+
+      if (this.completedIds.has(id)) return false;
 
       if (!this.messages.has(id)) this.begin(input);
       const state = this.messages.get(id);
@@ -120,6 +126,8 @@
       state.failed = true;
       state.error = String(input?.error || 'CODEX_EXECUTION_CANCELLED');
       state.completed = true;
+      this.completedIds.add(state.id);
+      if (this.completedIds.size > 5000) this.completedIds.delete(this.completedIds.values().next().value);
       this._stopTimer(state);
       this._notify(state, 'stopped');
       return true;
@@ -171,6 +179,7 @@
     dispose() {
       for (const state of this.messages.values()) this._stopTimer(state);
       this.messages.clear();
+      this.completedIds.clear();
     }
 
     _ensureTimer(state) {
@@ -190,6 +199,8 @@
         state.displayedText = state.finalText;
       }
       state.completed = true;
+      this.completedIds.add(state.id);
+      if (this.completedIds.size > 5000) this.completedIds.delete(this.completedIds.values().next().value);
       this._stopTimer(state);
       this._notify(state, state.failed ? 'failed-complete' : 'complete');
       return true;

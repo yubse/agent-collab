@@ -2852,6 +2852,7 @@ const _executionEventIds = new Set();
 const _streamTrace = new Map();
 const _runningExecutions = new Map();
 const _stoppedExecutionMessages = new Set();
+const _pendingHumanMessages = new Map();
 let _executionStreamSource = null;
 let _executionStreamChannel = null;
 let activeThread = null;
@@ -2886,7 +2887,21 @@ function _executionEventKey(event) {
   const messageId = _executionMessageId(event);
   if (id !== null && id !== undefined) return `id:${id}`;
   if (messageId && seq !== null && seq !== undefined) return `${messageId}:seq:${seq}`;
+  // Older poll payloads may omit event_id/sequence. Keep a bounded fallback key
+  // so the same delta delivered by both SSE and poll is consumed only once.
+  if (messageId && (event?.delta ?? event?.text_delta ?? event?.content_delta) !== undefined) {
+    const delta = String(event.delta ?? event.text_delta ?? event.content_delta ?? '');
+    return `${messageId}:delta:${delta}`;
+  }
   return null;
+}
+
+function _streamTraceEvent(event, source) {
+  const messageId = _executionMessageId(event);
+  if (!messageId) return;
+  const type = String(event?.type || event?.event || 'unknown');
+  const key = _executionEventKey(event) || 'none';
+  console.debug(`[stream-diagnostic] message_id=${messageId} event_id=${key} source=${source} type=${type} typewriter=${_typewriter.get(messageId)?.completed ? 'completed' : _typewriter.get(messageId) ? 'active' : 'absent'}`);
 }
 
 function _runningSet(channelId) {
@@ -2934,7 +2949,7 @@ function _ensureExecutionStream(channelId, threadId = activeThread?.channel_id =
       const payload = JSON.parse(event.data);
       if (payload.type === 'presence_update') _consumePresenceUpdate(payload);
       else if (payload.type === 'transcription_update') window.dispatchEvent(new CustomEvent('aistudio:transcription_update', { detail: payload }));
-      else _consumeExecutionEvents([payload]);
+      else _consumeExecutionEvents([payload], 'sse');
     }
     catch (error) { console.warn('[stream] invalid server event', error); }
   };
@@ -3052,9 +3067,10 @@ function handleExecutionResult(event) {
   });
 }
 
-function _consumeExecutionEvents(events) {
+function _consumeExecutionEvents(events, source = 'unknown') {
   for (const event of (Array.isArray(events) ? events : [])) {
     if (!_isExecutionStreamEvent(event)) continue;
+    _streamTraceEvent(event, source);
     const type = String(event.type || event.event);
     if (type === 'message_created') {
       const channelId = _executionPresentationChannel(event);
@@ -4185,7 +4201,7 @@ async function pollGroup(ch) {
     ...(Array.isArray(data.stream_events) ? data.stream_events : []),
     ...(Array.isArray(data.events) ? data.events : []),
     ...embeddedEvents,
-  ]);
+  ], 'poll');
   if (Number.isFinite(Number(data.last_stream_id))) cs.streamCursor = Number(data.last_stream_id);
   const records = rawRecords.filter(record => !_isExecutionStreamEvent(record));
   const wasFirstBatch = !cs.cursor;
@@ -4567,6 +4583,65 @@ function activeComposer() {
     : { ta: document.getElementById('composerInput'),  btn: document.getElementById('sendBtn')   };
 }
 
+function _pendingMessageRecord(channelId, id, text, images, files) {
+  return {
+    id,
+    ts: new Date().toISOString(),
+    conversation_id: CHANNELS[channelId]?.convId || channelId,
+    sender_id: 'admin', sender_actor_type: 'human', sender_actor_id: currentProfile?.id || null,
+    text, images, files, message_type: 'chat', source: 'optimistic', pending: true,
+  };
+}
+
+function _insertPendingHumanMessage(channelId, record) {
+  const cs = channelState[channelId] || (channelState[channelId] = { messages: [], cursor: null, streamCursor: null, oldestId: null, canLoadMore: true, loadingMore: false, lastError: null });
+  cs.messages = [...(cs.messages || []), record];
+  _pendingHumanMessages.set(record.id, record);
+  _msgsSignature = '';
+  _dmMsgsSignature = '';
+  render();
+}
+
+function _mergeSentHumanMessage(channelId, pendingId, record) {
+  const cs = channelState[channelId];
+  if (!cs || !record) return;
+  cs.messages = (cs.messages || []).filter(item => item.id !== pendingId && item.id !== record.id);
+  cs.messages.push(record);
+  _pendingHumanMessages.delete(pendingId);
+  _msgsSignature = '';
+  _dmMsgsSignature = '';
+}
+
+function _markPendingHumanMessageFailed(channelId, pendingId, error) {
+  const pending = _pendingHumanMessages.get(pendingId);
+  if (!pending) return;
+  pending.pending = false;
+  pending.pendingStatus = 'failed';
+  pending.pendingError = String(error || '发送失败');
+  _msgsSignature = '';
+  _dmMsgsSignature = '';
+  render();
+}
+
+function _retryPendingHumanMessage(pendingId) {
+  const pending = _pendingHumanMessages.get(pendingId);
+  if (!pending || pending.pendingStatus !== 'failed') return;
+  const channelId = Object.keys(channelState).find(ch => channelState[ch]?.messages?.some(item => item.id === pendingId));
+  if (channelId && channelId !== currentChannel) return;
+  const { ta } = activeComposer();
+  if (!ta) return;
+  ta.value = pending.text || '';
+  pendingFiles = [
+    ...(pending.images || []).map(filename => ({ filename, name: filename, kind: 'image', size: 0 })),
+    ...(pending.files || []).map(file => ({ filename: file.server || file.filename || file, name: file.original || file.name || file, kind: 'file', size: file.size || 0 })),
+  ];
+  channelState[currentChannel].messages = (channelState[currentChannel].messages || []).filter(item => item.id !== pendingId);
+  _pendingHumanMessages.delete(pendingId);
+  renderComposerPending();
+  render();
+  sendCurrentMessage();
+}
+
 async function sendCurrentMessage() {
   if (_conversationRunning()) return;
   const { ta } = activeComposer();
@@ -4585,19 +4660,27 @@ async function sendCurrentMessage() {
 
   const cfg = CHANNELS[currentChannel];
   if (cfg.type === 'group') {
+    const pendingId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const optimisticStartedAt = performance.now();
+    _insertPendingHumanMessage(currentChannel, _pendingMessageRecord(currentChannel, pendingId, text, images, files));
+    console.debug(`[chat-performance] optimistic_human_message pending_id=${pendingId} render_ms=${Math.round(performance.now() - optimisticStartedAt)}`);
     const body = { sender_id: 'admin', text, images, files };
     if (cfg.convId !== 'workgroup') body.conversation_id = cfg.convId;
     else body.mentions = parseMentions(text);
     if (replyTo) body.reply_to = replyTo.id;
-    const sent = await apiJson('/group/send', { method: 'POST', body: JSON.stringify(body) });
+    let sent;
+    try { sent = await apiJson('/group/send', { method: 'POST', body: JSON.stringify(body) }); }
+    catch (error) { _markPendingHumanMessageFailed(currentChannel, pendingId, error?.message); return; }
     if (!sent?.ok) {
       if (sent?.error === 'CREATIVE_DISCUSSION_ALREADY_RUNNING') {
         showWipToast(`当前创意讨论正在第 ${sent.current_round || '—'}/${sent.max_rounds || 7} 轮，请等待创意总监总结。`);
       } else {
         showWipToast(sent?.error || '消息发送失败');
       }
+      _markPendingHumanMessageFailed(currentChannel, pendingId, sent?.error || '消息发送失败');
       return;
     }
+    _mergeSentHumanMessage(currentChannel, pendingId, sent.record);
     const deliveryErrors = Object.values(sent?.record?.delivery?.errors || {});
     if (deliveryErrors.includes('CODEX_CONNECTOR_OFFLINE')) {
       showWipToast('你的 AI Studio Connector 当前未连接。');
@@ -5595,6 +5678,9 @@ function renderGroupMsg(m) {
     : '';
   const threadAction = m.thread_id ? '' : `<button class="studio-thread-action" data-open-thread="${esc(m.id)}" title="回复到讨论串"><span class="material-symbols-rounded">reply</span> Thread</button>`;
 
+  const pendingStatus = m.pendingStatus === 'failed'
+    ? `<span class="ws-msg-stream-status failed">发送失败${m.pendingError ? ` · ${esc(m.pendingError)}` : ''} <button data-action="retry-pending" data-pending-id="${esc(m.id)}">重试</button></span>`
+    : m.pending ? '<span class="ws-msg-stream-status">发送中…</span>' : '';
   return `
     <div class="ws-msg-comment" data-msg-id="${esc(m.id)}"${streamStatus ? ` data-stream-status="${streamStatus}"` : ''}>
       <div class="ws-msg-avatar" style="background:var(--${designId});">
@@ -5608,7 +5694,7 @@ function renderGroupMsg(m) {
           ${taskRef ? `<span class="ws-msg-ref">↪ ${esc(taskRef)}</span>` : ''}
         </div>
         ${(visibleText || streamState) ? `<div class="ws-msg-text">${mdRender(visibleText)}</div>` : ''}
-        ${_typewriterStatusHtml(streamState)}
+        ${_typewriterStatusHtml(streamState)}${pendingStatus}
         ${attachments}
         ${threadMeta}
       </div>
@@ -5843,10 +5929,13 @@ function renderDmMsg(m, prev) {
   }
 
   const time = formatTime(m.ts || m.timestamp);
+  const pendingStatus = m.pendingStatus === 'failed'
+    ? `<span class="ws-msg-stream-status failed">发送失败${m.pendingError ? ` · ${esc(m.pendingError)}` : ''} <button data-action="retry-pending" data-pending-id="${esc(m.id)}">重试</button></span>`
+    : m.pending ? '<span class="ws-msg-stream-status">发送中…</span>' : '';
   const bubbleHtml = `<div class="ws-dm-msg-bubble ${isFromPm ? 'from-pm' : 'from-agent'}">
     ${replyBlock}
     <div class="ws-dm-msg-body">${mdRender(body)}</div>
-    ${_typewriterStatusHtml(streamState)}
+    ${_typewriterStatusHtml(streamState)}${pendingStatus}
     ${time ? `<div class="ws-dm-msg-time">${esc(time)}</div>` : ''}
     ${images}${files}
   </div>`;
@@ -9139,6 +9228,8 @@ document.getElementById('membersPanelClose').addEventListener('click', () => {
 document.getElementById('groupMessages').addEventListener('click', event => {
   const button = event.target.closest('[data-open-thread]');
   if (button) openThread(button.dataset.openThread);
+  const retry = event.target.closest('[data-action="retry-pending"]');
+  if (retry) _retryPendingHumanMessage(retry.dataset.pendingId);
 });
 document.querySelector('.ws-workstation-sidebar').addEventListener('click', event => {
   const viewButton = event.target.closest('[data-sidebar-view]');
@@ -10109,6 +10200,11 @@ document.getElementById('dmMessages').addEventListener('click', e => {
   if (!btn) return;
   const id = btn.dataset.id;
   const action = btn.dataset.action;
+
+  if (action === 'retry-pending') {
+    _retryPendingHumanMessage(btn.dataset.pendingId);
+    return;
+  }
 
   // AIC-92: loadmore button — 按 channel type 路由
   if (action === 'loadmore') {
