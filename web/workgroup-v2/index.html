@@ -3079,7 +3079,10 @@ function _consumeExecutionEvents(events, source = 'unknown') {
         continue;
       }
       const cs = channelState[channelId];
-      if (cs) { cs.cursor = null; pollGroup(channelId).then(() => { if (currentChannel === channelId) render(); }); }
+      // A message-created event is only a wake-up signal. Never reset the
+      // incremental cursor: doing so turns the next poll into a first-batch
+      // replacement and can erase pending/local history while sending.
+      if (cs) { pollGroup(channelId).then(() => { if (currentChannel === channelId) render(); }); }
     } else if (type === 'execution_started') handleExecutionStarted(event);
     else if (type === 'execution_delta') handleExecutionDelta(event);
     else handleExecutionResult(event);
@@ -4204,11 +4207,13 @@ async function pollGroup(ch) {
   ], 'poll');
   if (Number.isFinite(Number(data.last_stream_id))) cs.streamCursor = Number(data.last_stream_id);
   const records = rawRecords.filter(record => !_isExecutionStreamEvent(record));
-  const wasFirstBatch = !cs.cursor;
-  if (wasFirstBatch) cs.messages = records;
-  else if (records.length) {
-    const ids = new Set(cs.messages.map(m => m.id));
-    for (const r of records) if (!ids.has(r.id)) cs.messages.push(r);
+  const wasFirstBatch = !cs.cursor && cs.messages.length === 0;
+  if (records.length) {
+    // Poll is an incremental merge, never an authoritative array replacement.
+    // Keep optimistic/pending rows until the matching Server row reconciles them.
+    const byId = new Map((cs.messages || []).map(message => [message.id, message]));
+    for (const record of records) byId.set(record.id, record);
+    cs.messages = [...byId.values()].sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')));
   }
   for (const record of records) {
     if (_typewriter.get(record.id)) _typewriter.markPersisted(record.id, record);
@@ -4661,6 +4666,8 @@ async function sendCurrentMessage() {
   const cfg = CHANNELS[currentChannel];
   if (cfg.type === 'group') {
     const pendingId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const sendStartedAt = performance.now();
+    console.debug(`[chat-performance] client_send_start pending_id=${pendingId}`);
     const optimisticStartedAt = performance.now();
     _insertPendingHumanMessage(currentChannel, _pendingMessageRecord(currentChannel, pendingId, text, images, files));
     console.debug(`[chat-performance] optimistic_human_message pending_id=${pendingId} render_ms=${Math.round(performance.now() - optimisticStartedAt)}`);
@@ -4680,6 +4687,7 @@ async function sendCurrentMessage() {
       _markPendingHumanMessageFailed(currentChannel, pendingId, sent?.error || '消息发送失败');
       return;
     }
+    console.debug(`[chat-performance] send_response pending_id=${pendingId} message_id=${sent.record?.id || ''} elapsed_ms=${Math.round(performance.now() - sendStartedAt)}`);
     _mergeSentHumanMessage(currentChannel, pendingId, sent.record);
     const deliveryErrors = Object.values(sent?.record?.delivery?.errors || {});
     if (deliveryErrors.includes('CODEX_CONNECTOR_OFFLINE')) {
@@ -4688,7 +4696,6 @@ async function sendCurrentMessage() {
   }
   clearReply();
   await poll();
-  scrollMessagesToBottom();
 }
 
 async function stopCurrentConversation() {
@@ -4887,6 +4894,17 @@ function formatModelLabel(raw) {
   return raw;
 }
 
+// One availability projection is shared by group cards and DM rows. Both views
+// must consume the same server roster/status snapshot; they must not infer
+// availability from their own message history or from a stale local socket.
+function agentAvailability(serverId) {
+  const status = agentStatus[serverId] || {};
+  const raw = String(status.state || status.status || '').toLowerCase();
+  const online = ['online', 'active', 'working', 'busy', 'connected', 'ready', 'codex_ready'].includes(raw);
+  const busy = online && (raw === 'working' || raw === 'busy' || !!status.is_typing || !!String(status.status_text || '').trim());
+  return { online, busy, state: raw || 'offline', status };
+}
+
 // Map server roster member → design view model with decoration fields.
 function decorateAgent(serverId) {
   const designId = SERVER_TO_DESIGN_ID[serverId] || serverId;
@@ -4896,10 +4914,10 @@ function decorateAgent(serverId) {
 
   // State buckets — server returns state ∈ {'online','offline',...}. Activity (is_typing
   // or a non-empty status_text) is what distinguishes "working" from "just sitting there".
-  const rawState = (st.state || '').toLowerCase();
-  const isOnline = rawState === 'online' || rawState === 'active' || rawState === 'working' || rawState === 'busy';
-  const hasActivity = !!(st.is_typing || (st.status_text && st.status_text.trim()));
-  const isWorking = isOnline && hasActivity;
+  const availability = agentAvailability(serverId);
+  const rawState = availability.state;
+  const isOnline = availability.online;
+  const isWorking = availability.busy;
   const isOff = !isOnline && (rawState === 'offline' || rawState === 'off' || rawState === 'sleeping' || rawState === '');
   // AIC-48 status label: offline → 「不在线」；working → status_text (animal-themed casual);
   // idle → 「上次活跃 X 分钟前」（用 last_active 算，fallback last_seen）
@@ -5725,10 +5743,9 @@ function renderDmThreads() {
     const isActive = currentChannel === ch;
     // Thread dot = busy indicator: warn-orange when working, good-green when
     // online idle, mute-gray when offline. Mirrors the workstation card pill.
-    const st = agentStatus[sid] || {};
-    const rs = (st.state || '').toLowerCase();
-    const isOnline = rs === 'online' || rs === 'active' || rs === 'working' || rs === 'busy';
-    const isWorking = isOnline && !!(st.is_typing || (st.status_text && st.status_text.trim()));
+    const availability = agentAvailability(sid);
+    const isOnline = availability.online;
+    const isWorking = availability.busy;
     const statusColor = isWorking ? 'var(--warn)' : isOnline ? 'var(--good)' : 'var(--mute)';
     const unread = unreadCounts[ch] || 0;
     return { ch, sid, name: displayName(sid), designId, snippet, lastTimeLabel, isActive, statusColor, unread };
@@ -9284,7 +9301,21 @@ document.getElementById('appSettingsMask').addEventListener('click', e => {
   } else if (act === 'codex-restart') {
     restartCodexRuntime();
   } else if (act === 'app-switch-profile') {
-    apiJson('/api/auth/logout', { method: 'POST', body: '{}' }).finally(() => location.replace('/web/login.html'));
+    void (async () => {
+      console.info('[profile-switch] stage=logout_start');
+      try {
+        const result = await apiJson('/api/auth/logout', { method: 'POST', body: '{}' });
+        currentProfile = null;
+        connectorDevices = [];
+        console.info(`[profile-switch] stage=logout_complete ok=${result?.ok === true}`);
+      } catch (error) {
+        console.warn('[profile-switch] stage=logout_error', error?.message || error);
+      } finally {
+        // Cache-bust the profile selector so the browser cannot restore the old
+        // session page while the Set-Cookie deletion is being applied.
+        location.replace(`/web/login.html?switch=${Date.now()}`);
+      }
+    })();
   } else if (act === 'app-settings-shortcuts') {
     showWipToast('快捷键面板 WIP');
   }

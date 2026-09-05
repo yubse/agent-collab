@@ -3237,6 +3237,7 @@ function startNextAgentTurn(userId: string, conversationId: string, agentId: str
     targetType: 'execution', targetId: route.id, correlationId: `execution:${route.id}:queued`,
     metadata: { request_id: route.requestId || route.id, execution_owner_user_id: route.userId, agent_id: agentId },
   })
+  console.log(`[chat] dispatch_queued message=${safeConnectorTraceId(route.recordId)} turn=${safeConnectorTraceId(route.id)} agent=${safeConnectorTraceId(agentId)} owner=${safeConnectorTraceId(route.userId)}`)
   const provider = ensureProvider(userId, conversationId, agentId)
   if (!provider) {
     _agentTurnRoutes.remove(key, route.id)
@@ -5095,6 +5096,7 @@ Bun.serve<ConnectorSocketData>({
           const dmTargets = senderId === dmAgent ? [] : [dmAgent]
           const dmDelivery = { targets: dmTargets, mode: 'dm', dispatch_id: groupId('dsp'), delivered: [], failed: [] }
           const dmRecord = appendGroupRecord({ ...body, sender_id: senderId }, [], dmDelivery, currentUser!.id)
+          console.log(`[chat] message_persisted message=${safeConnectorTraceId(dmRecord.id)} owner=${safeConnectorTraceId(currentUser!.id)} channel=${safeConnectorTraceId(dmRecord.conversation_id)}`)
           if (dmTargets.length > 0) dispatchGroupRecord(dmRecord, dmTargets, hopCount)
           return Response.json({ ok: true, record: dmRecord, targets: dmTargets, observers: [] })
         }
@@ -5115,6 +5117,7 @@ Bun.serve<ConnectorSocketData>({
           }
           const delivery = { targets: [], mode: 'creative_discussion', dispatch_id: groupId('dsp'), delivered: [], failed: [] }
           const record = appendGroupRecord({ ...body, sender_id: senderId }, mentions, delivery, currentUser!.id)
+          console.log(`[chat] message_persisted message=${safeConnectorTraceId(record.id)} owner=${safeConnectorTraceId(currentUser!.id)} channel=${safeConnectorTraceId(record.conversation_id)}`)
           const discussion = startCreativeDiscussion(record)
           return Response.json({
             ok: true,
@@ -5133,6 +5136,7 @@ Bun.serve<ConnectorSocketData>({
           failed: [],
         }
         const record = appendGroupRecord({ ...body, sender_id: senderId }, mentions, delivery, currentUser!.id)
+        console.log(`[chat] message_persisted message=${safeConnectorTraceId(record.id)} owner=${safeConnectorTraceId(currentUser!.id)} channel=${safeConnectorTraceId(record.conversation_id)}`)
         if (targets.length > 0) dispatchGroupRecord(record, targets, hopCount)
         const observers = groupObserverTargetsFor(senderId, targets, conversationId, currentUser!.id)
         if (observers.length > 0) dispatchGroupRecord(record, observers, hopCount, true)
