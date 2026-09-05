@@ -5,7 +5,7 @@ import { Database } from 'bun:sqlite'
 import path from 'path'
 import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync, statSync, renameSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
-import { randomBytes } from 'crypto'
+import { randomBytes, randomUUID } from 'crypto'
 import { jsonOk, jsonError, readJsonBody } from './src/responses.ts'
 import { jsonParseSafe } from './src/formatters.ts'
 import {
@@ -688,6 +688,18 @@ const transcriptionSubscribers = new Set<{ streamId: string; userId: string; con
 const presenceStore = new PresenceStore()
 let browserExecutionSequence = 0
 const streamEncoder = new TextEncoder()
+
+function perfRequestId(req: Request): string {
+  const supplied = req.headers.get('x-request-id') || ''
+  return (supplied || `srv_${randomUUID()}`).replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80)
+}
+
+function logRequestPerf(req: Request, endpoint: string, startedAt: number, dbStartedAt: number, handlerStartedAt = performance.now()) {
+  const now = performance.now()
+  const dbMs = Math.max(0, Math.round(handlerStartedAt - dbStartedAt))
+  const handlerMs = Math.max(0, Math.round(now - startedAt))
+  console.debug(`[perf] request_id=${perfRequestId(req)} endpoint=${endpoint} db_ms=${dbMs} handler_ms=${handlerMs} response_ms=${handlerMs}`)
+}
 
 function executionStreamKey(userId: string, conversationId: string) {
   const channel = db.prepare(`SELECT scope FROM group_conversations WHERE id=?`).get(conversationId) as any
@@ -4995,6 +5007,8 @@ Bun.serve<ConnectorSocketData>({
           return Response.json({ ok: false, error: 'thread not found' }, { status: 404 })
         }
       }
+      const perfStartedAt = performance.now()
+      const dbStartedAt = performance.now()
       const records = readGroupRecords(currentUser!.id, since, limit, conversationId, beforeId, threadId)
       const streamSinceRaw = url.searchParams.get('stream_since')
       const streamSince = streamSinceRaw === null ? null : Number.parseInt(streamSinceRaw, 10)
@@ -5009,7 +5023,7 @@ Bun.serve<ConnectorSocketData>({
       const isHistoryFetch = !!beforeId
       const cursor = isHistoryFetch && records.length > 0 ? records[0].id : null
       const hasMore = isHistoryFetch ? records.length === Math.min(Math.max(limit || 120, 1), 500) : false
-      return Response.json({
+      const response = Response.json({
         ok: true,
         records,
         execution_events: stream.events,
@@ -5024,6 +5038,8 @@ Bun.serve<ConnectorSocketData>({
         presence: presenceStore.snapshot(conversationId, threadId),
         status: groupStatusSnapshot(currentUser!.id),
       })
+      logRequestPerf(req, '/group/poll', perfStartedAt, dbStartedAt)
+      return response
     }
 
     if (req.method === 'POST' && url.pathname === '/api/presence/typing' && isAuthed) {
@@ -5901,6 +5917,7 @@ Bun.serve<ConnectorSocketData>({
 
     // 12.13 GET /tasks/:id/events — long poll for new events on a task
     if (req.method === 'GET' && url.pathname.startsWith('/tasks/') && url.pathname.endsWith('/events') && isAuthed) {
+      const perfStartedAt = performance.now()
       const taskId = decodeURIComponent(url.pathname.slice('/tasks/'.length, -'/events'.length))
       if (!loadTask(taskId, currentUser!.id)) return Response.json({ ok: false, error: 'task not found' }, { status: 404 })
       // AIC-117 cycle 2: accept `since` as alias for `since_event_id` (scope 字面写的是 `since=ULID`).
@@ -5934,11 +5951,17 @@ Bun.serve<ConnectorSocketData>({
         return rows.map(e => ({ ...e, meta: JSON.parse(e.meta || '{}') }))
       }
       const immediate = fetchNew()
-      if (immediate.length > 0 || !sinceEventId) return Response.json({ ok: true, events: immediate })
+      if (immediate.length > 0 || !sinceEventId) {
+        const response = Response.json({ ok: true, events: immediate })
+        logRequestPerf(req, '/tasks/:id/events', perfStartedAt, perfStartedAt)
+        return response
+      }
       return new Promise<Response>((resolve) => {
         const timer = setTimeout(() => {
           taskEventWaiters.delete(waiter)
-          resolve(Response.json({ ok: true, events: [] }))
+          const response = Response.json({ ok: true, events: [] })
+          logRequestPerf(req, '/tasks/:id/events', perfStartedAt, perfStartedAt)
+          resolve(response)
         }, timeout)
         const waiter = { taskId, sinceEventId, resolve, timer }
         taskEventWaiters.add(waiter)
@@ -5947,6 +5970,7 @@ Bun.serve<ConnectorSocketData>({
 
     // 12.12 GET /tasks/summary — long poll for list-level summary (cursor-based)
     if (req.method === 'GET' && url.pathname === '/tasks/summary' && isAuthed) {
+      const perfStartedAt = performance.now()
       const sinceCursor = url.searchParams.get('since_cursor') || ''
       const timeout = Math.min(parseInt(url.searchParams.get('timeout') || '30'), 30) * 1000
       const buildSnapshot = () => {
@@ -5979,11 +6003,17 @@ Bun.serve<ConnectorSocketData>({
         return { cursor, tasks: rows }
       }
       const snap = buildSnapshot()
-      if (snap.cursor !== sinceCursor || !sinceCursor) return Response.json({ ok: true, ...snap })
+      if (snap.cursor !== sinceCursor || !sinceCursor) {
+        const response = Response.json({ ok: true, ...snap })
+        logRequestPerf(req, '/tasks/summary', perfStartedAt, perfStartedAt)
+        return response
+      }
       return new Promise<Response>((resolve) => {
         const timer = setTimeout(() => {
           taskSummaryWaiters.delete(waiter)
-          resolve(Response.json({ ok: true, ...buildSnapshot() }))
+          const response = Response.json({ ok: true, ...buildSnapshot() })
+          logRequestPerf(req, '/tasks/summary', perfStartedAt, perfStartedAt)
+          resolve(response)
         }, timeout)
         const waiter = { userId: currentUser!.id, sinceCursor, resolve, timer }
         taskSummaryWaiters.add(waiter)

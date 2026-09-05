@@ -71,4 +71,19 @@ describe('user ownership isolation', () => {
     const req = new Request('http://localhost/api/me?user_id=' + b.id, { headers: { cookie: `aicollab_session=${token}` } })
     expect(authenticatedUser(db, req)?.id).toBe(a.id)
   })
+
+  test('session last_seen_at is throttled while TTL validation remains active', async () => {
+    const { a } = await users()
+    const createdAt = new Date()
+    const { token } = createSession(db, a.id)
+    const req = new Request('http://localhost/api/me', { headers: { cookie: `aicollab_session=${token}` } })
+    authenticatedUser(db, req, createdAt)
+    const first = db.query('SELECT last_seen_at FROM user_sessions').get() as { last_seen_at: string }
+    authenticatedUser(db, req, new Date(createdAt.getTime() + 60_000))
+    const withinWindow = db.query('SELECT last_seen_at FROM user_sessions').get() as { last_seen_at: string }
+    expect(withinWindow.last_seen_at).toBe(first.last_seen_at)
+    authenticatedUser(db, req, new Date(createdAt.getTime() + 6 * 60_000))
+    const afterWindow = db.query('SELECT last_seen_at FROM user_sessions').get() as { last_seen_at: string }
+    expect(afterWindow.last_seen_at).not.toBe(first.last_seen_at)
+  })
 })

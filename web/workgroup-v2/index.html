@@ -2695,7 +2695,10 @@ button, textarea, input { font: inherit; }
 const STORAGE_KEY = 'wgv2:state';
 // Creative workers finish independently; poll fast enough to reveal each result
 // instead of making the first finisher appear to wait for the rest of its round.
-const POLL_MS = 1000;
+// SSE carries execution and message-created wakeups. Poll is reconciliation,
+// not the primary transport: 10s when healthy, 2s only while SSE reconnects.
+const POLL_MS = 10000;
+const POLL_FALLBACK_MS = 2000;
 
 // Map server roster.id ↔ design token id. Design system has tokens for
 // Runtime actor ids mapped to stable visual design tokens.
@@ -2944,6 +2947,7 @@ function _ensureExecutionStream(channelId, threadId = activeThread?.channel_id =
   const params = new URLSearchParams({ conversation_id: cfg.convId });
   if (threadId) params.set('thread_id', threadId);
   _executionStreamSource = new EventSource(`/group/stream?${params}`);
+  _executionStreamSource.onopen = () => _setExecutionStreamHealth(true);
   _executionStreamSource.onmessage = event => {
     try {
       const payload = JSON.parse(event.data);
@@ -2954,7 +2958,9 @@ function _ensureExecutionStream(channelId, threadId = activeThread?.channel_id =
     catch (error) { console.warn('[stream] invalid server event', error); }
   };
   _executionStreamSource.onerror = () => {
-    // EventSource reconnects automatically; /group/poll remains the fallback.
+    // EventSource reconnects automatically. Reconcile faster only while it is
+    // disconnected; normal SSE does not run a 1s primary poll.
+    _setExecutionStreamHealth(false);
   };
 }
 
@@ -3235,6 +3241,19 @@ let autoReply = {};        // id → bool
 let pendingFiles = [];     // [{filename, name, kind: 'image'|'file'}]
 let pollTimer = null;
 let pollBgTimer = null;
+let _executionStreamHealthy = false;
+let _executionStreamFailed = false;
+
+function _scheduleChannelPoll() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(poll, _executionStreamFailed ? POLL_FALLBACK_MS : POLL_MS);
+}
+
+function _setExecutionStreamHealth(healthy) {
+  _executionStreamHealthy = healthy;
+  _executionStreamFailed = !healthy;
+  _scheduleChannelPoll();
+}
 
 // Unread tracking — lastSeenIds is the last message id the user saw per
 // channel. AIC-55: also synced to server so the iOS app shares state — local
@@ -4158,6 +4177,7 @@ function persist() {
 async function api(path, opts = {}) {
   const json = !!opts.body && typeof opts.body === 'string';
   const headers = { ...(json ? { 'Content-Type': 'application/json' } : {}), ...(opts.headers || {}) };
+  if (!headers['x-request-id']) headers['x-request-id'] = `web_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const res = await fetch(path, { credentials: 'include', ...opts, headers });
   if (res.status === 401) {
     location.href = '/web/login.html?next=' + encodeURIComponent(location.pathname);
@@ -4548,7 +4568,7 @@ function markSeenTasks() { /* badge is TODO-based, no seen state to track */ }
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   poll();
-  pollTimer = setInterval(poll, POLL_MS);
+  _scheduleChannelPoll();
 }
 
 // ============================================================================
@@ -6819,6 +6839,8 @@ async function bootTasksV2() {
 }
 
 let tasksV2PollTimer = null;
+let tasksV2SummaryCursor = '';
+let tasksV2SummaryLoop = 0;
 async function _fetchTasksV2Once() {
   if (state.view !== 'tasks') return;
   const data = await apiJson('/tasks?include_done=1');
@@ -6832,15 +6854,34 @@ async function _fetchTasksV2Once() {
 function startTasksV2Poll() {
   stopTasksV2Poll();
   if (state.view !== 'tasks') return;
-  // 2026-06-22 PM: 启动立刻 fetch 一次, 不等 5s 首跳, 跟 setView 切换瞬间刷新数据契约对齐。
-  _fetchTasksV2Once();
-  // Short poll (5s) — long-poll cursor flow doesn't fit the include_done flow,
-  // and the task list isn't large enough to make a periodic refetch costly.
-  tasksV2PollTimer = setInterval(_fetchTasksV2Once, 5000);
+  const loopId = ++tasksV2SummaryLoop;
+  tasksV2SummaryCursor = '';
+  _fetchTasksV2Once().finally(() => _runTasksV2SummaryLongPoll(loopId));
+}
+
+async function _runTasksV2SummaryLongPoll(loopId) {
+  if (loopId !== tasksV2SummaryLoop || state.view !== 'tasks') return;
+  try {
+    const data = await apiJson(`/tasks/summary?since_cursor=${encodeURIComponent(tasksV2SummaryCursor)}&timeout=25`);
+    if (loopId !== tasksV2SummaryLoop || state.view !== 'tasks') return;
+    const nextCursor = String(data?.cursor || '');
+    if (data?.ok && nextCursor !== tasksV2SummaryCursor) {
+      tasksV2SummaryCursor = nextCursor;
+      await _fetchTasksV2Once();
+    }
+    _runTasksV2SummaryLongPoll(loopId);
+  } catch {
+    if (loopId !== tasksV2SummaryLoop) return;
+    tasksV2PollTimer = setTimeout(() => {
+      tasksV2PollTimer = null;
+      _fetchTasksV2Once().finally(() => _runTasksV2SummaryLongPoll(loopId));
+    }, 10000);
+  }
 }
 
 function stopTasksV2Poll() {
-  if (tasksV2PollTimer) { clearInterval(tasksV2PollTimer); tasksV2PollTimer = null; }
+  tasksV2SummaryLoop++;
+  if (tasksV2PollTimer) { clearTimeout(tasksV2PollTimer); tasksV2PollTimer = null; }
 }
 
 // ============================================================================
@@ -7784,14 +7825,28 @@ function startTaskDetailPoll() {
   fetchTaskDetail(state.activeTaskId);
   // Short poll for now — long poll on /tasks/:id/events would be more efficient
   // but the detail page is rarely open and 5s is plenty responsive.
-  tasksV2DetailPollTimer = setInterval(() => {
-    if (state.view !== 'task' || !state.activeTaskId) { stopTaskDetailPoll(); return; }
-    fetchTaskDetail(state.activeTaskId);
-  }, 5000);
+  const taskId = state.activeTaskId;
+  const loop = async () => {
+    if (state.view !== 'task' || state.activeTaskId !== taskId) return;
+    try {
+      const cursor = tasksV2DetailData?.task?.id === taskId
+        ? String(tasksV2DetailData.events?.at(-1)?.id || '') : '';
+      const data = await apiJson(`/tasks/${encodeURIComponent(taskId)}/events?since_event_id=${encodeURIComponent(cursor)}&timeout=25`);
+      if (state.view !== 'task' || state.activeTaskId !== taskId) return;
+      if (data?.ok && Array.isArray(data.events) && data.events.length) await fetchTaskDetail(taskId);
+      loop();
+    } catch {
+      tasksV2DetailPollTimer = setTimeout(() => {
+        tasksV2DetailPollTimer = null;
+        fetchTaskDetail(taskId).finally(loop);
+      }, 10000);
+    }
+  };
+  fetchTaskDetail(taskId).finally(loop);
 }
 
 function stopTaskDetailPoll() {
-  if (tasksV2DetailPollTimer) { clearInterval(tasksV2DetailPollTimer); tasksV2DetailPollTimer = null; }
+  if (tasksV2DetailPollTimer) { clearTimeout(tasksV2DetailPollTimer); tasksV2DetailPollTimer = null; }
 }
 
 async function advanceTaskV2(id, actor) {

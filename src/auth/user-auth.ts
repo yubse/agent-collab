@@ -4,6 +4,7 @@ import { LEGACY_ADMIN_ID } from '../db/migrations.ts'
 
 export const SESSION_COOKIE = 'aicollab_session'
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
+export const SESSION_LAST_SEEN_THROTTLE_MS = 5 * 60 * 1000
 
 // Trusted LAN MVP only: anyone who can reach the selector can choose one of
 // these profiles. The selected id is still exchanged for a server-side
@@ -153,12 +154,16 @@ export function sessionTokenFromRequest(req: Request): string | null {
 export function authenticatedUser(db: Database, req: Request, now = new Date()): AuthenticatedUser | null {
   const token = sessionTokenFromRequest(req)
   if (!token) return null
-  const row = db.prepare(`SELECT u.id, u.tenant_id, u.username, u.display_name, u.role, s.id AS session_id
+  const row = db.prepare(`SELECT u.id, u.tenant_id, u.username, u.display_name, u.role, s.id AS session_id, s.last_seen_at
     FROM user_sessions s JOIN users u ON u.id=s.user_id
     WHERE s.token_hash=? AND s.expires_at>?`).get(hashSecret(token), now.toISOString()) as any
   if (!row) return null
-  db.run(`UPDATE user_sessions SET last_seen_at=? WHERE id=?`, [now.toISOString(), row.session_id])
+  const lastSeenMs = Date.parse(String(row.last_seen_at || ''))
+  if (!Number.isFinite(lastSeenMs) || now.getTime() - lastSeenMs >= SESSION_LAST_SEEN_THROTTLE_MS) {
+    db.run(`UPDATE user_sessions SET last_seen_at=? WHERE id=?`, [now.toISOString(), row.session_id])
+  }
   delete row.session_id
+  delete row.last_seen_at
   return row as AuthenticatedUser
 }
 
