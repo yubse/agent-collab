@@ -3213,7 +3213,7 @@ function activeGroupInfo() {
 }
 
 async function loadGroups() {
-  const data = await apiJson('/api/channels');
+  const data = await bootApiJson('/api/channels', 'channels');
   if (!data?.ok || !Array.isArray(data.channels)) return;
   groupConversations = data.channels;
   channelMemberCandidates = data.member_candidates || channelMemberCandidates;
@@ -3408,6 +3408,49 @@ const SETTINGS_THEMES = [
 ];
 let appSettingsUsageActor = 'creative';
 let currentProfile = null;
+const BOOT_REQUEST_TIMEOUT_MS = 5000;
+const bootStatus = { profile: 'loading', roster: 'loading', channels: 'loading' };
+const bootErrors = { profile: '', roster: '', channels: '' };
+
+function bootTrace(stage, details = {}) {
+  console.info('[boot]', { stage, ...details });
+}
+
+function renderBootStatus() {
+  const profileEl = document.getElementById('sidebarProfileName');
+  if (profileEl && !currentProfile) {
+    profileEl.textContent = bootStatus.profile === 'error' ? '当前用户加载失败' : '加载中…';
+    profileEl.title = bootErrors.profile || '';
+  }
+  const groupEl = document.getElementById('groupList');
+  if (groupEl && bootStatus.channels === 'error' && !groupConversations.length) {
+    groupEl.innerHTML = `<div style="padding:12px;color:var(--bad);font-size:12px;">Groups 加载失败 · <button data-boot-retry="channels" style="border:0;background:none;color:inherit;text-decoration:underline;cursor:pointer;">重试</button></div>`;
+  }
+}
+
+async function bootApiJson(path, key) {
+  const started = performance.now();
+  bootStatus[key] = 'loading';
+  bootTrace(`${key}_start`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException('boot request timeout', 'TimeoutError')), BOOT_REQUEST_TIMEOUT_MS);
+  try {
+    const data = await apiJson(path, { signal: controller.signal });
+    if (!data) throw new Error('empty response');
+    bootStatus[key] = 'ready';
+    bootErrors[key] = '';
+    bootTrace(`${key}_end`, { status: 'ok', ms: Math.round(performance.now() - started) });
+    return data;
+  } catch (error) {
+    bootStatus[key] = 'error';
+    bootErrors[key] = error?.name === 'AbortError' || error?.name === 'TimeoutError' ? '请求超时' : (error?.message || '请求失败');
+    bootTrace(`${key}_end`, { status: 'error', error: error?.name || 'Error', ms: Math.round(performance.now() - started) });
+    renderBootStatus();
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 let connectorDevices = [];
 let connectorPairingState = { status: 'idle', startingDeviceIds: [] };
 let localHelperStatus = { available: false, checking: true, data: null };
@@ -3474,10 +3517,9 @@ async function loadConnectorDevices() {
   renderAppSettings();
 }
 async function loadCurrentProfile() {
-  try {
-    const data = await apiJson('/api/auth/me');
-    currentProfile = data?.user || null;
-  } catch (e) { console.error('loadCurrentProfile', e); }
+  const data = await bootApiJson('/api/auth/me', 'profile');
+  currentProfile = data?.user || null;
+  renderBootStatus();
   return currentProfile;
 }
 async function loadLocalHelperStatus() {
@@ -4023,8 +4065,6 @@ let _terminalJustOpened = false;   // one-shot flag — adds .fresh on next rend
 // Tasks v2 state
 let tasksV2Cache = [];             // full task list from /tasks/summary
 let tv2WorkflowTemplates = null;   // { type: { label, phases: [...] } }
-let tasksV2SummaryCursor = '';
-let tasksV2SummaryAbort = null;
 let tasksV2Booted = false;         // first-time fetch done?
 
 // Task detail
@@ -4192,7 +4232,7 @@ async function apiJson(path, opts = {}) {
 
 // Prime roster + agentStatus independently of the current channel's poll.
 async function loadRoster() {
-  const data = await apiJson('/group/roster');
+  const data = await bootApiJson('/group/roster', 'roster');
   if (!data?.ok) return;
   roster = data.roster || roster;
   if (data.presence) presenceSnapshot = data.presence;
@@ -10346,17 +10386,30 @@ loadPersisted();
 if (state.view === 'dm') currentChannel = state.activeDm || 'dm-product';
 else if (state.view === 'group') currentChannel = state.activeGroup || 'workgroup';
 render();  // placeholder render so the page isn't blank during the prime fetch
+document.getElementById('groupList')?.addEventListener('click', event => {
+  const retry = event.target.closest('[data-boot-retry]');
+  if (!retry) return;
+  const key = retry.dataset.bootRetry;
+  bootStatus[key] = 'retrying';
+  bootTrace(`${key}_retry`);
+  if (key === 'channels') loadGroups().then(() => { render(); });
+  else if (key === 'roster') loadRoster().then(() => { render(); });
+  else if (key === 'profile') loadCurrentProfile().then(() => { render(); });
+});
 (async () => {
-  try {
-    await loadCurrentProfile();
-  } catch (e) { console.error('[init] loadCurrentProfile failed:', e); }
-  try {
-    await loadRoster();
-  } catch (e) { console.error('[init] loadRoster failed:', e); }
-  try {
-    await loadGroups();
-  } catch (e) { console.error('[init] loadGroups failed:', e); }
+  bootTrace('boot_start');
+  const results = await Promise.allSettled([
+    loadCurrentProfile(),
+    loadRoster(),
+    loadGroups(),
+  ]);
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') console.error('[boot] unexpected rejection', index, result.reason);
+  });
   render();
+  bootTrace('boot_ready', { profile: bootStatus.profile, roster: bootStatus.roster, channels: bootStatus.channels });
+  renderBootStatus();
+  bootTrace('poll_start');
   startPolling();
   startBackgroundPolling();  // pulls non-current channels every 10s to keep unread badges live
   // AIC-61: arm toast audio + click delegation before any user interaction.

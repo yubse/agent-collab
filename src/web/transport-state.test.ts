@@ -23,4 +23,16 @@ describe('transport and state performance safeguards', () => {
     expect(source).toContain("headers['x-request-id']")
     expect(source).toContain('web_${Date.now()}_')
   })
+
+  test('boot loads profile, roster and channels independently with a bounded timeout', () => {
+    expect(source).toContain('const BOOT_REQUEST_TIMEOUT_MS = 5000;')
+    expect(source).toContain('Promise.allSettled([')
+    expect(source).toContain("loadCurrentProfile(),")
+    expect(source).toContain("loadRoster(),")
+    expect(source).toContain("loadGroups(),")
+    expect(source).toContain("controller.abort(new DOMException('boot request timeout', 'TimeoutError'))")
+    expect(source).toContain("data-boot-retry=\"channels\"")
+    expect(source).toContain("bootTrace('boot_start')")
+    expect(source).toContain("bootTrace('poll_start')")
+  })
 })
